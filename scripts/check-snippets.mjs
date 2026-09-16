@@ -131,3 +131,8 @@ if (bad) {
   console.log("the language does not have, and the error lands one keystroke later.");
   process.exit(1);
 }
+
+// app.js is a live application and installs timers while its scripts are
+// evaluated. This checker is a command-line probe, not a server: leave no
+// event-loop handles behind or the build appears to hang after all rows passed.
+process.exit(0);
