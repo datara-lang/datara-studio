@@ -1,0 +1,146 @@
+//! ryan-events :: typed event vocabulary
+//!
+//! Event kinds are plain strings so that they survive serialisation across the
+//! extension boundary and can be matched by adapters written in other
+//! languages. The kernel keeps the canonical list here, and every publisher
+//! uses these constructors rather than writing a literal.
+//!
+//! Grouped by the subsystem that owns them:
+//!   workspace / document / semantic / build / task / process / terminal /
+//!   debug / package / extension
+
+pub fn ev_workspace_opened() -> Str => "WorkspaceOpened"
+pub fn ev_workspace_closed() -> Str => "WorkspaceClosed"
+pub fn ev_project_opened() -> Str => "ProjectOpened"
+pub fn ev_document_opened() -> Str => "DocumentOpened"
+pub fn ev_document_changed() -> Str => "DocumentChanged"
+pub fn ev_document_saved() -> Str => "DocumentSaved"
+pub fn ev_document_closed() -> Str => "DocumentClosed"
+pub fn ev_document_dirty_changed() -> Str => "DocumentDirtyChanged"
+pub fn ev_document_external_change() -> Str => "DocumentExternalChange"
+
+pub fn ev_parse_started() -> Str => "ParseStarted"
+pub fn ev_parse_completed() -> Str => "ParseCompleted"
+pub fn ev_semantic_changed() -> Str => "SemanticChanged"
+pub fn ev_symbols_indexed() -> Str => "SymbolsIndexed"
+
+pub fn ev_build_started() -> Str => "BuildStarted"
+pub fn ev_build_finished() -> Str => "BuildFinished"
+pub fn ev_diagnostic_published() -> Str => "DiagnosticPublished"
+pub fn ev_diagnostics_cleared() -> Str => "DiagnosticsCleared"
+
+pub fn ev_task_started() -> Str => "TaskStarted"
+pub fn ev_task_progress() -> Str => "TaskProgress"
+pub fn ev_task_finished() -> Str => "TaskFinished"
+pub fn ev_task_cancelled() -> Str => "TaskCancelled"
+pub fn ev_task_stale_rejected() -> Str => "TaskStaleRejected"
+
+pub fn ev_process_started() -> Str => "ProcessStarted"
+pub fn ev_process_exited() -> Str => "ProcessExited"
+pub fn ev_terminal_output() -> Str => "TerminalOutput"
+pub fn ev_terminal_session_opened() -> Str => "TerminalSessionOpened"
+pub fn ev_terminal_session_closed() -> Str => "TerminalSessionClosed"
+
+pub fn ev_debug_started() -> Str => "DebugStarted"
+pub fn ev_debug_stopped() -> Str => "DebugStopped"
+pub fn ev_breakpoint_hit() -> Str => "BreakpointHit"
+pub fn ev_debug_paused() -> Str => "DebugPaused"
+
+pub fn ev_package_installed() -> Str => "PackageInstalled"
+pub fn ev_package_removed() -> Str => "PackageRemoved"
+pub fn ev_package_verified() -> Str => "PackageVerified"
+
+pub fn ev_extension_loaded() -> Str => "ExtensionLoaded"
+pub fn ev_extension_unloaded() -> Str => "ExtensionUnloaded"
+pub fn ev_extension_panicked() -> Str => "ExtensionPanicked"
+pub fn ev_capability_denied() -> Str => "CapabilityDenied"
+
+pub fn ev_transaction_began() -> Str => "TransactionBegan"
+pub fn ev_transaction_committed() -> Str => "TransactionCommitted"
+pub fn ev_transaction_rolled_back() -> Str => "TransactionRolledBack"
+pub fn ev_transaction_conflict() -> Str => "TransactionConflict"
+
+pub fn ev_kernel_started() -> Str => "KernelStarted"
+pub fn ev_kernel_shutdown() -> Str => "KernelShutdown"
+pub fn ev_event_dropped() -> Str => "EventDropped"
+
+/// Every kind the kernel can emit, in the order the documentation lists them.
+/// Conformance asserts that this list and the constructors above agree.
+pub fn event_kind_catalog() -> List<Str> {
+    return [
+        "WorkspaceOpened", "WorkspaceClosed", "ProjectOpened",
+        "DocumentOpened", "DocumentChanged", "DocumentSaved", "DocumentClosed",
+        "DocumentDirtyChanged", "DocumentExternalChange",
+        "ParseStarted", "ParseCompleted", "SemanticChanged", "SymbolsIndexed",
+        "BuildStarted", "BuildFinished", "DiagnosticPublished", "DiagnosticsCleared",
+        "TaskStarted", "TaskProgress", "TaskFinished", "TaskCancelled", "TaskStaleRejected",
+        "ProcessStarted", "ProcessExited", "TerminalOutput",
+        "TerminalSessionOpened", "TerminalSessionClosed",
+        "DebugStarted", "DebugStopped", "BreakpointHit", "DebugPaused",
+        "PackageInstalled", "PackageRemoved", "PackageVerified",
+        "ExtensionLoaded", "ExtensionUnloaded", "ExtensionPanicked", "CapabilityDenied",
+        "TransactionBegan", "TransactionCommitted", "TransactionRolledBack", "TransactionConflict",
+        "KernelStarted", "KernelShutdown", "EventDropped"
+    ]
+}
+
+pub fn event_kind_is_known( kind: Str) -> Bool {
+    let all = event_kind_catalog()
+    mut i = 0
+    while i < all.len() {
+        if all[i] == kind {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// Which subsystem owns a kind. Used for scoped subscriptions and for routing a
+/// delivery to the right reducer without a giant if-chain at every call site.
+pub fn event_kind_subsystem( kind: Str) -> Str {
+    if str_starts_with(kind, "Document") == 1 || str_starts_with(kind, "Workspace") == 1 || str_starts_with(kind, "Project") == 1 {
+        return "workspace"
+    }
+    if str_starts_with(kind, "Parse") == 1 || str_starts_with(kind, "Semantic") == 1 || str_starts_with(kind, "Symbols") == 1 {
+        return "language"
+    }
+    if str_starts_with(kind, "Build") == 1 || str_starts_with(kind, "Diagnostic") == 1 {
+        return "compiler"
+    }
+    if str_starts_with(kind, "Task") == 1 {
+        return "task"
+    }
+    if str_starts_with(kind, "Process") == 1 || str_starts_with(kind, "Terminal") == 1 {
+        return "process"
+    }
+    if str_starts_with(kind, "Debug") == 1 || str_starts_with(kind, "Breakpoint") == 1 {
+        return "debug"
+    }
+    if str_starts_with(kind, "Package") == 1 {
+        return "package"
+    }
+    if str_starts_with(kind, "Extension") == 1 || str_starts_with(kind, "Capability") == 1 {
+        return "extension"
+    }
+    if str_starts_with(kind, "Transaction") == 1 {
+        return "transaction"
+    }
+    return "kernel"
+}
+
+/// Kinds that are high-frequency and therefore subject to storm protection.
+/// A document-changed burst from a formatter must not be able to starve the
+/// task scheduler.
+pub fn event_kind_is_high_frequency( kind: Str) -> Bool {
+    if kind == "DocumentChanged" {
+        return true
+    }
+    if kind == "TerminalOutput" {
+        return true
+    }
+    if kind == "TaskProgress" {
+        return true
+    }
+    return false
+}

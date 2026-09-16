@@ -1,0 +1,12 @@
+# forgen build output
+*.exe
+*.obj
+*.pdb
+target/
+build/
+
+# generated probes (regenerate with scripts/gen_*.py)
+probes/bool_field/main.dtr
+probes/layout_iso/
+probes/fieldnames_shared/main.dtr
+probes/fieldnames_unique/main.dtr

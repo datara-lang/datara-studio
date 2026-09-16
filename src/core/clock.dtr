@@ -1,0 +1,86 @@
+use stdlib.result.result.Outcome
+
+//! ryan-core :: clock abstraction
+//!
+//! The kernel never calls `now_ms()` directly. All time flows through a Clock
+//! value, which lets tests run against a fake clock and makes timeout behaviour
+//! deterministic. See also `determinism/clock.dtr`.
+
+pub struct Clock {
+    /// "real" | "fake" | "logical"
+    clk_mode: Str
+    /// base epoch in milliseconds (real clocks use 0 and read the OS)
+    clk_base_ms: Int
+    /// accumulated fake time in milliseconds
+    clk_fake_ms: Int
+    /// number of time reads, used by tests to prove that a code path is
+    /// time-independent when it should be
+    clk_reads: Int
+}
+
+pub fn clock_real() -> Clock {
+    return Clock { clk_mode: "real", clk_base_ms: 0, clk_fake_ms: 0, clk_reads: 0 }
+}
+
+pub fn clock_fake( start_ms: Int) -> Clock {
+    return Clock { clk_mode: "fake", clk_base_ms: start_ms, clk_fake_ms: start_ms, clk_reads: 0 }
+}
+
+/// A logical clock that never advances on its own; it only moves when the test
+/// explicitly advances it. Ideal for stale-result and timeout tests.
+pub fn clock_logical() -> Clock {
+    return Clock { clk_mode: "logical", clk_base_ms: 0, clk_fake_ms: 0, clk_reads: 0 }
+}
+
+pub fn clock_mode( view c: Clock) -> Str {
+    return c.clk_mode
+}
+
+pub fn clock_now_ms( view c: Clock) -> Int {
+    if c.clk_mode == "real" {
+        return now_ms()
+    }
+    return c.clk_fake_ms
+}
+
+pub fn clock_now_ns( view c: Clock) -> Int {
+    if c.clk_mode == "real" {
+        return now_ns()
+    }
+    return c.clk_fake_ms * 1000000
+}
+
+/// Advance a fake/logical clock. Panics in intent: advancing a real clock is a
+/// programming error, and we surface it as a boolean instead of silently doing
+/// nothing.
+pub fn clock_advance( view c: Clock, delta_ms: Int) -> Outcome<Clock> {
+    if c.clk_mode == "real" {
+        return outcome_fail(c, "cannot advance a real clock; use clock_fake")
+    }
+    return outcome_ok(Clock {
+        clk_mode: c.clk_mode,
+        clk_base_ms: c.clk_base_ms,
+        clk_fake_ms: c.clk_fake_ms + delta_ms,
+        clk_reads: c.clk_reads + 1
+    })
+}
+
+pub fn clock_reads( view c: Clock) -> Int {
+    return c.clk_reads
+}
+
+/// Convenience: measure elapsed wall time around a unit of work, returning
+/// (result, elapsed_ms). Used by the benchmark harness.
+pub struct Timed {
+    timed_started_ms: Int
+    timed_elapsed_ms: Int
+}
+
+pub fn timed_begin( view c: Clock) -> Timed {
+    return Timed { timed_started_ms: clock_now_ms(c), timed_elapsed_ms: 0 }
+}
+
+pub fn timed_end( view c: Clock, view t: Timed) -> Timed {
+    let end = clock_now_ms(c)
+    return Timed { timed_started_ms: t.timed_started_ms, timed_elapsed_ms: end - t.timed_started_ms }
+}

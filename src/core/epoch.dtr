@@ -1,0 +1,152 @@
+use stdlib.result.result.Outcome
+
+//! ryan-core :: epochs, generations and revisions
+//!
+//! Stale-result suppression (master prompt section 10) needs a coherent
+//! generation strategy. Ryan uses four orthogonal counters, each answering a
+//! different question:
+//!
+//!   document revision - "which version of this file did the work see?"
+//!   workspace epoch   - "has the project shape changed since the work started?"
+//!   operation generation - "is a newer request for the same operation queued?"
+//!   provider request id  - "which in-flight provider call is this?"
+//!
+//! A result is *fresh* only if all four match at completion time.
+
+pub struct Revision {
+    rev_value: Int
+}
+
+pub fn revision_new( value: Int) -> Revision => Revision { rev_value: value }
+
+pub fn revision_next( view r: Revision) -> Revision => Revision { rev_value: r.rev_value + 1 }
+
+pub fn revision_value( view r: Revision) -> Int => r.rev_value
+
+pub struct Epoch {
+    epoch_value: Int
+}
+
+pub fn epoch_new() -> Epoch => Epoch { epoch_value: 1 }
+
+pub fn epoch_next( view e: Epoch) -> Epoch => Epoch { epoch_value: e.epoch_value + 1 }
+
+pub fn epoch_value( view e: Epoch) -> Int => e.epoch_value
+
+/// The full freshness ticket carried by every asynchronous request.
+pub struct Generation {
+    gen_document_id: Int
+    gen_document_revision: Int
+    gen_workspace_epoch: Int
+    gen_operation: Str
+    gen_operation_generation: Int
+    gen_request_id: Int
+}
+
+pub fn generation_new( document_id: Int, document_revision: Int, workspace_epoch: Int, operation: Str, operation_generation: Int, request_id: Int) -> Generation {
+    return Generation {
+        gen_document_id: document_id,
+        gen_document_revision: document_revision,
+        gen_workspace_epoch: workspace_epoch,
+        gen_operation: operation,
+        gen_operation_generation: operation_generation,
+        gen_request_id: request_id
+    }
+}
+
+pub fn generation_render( view g: Generation) -> Str {
+    return fmt"doc={g.gen_document_id}@{g.gen_document_revision} epoch={g.gen_workspace_epoch} op={g.gen_operation}#{g.gen_operation_generation} req={g.gen_request_id}"
+}
+
+/// Result of comparing a ticket taken when work was scheduled against the
+/// ticket observed when the work completed.
+pub struct Freshness {
+    fresh_fresh: Bool
+    fresh_reason: Str
+}
+
+pub fn freshness_check( view scheduled: Generation, view current: Generation) -> Freshness {
+    if scheduled.gen_document_id != current.gen_document_id {
+        return Freshness { fresh_fresh: false, fresh_reason: "document identity changed" }
+    }
+    if scheduled.gen_workspace_epoch != current.gen_workspace_epoch {
+        return Freshness { fresh_fresh: false, fresh_reason: "workspace epoch advanced" }
+    }
+    if scheduled.gen_document_revision != current.gen_document_revision {
+        return Freshness { fresh_fresh: false, fresh_reason: "document revision advanced" }
+    }
+    if scheduled.gen_operation != current.gen_operation {
+        return Freshness { fresh_fresh: false, fresh_reason: "operation kind changed" }
+    }
+    if scheduled.gen_operation_generation != current.gen_operation_generation {
+        return Freshness { fresh_fresh: false, fresh_reason: "a newer request superseded this one" }
+    }
+    if scheduled.gen_request_id != current.gen_request_id {
+        return Freshness { fresh_fresh: false, fresh_reason: "request id superseded" }
+    }
+    return Freshness { fresh_fresh: true, fresh_reason: "" }
+}
+
+pub fn freshness_is_fresh( view f: Freshness) -> Bool => f.fresh_fresh
+
+pub fn freshness_reason( view f: Freshness) -> Str => f.fresh_reason
+
+/// Per-operation generation counters. One counter per operation kind means that
+/// a burst of `parse` requests cannot invalidate an in-flight `diagnostics`
+/// request, while still catching parse-vs-parse races.
+pub struct GenerationTable {
+    gentab_keys: List<Str>
+    gentab_values: List<Int>
+    gentab_request_counter: Int
+}
+
+pub fn generation_table_new() -> GenerationTable {
+    return GenerationTable { gentab_keys: [], gentab_values: [], gentab_request_counter: 0 }
+}
+
+pub fn generation_table_index( view t: GenerationTable, key: Str) -> Int {
+    mut i = 0
+    while i < t.gentab_keys.len() {
+        if t.gentab_keys[i] == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+pub fn generation_table_bump( view t: GenerationTable, key: Str) -> GenerationTable {
+    let idx = generation_table_index(t, key)
+    if idx < 0 {
+        mut keys = t.gentab_keys
+        mut values = t.gentab_values
+        keys = keys.push(key)
+        values = values.push(1)
+        return GenerationTable { gentab_keys: keys, gentab_values: values, gentab_request_counter: t.gentab_request_counter }
+    }
+    mut values = t.gentab_values
+    values[idx] = values[idx] + 1
+    return GenerationTable { gentab_keys: t.gentab_keys, gentab_values: values, gentab_request_counter: t.gentab_request_counter }
+}
+
+pub fn generation_table_get( view t: GenerationTable, key: Str) -> Int {
+    let idx = generation_table_index(t, key)
+    if idx < 0 {
+        return 0
+    }
+    return t.gentab_values[idx]
+}
+
+/// Allocate a globally increasing request id. Monotonic, never reused, so a
+/// late completion can always be matched to the request that produced it.
+pub fn generation_table_next_request( view t: GenerationTable) -> GenerationTable {
+    return GenerationTable {
+        gentab_keys: t.gentab_keys,
+        gentab_values: t.gentab_values,
+        gentab_request_counter: t.gentab_request_counter + 1
+    }
+}
+
+pub fn generation_table_request_id( view t: GenerationTable) -> Int {
+    return t.gentab_request_counter
+}

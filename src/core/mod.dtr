@@ -1,0 +1,66 @@
+//! ryan-core :: module root
+//!
+//! Kernel foundation primitives. Everything in this module is language-neutral,
+//! UI-free and dependency-free. It must remain useful with zero AI code and zero
+//! cloud access.
+//!
+//! Layout:
+//!   ids      - strongly typed identity values for every kernel entity
+//!   version  - semantic versioning + compatibility rules
+//!   clock    - injectable clock (real / fake / logical) for deterministic tests
+//!   epoch    - workspace epochs, generations and revision counters
+//!   outcome  - small helpers over stdlib Outcome/Maybe
+//!
+//! NOTE ON DATARA STYLE (verified against forgen 1.3.0, not against the README):
+//!   * `pub` is accepted on top-level `fn` / `struct` / `trait`, but NOT on
+//!     struct fields, and NOT on top-level `let`. Field visibility is therefore
+//!     uniform (all fields readable), and constants are exposed as
+//!     zero-argument functions instead of `pub let` bindings.
+//!   * There is no `::` path syntax; `use <module>` merges the module's public
+//!     items into a flat namespace, so every public name in the kernel is
+//!     globally unique and carries its module prefix.
+
+use core.ids
+use core.version
+use core.clock
+use core.epoch
+use core.outcome
+
+// ---------------------------------------------------------------------------
+// Kernel-wide invariants
+// ---------------------------------------------------------------------------
+
+/// Version of the kernel ABI that providers and extensions are compiled against.
+pub fn ryan_kernel_abi() -> Int => 1
+
+/// Human-readable kernel name, used in traces and diagnostics.
+pub fn ryan_kernel_name() -> Str => "Ryan Harness Core"
+
+/// The kernel never requires a network connection. Exposed as a runtime value so
+/// adapters can assert the invariant instead of trusting a comment.
+pub fn ryan_requires_network() -> Bool => false
+
+/// The kernel never requires an AI subsystem.
+pub fn ryan_requires_ai() -> Bool => false
+
+// ---------------------------------------------------------------------------
+// Kernel identity banner (used by the headless CLI and conformance runner)
+// ---------------------------------------------------------------------------
+
+pub fn kernel_banner() -> Str {
+    return "Ryan Harness Core " + version_to_str(kernel_version())
+}
+
+pub fn kernel_version() -> Version {
+    return version_new(0, 1, 0)
+}
+
+pub fn kernel_self_check() -> Outcome<Str> {
+    if ryan_requires_network() {
+        return outcome_fail("", "kernel must not require network access")
+    }
+    if ryan_requires_ai() {
+        return outcome_fail("", "kernel must not require an AI subsystem")
+    }
+    return outcome_ok("kernel self-check passed")
+}

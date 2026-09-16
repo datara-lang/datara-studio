@@ -1,0 +1,431 @@
+//! ryan-text :: piece-table rope
+//!
+//! Large editable documents are never stored as a naive mutable `String`.
+//! Ryan uses a **piece table**: an immutable `original` buffer plus an
+//! append-only `added` buffer, addressed by a list of chunks. Edits append to
+//! `added` and only rewrite the chunk list, so:
+//!
+//!   * a full-document read is O(chunks) with one substring per chunk;
+//!   * an edit is O(chunks) but touches no bulk memory;
+//!   * the original bytes are never mutated, which is what makes undo,
+//!     transaction rollback and snapshotting cheap and exact.
+//!
+//! Why a piece table and not a tree rope: the master prompt asks for a choice
+//! "made using benchmark evidence". `benches/bench_text.dtr` measures both
+//! strategies over the same workloads; the measured numbers are reported in
+//! `docs/PERFORMANCE.md`. For the edit-heavy, moderate-chunk-count workload a
+//! kernel actually sees, the piece table wins on constant factors while keeping
+//! the implementation small enough to verify.
+//!
+//! All offsets in this module are **byte offsets into UTF-8**. Character and
+//! UTF-16 offsets are derived in `utf16.dtr`.
+
+/// A chunk addresses a slice of one of the two backing buffers.
+/// buffer 0 = original, buffer 1 = added.
+///
+/// The field is called `buffer`, not `source`, on purpose: forgen keeps struct
+/// field names in a single global namespace and silently miscompiles when two
+/// structs declare the same field name with different types. `Event.source` is
+/// a `Str`, so an `Int` field named `source` here would corrupt both.
+pub struct RopeChunk {
+    chunk_buffer: Int
+    chunk_start: Int
+    chunk_len: Int
+}
+
+pub struct Rope {
+    rope_original: Str
+    rope_added: Str
+    rope_chunks: List<RopeChunk>
+    rope_byte_len: Int
+    /// monotonic revision, bumped by every structural change
+    rope_revision: Int
+}
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+pub fn rope_empty() -> Rope {
+    return Rope {
+        rope_original: "",
+        rope_added: "",
+        rope_chunks: [],
+        rope_byte_len: 0,
+        rope_revision: 0
+    }
+}
+
+pub fn rope_new( text: Str) -> Rope {
+    mut chunks: List<RopeChunk> = []
+    let n = str_len(text)
+    if n > 0 {
+        chunks = chunks.push(RopeChunk { chunk_buffer: 0, chunk_start: 0, chunk_len: n })
+    }
+    return Rope {
+        rope_original: text,
+        rope_added: "",
+        rope_chunks: chunks,
+        rope_byte_len: n,
+        rope_revision: 1
+    }
+}
+
+pub fn rope_len( view r: Rope) -> Int => r.rope_byte_len
+
+pub fn rope_revision( view r: Rope) -> Int => r.rope_revision
+
+pub fn rope_chunk_count( view r: Rope) -> Int => r.rope_chunks.len()
+
+pub fn rope_is_empty( view r: Rope) -> Bool => r.rope_byte_len == 0
+
+// ---------------------------------------------------------------------------
+// Materialisation
+// ---------------------------------------------------------------------------
+
+pub fn rope_to_str( view r: Rope) -> Str {
+    mut buf = ""
+    mut i = 0
+    while i < r.rope_chunks.len() {
+        let c = r.rope_chunks[i]
+        if c.chunk_len > 0 {
+            if c.chunk_buffer == 0 {
+                buf = buf + str_substring(r.rope_original, c.chunk_start, c.chunk_len)
+            } else {
+                buf = buf + str_substring(r.rope_added, c.chunk_start, c.chunk_len)
+            }
+        }
+        i = i + 1
+    }
+    return buf
+}
+
+/// Byte value at a byte offset, without materialising the document.
+pub fn rope_byte_at( view r: Rope, offset: Int) -> Int {
+    if offset < 0 || offset >= r.rope_byte_len {
+        return -1
+    }
+    mut acc = 0
+    mut i = 0
+    while i < r.rope_chunks.len() {
+        let c = r.rope_chunks[i]
+        if offset < acc + c.chunk_len {
+            let inner = offset - acc
+            if c.chunk_buffer == 0 {
+                return str_byte_at(r.rope_original, c.chunk_start + inner)
+            }
+            return str_byte_at(r.rope_added, c.chunk_start + inner)
+        }
+        acc = acc + c.chunk_len
+        i = i + 1
+    }
+    return -1
+}
+
+// ---------------------------------------------------------------------------
+// Structural primitives
+// ---------------------------------------------------------------------------
+
+/// Returns a rope in which a chunk boundary exists exactly at `offset`.
+/// Calling this twice with different offsets is the standard way to isolate a
+/// range before deleting it.
+pub fn rope_split_at( view r: Rope, offset: Int) -> Rope {
+    if offset <= 0 || offset >= r.rope_byte_len {
+        return r
+    }
+    mut buf: List<RopeChunk> = []
+    mut acc = 0
+    mut i = 0
+    while i < r.rope_chunks.len() {
+        let c = r.rope_chunks[i]
+        if offset > acc && offset < acc + c.chunk_len {
+            let left_len = offset - acc
+            buf = buf.push(RopeChunk { chunk_buffer: c.chunk_buffer, chunk_start: c.chunk_start, chunk_len: left_len })
+            buf = buf.push(RopeChunk {
+                chunk_buffer: c.chunk_buffer,
+                chunk_start: c.chunk_start + left_len,
+                chunk_len: c.chunk_len - left_len
+            })
+        } else {
+            buf = buf.push(c)
+        }
+        acc = acc + c.chunk_len
+        i = i + 1
+    }
+    return Rope {
+        rope_original: r.rope_original,
+        rope_added: r.rope_added,
+        rope_chunks: buf,
+        rope_byte_len: r.rope_byte_len,
+        rope_revision: r.rope_revision
+    }
+}
+
+pub fn rope_insert( view r: Rope, offset: Int, text: Str) -> Rope {
+    let add_len = str_len(text)
+    if add_len == 0 {
+        return r
+    }
+    mut at = offset
+    if at < 0 {
+        at = 0
+    }
+    if at > r.rope_byte_len {
+        at = r.rope_byte_len
+    }
+    let split = rope_split_at(r, at)
+    let add_start = str_len(split.rope_added)
+
+    mut buf: List<RopeChunk> = []
+    mut acc = 0
+    mut inserted = false
+    mut i = 0
+    while i < split.rope_chunks.len() {
+        let c = split.rope_chunks[i]
+        if !inserted && acc == at {
+            buf = buf.push(RopeChunk { chunk_buffer: 1, chunk_start: add_start, chunk_len: add_len })
+            inserted = true
+        }
+        buf = buf.push(c)
+        acc = acc + c.chunk_len
+        i = i + 1
+    }
+    if !inserted {
+        buf = buf.push(RopeChunk { chunk_buffer: 1, chunk_start: add_start, chunk_len: add_len })
+    }
+
+    return Rope {
+        rope_original: split.rope_original,
+        rope_added: split.rope_added + text,
+        rope_chunks: buf,
+        rope_byte_len: split.rope_byte_len + add_len,
+        rope_revision: split.rope_revision + 1
+    }
+}
+
+pub fn rope_delete( view r: Rope, start: Int, del_len: Int) -> Rope {
+    if del_len <= 0 {
+        return r
+    }
+    mut begin_at = start
+    if begin_at < 0 {
+        begin_at = 0
+    }
+    if begin_at > r.rope_byte_len {
+        begin_at = r.rope_byte_len
+    }
+    mut to = begin_at + del_len
+    if to > r.rope_byte_len {
+        to = r.rope_byte_len
+    }
+
+    let s1 = rope_split_at(r, begin_at)
+    let s2 = rope_split_at(s1, to)
+
+    mut buf: List<RopeChunk> = []
+    mut acc = 0
+    mut removed = 0
+    mut i = 0
+    while i < s2.rope_chunks.len() {
+        let c = s2.rope_chunks[i]
+        let c_start = acc
+        let c_end = acc + c.chunk_len
+        if c_end <= begin_at || c_start >= to {
+            buf = buf.push(c)
+        } else {
+            removed = removed + c.chunk_len
+        }
+        acc = c_end
+        i = i + 1
+    }
+
+    return Rope {
+        rope_original: s2.rope_original,
+        rope_added: s2.rope_added,
+        rope_chunks: buf,
+        rope_byte_len: s2.rope_byte_len - removed,
+        rope_revision: s2.rope_revision + 1
+    }
+}
+
+pub fn rope_replace( view r: Rope, start: Int, del_len: Int, text: Str) -> Rope {
+    let after_delete = rope_delete(r, start, del_len)
+    return rope_insert(after_delete, start, text)
+}
+
+/// Append is the common case and skips the split scan.
+pub fn rope_append( view r: Rope, text: Str) -> Rope {
+    return rope_insert(r, r.rope_byte_len, text)
+}
+
+/// Extract a byte range. Returns "" for an buf-of-range request rather than
+/// panicking: callers in the kernel are adapters reading provider-supplied
+/// offsets, and a bad offset must never take the kernel down.
+pub fn rope_slice( view r: Rope, start: Int, len: Int) -> Str {
+    if start < 0 || len <= 0 || start >= r.rope_byte_len {
+        return ""
+    }
+    mut end = start + len
+    if end > r.rope_byte_len {
+        end = r.rope_byte_len
+    }
+
+    mut buf = ""
+    mut acc = 0
+    mut i = 0
+    while i < r.rope_chunks.len() {
+        let c = r.rope_chunks[i]
+        let c_start = acc
+        let c_end = acc + c.chunk_len
+        if c_end > start && c_start < end {
+            mut local_start = start - c_start
+            if local_start < 0 {
+                local_start = 0
+            }
+            mut local_end = end - c_start
+            if local_end > c.chunk_len {
+                local_end = c.chunk_len
+            }
+            let take = local_end - local_start
+            if take > 0 {
+                if c.chunk_buffer == 0 {
+                    buf = buf + str_substring(r.rope_original, c.chunk_start + local_start, take)
+                } else {
+                    buf = buf + str_substring(r.rope_added, c.chunk_start + local_start, take)
+                }
+            }
+        }
+        acc = c_end
+        if acc >= end {
+            return buf
+        }
+        i = i + 1
+    }
+    return buf
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+//
+// After many edits the chunk list grows. Compaction folds the live text back
+// into a fresh single-chunk rope. This is the piece table's analogue of rope
+// rebalancing and is what keeps chunk count bounded in a long editing session.
+
+pub fn rope_compaction_threshold() -> Int => 512
+
+pub fn rope_needs_compaction( view r: Rope) -> Bool {
+    return r.rope_chunks.len() > rope_compaction_threshold()
+}
+
+pub fn rope_compact( view r: Rope) -> Rope {
+    let flat = rope_to_str(r)
+    let n = str_len(flat)
+    mut chunks: List<RopeChunk> = []
+    if n > 0 {
+        chunks = chunks.push(RopeChunk { chunk_buffer: 0, chunk_start: 0, chunk_len: n })
+    }
+    return Rope {
+        rope_original: flat,
+        rope_added: "",
+        rope_chunks: chunks,
+        rope_byte_len: n,
+        rope_revision: r.rope_revision + 1
+    }
+}
+
+pub fn rope_maybe_compact( view r: Rope) -> Rope {
+    if rope_needs_compaction(r) {
+        return rope_compact(r)
+    }
+    return r
+}
+
+// ---------------------------------------------------------------------------
+// Line-oriented helpers used by the line index
+// ---------------------------------------------------------------------------
+
+pub fn rope_count_lines( view r: Rope) -> Int {
+    if r.rope_byte_len == 0 {
+        return 1
+    }
+    mut count = 1
+    mut i = 0
+    while i < r.rope_byte_len {
+        if rope_byte_at(r, i) == 10 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+/// Byte offsets at which each line starts. Line 0 always starts at byte 0.
+pub fn rope_line_starts( view r: Rope) -> List<Int> {
+    mut starts: List<Int> = [0]
+    mut i = 0
+    while i < r.rope_byte_len {
+        if rope_byte_at(r, i) == 10 {
+            starts = starts.push(i + 1)
+        }
+        i = i + 1
+    }
+    return starts
+}
+
+/// Byte offset of the start of the line containing `offset`.
+pub fn rope_line_start( view r: Rope, offset: Int) -> Int {
+    mut i = offset
+    while i > 0 {
+        if rope_byte_at(r, i - 1) == 10 {
+            return i
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+/// Byte offset just past the end of the line containing `offset`
+/// (excluding the newline itself).
+pub fn rope_line_end( view r: Rope, offset: Int) -> Int {
+    mut i = offset
+    while i < r.rope_byte_len {
+        if rope_byte_at(r, i) == 10 {
+            return i
+        }
+        i = i + 1
+    }
+    return r.rope_byte_len
+}
+
+pub fn rope_line_of_offset( view r: Rope, offset: Int) -> Int {
+    mut line = 0
+    mut i = 0
+    while i < offset && i < r.rope_byte_len {
+        if rope_byte_at(r, i) == 10 {
+            line = line + 1
+        }
+        i = i + 1
+    }
+    return line
+}
+
+// ---------------------------------------------------------------------------
+// Introspection accessors (used by tests, benchmarks and the debug CLI)
+// ---------------------------------------------------------------------------
+
+pub fn rope_chunk_at(view r: Rope, index: Int) -> RopeChunk {
+    if index < 0 || index >= r.rope_chunks.len() {
+        return RopeChunk { chunk_buffer: -1, chunk_start: -1, chunk_len: -1 }
+    }
+    return r.rope_chunks[index]
+}
+
+pub fn rope_original_len(view r: Rope) -> Int => str_len(r.rope_original)
+pub fn rope_added_len(view r: Rope) -> Int => str_len(r.rope_added)
+pub fn rope_original(view r: Rope) -> Str => r.rope_original
+pub fn rope_added(view r: Rope) -> Str => r.rope_added
+
+pub fn chunk_source(view c: RopeChunk) -> Int => c.chunk_buffer
+pub fn chunk_start(view c: RopeChunk) -> Int => c.chunk_start
+pub fn chunk_len(view c: RopeChunk) -> Int => c.chunk_len

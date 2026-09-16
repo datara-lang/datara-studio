@@ -1,0 +1,125 @@
+use stdlib.result.result.Outcome
+
+//! ryan-core :: semantic versioning
+//!
+//! Providers, extensions and persisted state all declare a version. The kernel
+//! needs one place that decides whether two versions are compatible, so that a
+//! plugin written for ABI 1 is never silently loaded into ABI 2.
+
+pub struct Version {
+    ver_major: Int
+    ver_minor: Int
+    ver_patch: Int
+}
+
+pub fn version_new( major: Int, minor: Int, patch: Int) -> Version {
+    return Version { ver_major: major, ver_minor: minor, ver_patch: patch }
+}
+
+pub fn version_to_str( view v: Version) -> Str {
+    return fmt"{v.ver_major}.{v.ver_minor}.{v.ver_patch}"
+}
+
+pub fn version_parse( s: Str) -> Version {
+    let parts = str_split(s, ".")
+    if parts.len() < 1 {
+        return Version { ver_major: 0, ver_minor: 0, ver_patch: 0 }
+    }
+    mut major = str_to_int(parts[0])
+    mut minor = 0
+    mut patch = 0
+    if parts.len() >= 2 {
+        minor = str_to_int(parts[1])
+    }
+    if parts.len() >= 3 {
+        patch = str_to_int(parts[2])
+    }
+    return Version { ver_major: major, ver_minor: minor, ver_patch: patch }
+}
+
+/// Total ordering helper. Returns -1, 0 or 1.
+pub fn version_cmp( view a: Version, view b: Version) -> Int {
+    if a.ver_major != b.ver_major {
+        if a.ver_major < b.ver_major { return -1 }
+        return 1
+    }
+    if a.ver_minor != b.ver_minor {
+        if a.ver_minor < b.ver_minor { return -1 }
+        return 1
+    }
+    if a.ver_patch != b.ver_patch {
+        if a.ver_patch < b.ver_patch { return -1 }
+        return 1
+    }
+    return 0
+}
+
+pub fn version_lt( view a: Version, view b: Version) -> Bool => version_cmp(a, b) < 0
+pub fn version_eq( view a: Version, view b: Version) -> Bool => version_cmp(a, b) == 0
+
+/// Compatibility rule used for extensions and persisted state:
+///   - same major  -> compatible (forward and backward within the major line)
+///   - newer minor -> compatible
+///   - older minor -> compatible (we accept older readers)
+///   - different major -> incompatible, requires an explicit migration step
+pub fn version_compatible( view host: Version, view guest: Version) -> Bool {
+    if host.ver_major == guest.ver_major {
+        return true
+    }
+    return false
+}
+
+pub fn version_incompatibility_reason( view host: Version, view guest: Version) -> Str {
+    if host.ver_major == guest.ver_major {
+        return ""
+    }
+    return "major version mismatch: host " + version_to_str(host) + " vs guest " + version_to_str(guest)
+}
+
+/// A version *range* requirement, e.g. "^1.2.0" or ">=0.1.0".
+pub struct VersionReq {
+    vreq_raw: Str
+    vreq_op: Str
+    vreq_target: Version
+}
+
+pub fn version_req_parse( raw: Str) -> VersionReq {
+    mut op = "="
+    mut body = raw
+    let n = str_len(raw)
+    if n >= 2 {
+        let two = str_substring(raw, 0, 2)
+        if two == ">=" {
+            op = ">="
+            body = str_substring(raw, 2, n - 2)
+        } else if two == "<=" {
+            op = "<="
+            body = str_substring(raw, 2, n - 2)
+        } else if str_substring(raw, 0, 1) == ">" {
+            op = ">"
+            body = str_substring(raw, 1, n - 1)
+        } else if str_substring(raw, 0, 1) == "<" {
+            op = "<"
+            body = str_substring(raw, 1, n - 1)
+        } else if str_substring(raw, 0, 1) == "^" {
+            op = "^"
+            body = str_substring(raw, 1, n - 1)
+        }
+    }
+    return VersionReq { vreq_raw: raw, vreq_op: op, vreq_target: version_parse(body) }
+}
+
+pub fn version_req_matches( view req: VersionReq, view v: Version) -> Bool {
+    let c = version_cmp(v, req.vreq_target)
+    if req.vreq_op == "=" { return c == 0 }
+    if req.vreq_op == ">=" { return c >= 0 }
+    if req.vreq_op == "<=" { return c <= 0 }
+    if req.vreq_op == ">" { return c > 0 }
+    if req.vreq_op == "<" { return c < 0 }
+    if req.vreq_op == "^" {
+        // caret: same major, at least the target
+        if v.ver_major != req.vreq_target.ver_major { return false }
+        return c >= 0
+    }
+    return false
+}

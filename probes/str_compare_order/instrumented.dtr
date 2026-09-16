@@ -1,0 +1,79 @@
+fn show( xs: List<Str>) -> Str {
+    let n = xs.len()
+    mut s = ""
+    mut i = 0
+    while i < n {
+        s = s + xs[i] + " "
+        i = i + 1
+    }
+    return s
+}
+
+fn showi( xs: List<Int>) -> Str {
+    let n = xs.len()
+    mut s = ""
+    mut i = 0
+    while i < n {
+        s = s + int_to_str(xs[i]) + " "
+        i = i + 1
+    }
+    return s
+}
+
+fn sort_probe( names: List<Str>) -> Str {
+    let n = names.len()
+    mut order: List<Int> = []
+    mut i = 0
+    while i < n {
+        order = order.push(i)
+        i = i + 1
+    }
+    println("   entry names=" + show(names) + " order=" + showi(order))
+    mut a = 1
+    while a < n {
+        let cur = order[a]
+        let cur_name = names[cur]
+        println("   a=" + int_to_str(a) + " cur=" + int_to_str(cur) + " cur_name=" + cur_name)
+        mut b = a - 1
+        mut placed = false
+        while b >= 0 && !placed {
+            let prev = order[b]
+            let prev_name = names[prev]
+            println("      b=" + int_to_str(b) + " prev=" + int_to_str(prev) + " prev_name=" + prev_name + " cmp=" + bool_to_str(prev_name > cur_name))
+            if prev_name > cur_name {
+                order[b + 1] = prev
+                b = b - 1
+            } else {
+                placed = true
+            }
+        }
+        order[b + 1] = cur
+        println("      after order=" + showi(order))
+        a = a + 1
+    }
+    return showi(order)
+}
+
+fn main() -> Int {
+    let content = "a: Int\nb: Int\nc: Int\nd: Int\n"
+    let lines = str_split(content, "\n")
+    let ln_total = lines.len()
+    mut names: List<Str> = []
+    mut li = 0
+    while li < ln_total {
+        let line = lines[li]
+        li = li + 1
+        let t = str_trim(line)
+        if byte_len(t) == 0 {
+            continue
+        }
+        let idx = str_index_of(t, ":")
+        if idx <= 0 {
+            continue
+        }
+        names = names.push(str_trim(str_substring(t, 0, idx)))
+    }
+    println("names collected: " + show(names))
+    println("result: " + sort_probe(names))
+    return 0
+}

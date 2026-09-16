@@ -1,0 +1,86 @@
+//! ryan-text :: module root
+//!
+//! Text storage and manipulation. Nothing in here knows about workspaces,
+//! providers or UI: it is a self-contained, testable text engine.
+//!
+//!   rope       - piece-table document storage (byte-addressed)
+//!   line_index - byte offset <-> (line, column), positions, ranges, selections
+//!   utf16      - UTF-8/UTF-16 conversion, line-ending policy
+//!   edit       - edits, grouped edits, multi-cursor batches, undo/redo
+
+use text.rope
+use text.line_index
+use text.utf16
+use text.edit
+
+/// Text engine capabilities, reported honestly so that conformance runs can
+/// assert them instead of trusting prose.
+pub fn text_engine_name() -> Str => "piece-table-rope"
+
+pub fn text_engine_supports_utf16() -> Bool => true
+pub fn text_engine_supports_multi_cursor() -> Bool => true
+pub fn text_engine_supports_undo() -> Bool => true
+pub fn text_engine_supports_snapshots() -> Bool => true
+
+/// A one-call sanity check used by the headless CLI and by conformance.
+pub fn text_engine_selftest() -> Outcome<Str> {
+    let r0 = rope_new("hello world")
+    if rope_len(r0) != 11 {
+        return outcome_fail("", "rope length mismatch")
+    }
+
+    let r1 = rope_insert(r0, 5, ",")
+    let s1 = rope_to_str(r1)
+    if s1 != "hello, world" {
+        return outcome_fail(s1, "insert produced wrong text")
+    }
+
+    let r2 = rope_delete(r1, 0, 6)
+    let s2 = rope_to_str(r2)
+    if s2 != " world" {
+        return outcome_fail(s2, "delete produced wrong text")
+    }
+
+    let r3 = rope_replace(r2, 0, 1, "X")
+    if rope_to_str(r3) != "Xworld" {
+        return outcome_fail(rope_to_str(r3), "replace produced wrong text")
+    }
+
+    let ix = line_index_build("a\nbb\nccc")
+    if line_index_line_count(ix) != 3 {
+        return outcome_fail("", "line count mismatch")
+    }
+    if line_index_line_of(ix, 4) != 1 {
+        return outcome_fail("", "line lookup mismatch")
+    }
+
+    // UTF-8 vs UTF-16: 'a' = 1 byte / 1 unit, U+1F600 = 4 bytes / 2 units,
+    // 'b' = 1 byte / 1 unit. Cyrillic U+0416 = 2 bytes / 1 unit.
+    let astral = "a😀b"
+    if utf16_len(astral) != 4 {
+        return outcome_fail("", "utf16 length mismatch")
+    }
+    if utf8_char_count(astral) != 3 {
+        return outcome_fail("", "char count mismatch")
+    }
+    if utf16_offset(astral, 5) != 3 {
+        return outcome_fail("", "utf16 offset mismatch")
+    }
+    if utf16_to_byte(astral, 3) != 5 {
+        return outcome_fail("", "utf16 reverse offset mismatch")
+    }
+    if utf16_len("Ж") != 1 {
+        return outcome_fail("", "cyrillic utf16 width mismatch")
+    }
+    if !utf8_is_valid(astral) {
+        return outcome_fail("", "valid utf8 reported invalid")
+    }
+    if eol_detect("a\r\nb\r\nc") != 2 {
+        return outcome_fail("", "crlf detection mismatch")
+    }
+    if eol_count_lines("a\nb\nc") != 3 {
+        return outcome_fail("", "line count mismatch")
+    }
+
+    return outcome_ok("text engine self-test passed")
+}

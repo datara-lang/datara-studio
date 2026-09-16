@@ -1,0 +1,317 @@
+//! ryan-text :: incremental line index
+//!
+//! The line index maps between byte offsets and (line, column) positions. It is
+//! the structure every editor feature depends on: gutter numbers, folding,
+//! go-to-line, LSP position conversion, diagnostics grouping.
+//!
+//! Design choice: the index stores line *start byte offsets* only, and derives
+//! columns by subtraction. That keeps the index a single `List<Int>` — cheap to
+//! copy, cheap to snapshot, and trivial to verify. Incremental maintenance is
+//! done by splicing the affected suffix rather than rebuilding.
+
+pub struct LineIndex {
+    /// line_starts[i] = byte offset where line i begins. Always starts with 0.
+    li_line_starts: List<Int>
+    /// total byte length the index was built against
+    li_byte_len: Int
+    /// how many times the index was rebuilt or spliced (observability)
+    li_updates: Int
+}
+
+pub fn line_index_new() -> LineIndex {
+    return LineIndex { li_line_starts: [0], li_byte_len: 0, li_updates: 0 }
+}
+
+pub fn line_index_build( text: Str) -> LineIndex {
+    mut starts: List<Int> = [0]
+    let n = str_len(text)
+    mut i = 0
+    while i < n {
+        if str_byte_at(text, i) == 10 {
+            starts = starts.push(i + 1)
+        }
+        i = i + 1
+    }
+    return LineIndex { li_line_starts: starts, li_byte_len: n, li_updates: 1 }
+}
+
+pub fn line_index_from_rope( view r: Rope) -> LineIndex {
+    return LineIndex {
+        li_line_starts: rope_line_starts(r),
+        li_byte_len: rope_len(r),
+        li_updates: 1
+    }
+}
+
+pub fn line_index_line_count( view ix: LineIndex) -> Int => ix.li_line_starts.len()
+
+pub fn line_index_byte_len( view ix: LineIndex) -> Int => ix.li_byte_len
+
+pub fn line_index_updates( view ix: LineIndex) -> Int => ix.li_updates
+
+/// Byte offset of the first character of `line`. Clamped to the document.
+pub fn line_index_line_start( view ix: LineIndex, line: Int) -> Int {
+    if line <= 0 {
+        return 0
+    }
+    if line >= ix.li_line_starts.len() {
+        return ix.li_byte_len
+    }
+    return ix.li_line_starts[line]
+}
+
+/// Byte offset just past the last character of `line`, excluding the newline.
+pub fn line_index_line_end( view ix: LineIndex, line: Int) -> Int {
+    if line < 0 || line >= ix.li_line_starts.len() {
+        return ix.li_byte_len
+    }
+    mut next_start = ix.li_byte_len
+    if line + 1 < ix.li_line_starts.len() {
+        next_start = ix.li_line_starts[line + 1]
+    }
+    // Datara has no if-expressions, so the branch is materialised here.
+    // A line end excludes the single trailing LF; a CR is trimmed by the caller
+    // which has the actual text.
+    if next_start > ix.li_line_starts[line] {
+        return next_start - 1
+    }
+    return next_start
+}
+
+/// 0-based line number containing `offset`, by binary search over line starts.
+pub fn line_index_line_of( view ix: LineIndex, offset: Int) -> Int {
+    mut lo = 0
+    mut hi = ix.li_line_starts.len() - 1
+    mut result = 0
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        if ix.li_line_starts[mid] <= offset {
+            result = mid
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return result
+}
+
+/// 0-based column, measured in bytes from the start of the line.
+pub fn line_index_column_of( view ix: LineIndex, offset: Int) -> Int {
+    let line = line_index_line_of(ix, offset)
+    return offset - ix.li_line_starts[line]
+}
+
+pub fn line_index_position( view ix: LineIndex, offset: Int) -> Position {
+    let line = line_index_line_of(ix, offset)
+    let col = offset - ix.li_line_starts[line]
+    return position_new(line, col)
+}
+
+/// Offset for a (line, column) position, clamped into the document.
+pub fn line_index_offset_of( view ix: LineIndex, line: Int, column: Int) -> Int {
+    let start = line_index_line_start(ix, line)
+    mut end = ix.li_byte_len
+    if line + 1 < ix.li_line_starts.len() {
+        end = ix.li_line_starts[line + 1]
+    }
+    mut off = start + column
+    if off > end {
+        off = end
+    }
+    return off
+}
+
+/// Rebuild after an edit. `delta` is the signed byte-length change and `at` is
+/// the byte offset where the change began.
+///
+/// Rather than rebuilding from scratch, we splice:
+///   * every line start before `at` is untouched;
+///   * line starts inside the edited region are dropped;
+///   * line starts after the region are shifted by `delta`.
+/// `new_lines` supplies the line starts discovered inside the inserted text.
+pub fn line_index_splice( view ix: LineIndex, at: Int, removed_bytes: Int, delta: Int, new_lines: List<Int>) -> LineIndex {
+    let region_end = at + removed_bytes
+    mut buf: List<Int> = []
+    mut i = 0
+    while i < ix.li_line_starts.len() {
+        let s = ix.li_line_starts[i]
+        if s <= at {
+            buf = buf.push(s)
+        } else if s >= region_end {
+            buf = buf.push(s + delta)
+        }
+        // line starts strictly inside (at, region_end) are dropped
+        i = i + 1
+    }
+
+    mut j = 0
+    while j < new_lines.len() {
+        buf = buf.push(new_lines[j] + at)
+        j = j + 1
+    }
+
+    return LineIndex {
+        li_line_starts: line_index_sort(buf),
+        li_byte_len: ix.li_byte_len + delta,
+        li_updates: ix.li_updates + 1
+    }
+}
+
+/// Small insertion sort. Chunk lists and line-start lists are near-sorted by
+/// construction, so an O(n^2) sort on a nearly-ordered list is the right call
+/// and avoids pulling in a comparison-sort generic.
+pub fn line_index_sort( values: List<Int>) -> List<Int> {
+    mut a = values
+    let n = a.len()
+    mut i = 1
+    while i < n {
+        let key = a[i]
+        mut j = i - 1
+        while j >= 0 && a[j] > key {
+            a[j + 1] = a[j]
+            j = j - 1
+        }
+        a[j + 1] = key
+        i = i + 1
+    }
+    return a
+}
+
+/// Line starts discovered inside a newly inserted text fragment, expressed as
+/// offsets relative to the fragment.
+pub fn line_index_scan_lines( text: Str) -> List<Int> {
+    mut buf: List<Int> = []
+    let n = str_len(text)
+    mut i = 0
+    while i < n {
+        if str_byte_at(text, i) == 10 {
+            buf = buf.push(i + 1)
+        }
+        i = i + 1
+    }
+    return buf
+}
+
+// ---------------------------------------------------------------------------
+// Position / Range / Selection
+// ---------------------------------------------------------------------------
+
+pub struct Position {
+    pos_line: Int
+    pos_column: Int
+}
+
+pub fn position_new( line: Int, column: Int) -> Position {
+    return Position { pos_line: line, pos_column: column }
+}
+
+pub fn position_line( view p: Position) -> Int => p.pos_line
+pub fn position_column( view p: Position) -> Int => p.pos_column
+
+pub fn position_render( view p: Position) -> Str {
+    return fmt"{p.pos_line}:{p.pos_column}"
+}
+
+pub fn position_eq( view a: Position, view b: Position) -> Bool {
+    return a.pos_line == b.pos_line && a.pos_column == b.pos_column
+}
+
+pub fn position_before( view a: Position, view b: Position) -> Bool {
+    if a.pos_line != b.pos_line {
+        return a.pos_line < b.pos_line
+    }
+    return a.pos_column < b.pos_column
+}
+
+/// A range is half-open [start, end) in byte offsets.
+pub struct Range {
+    range_start: Int
+    range_end: Int
+}
+
+pub fn range_new( start: Int, end: Int) -> Range {
+    if start <= end {
+        return Range { range_start: start, range_end: end }
+    }
+    return Range { range_start: end, range_end: start }
+}
+
+pub fn range_start( view r: Range) -> Int => r.range_start
+pub fn range_end( view r: Range) -> Int => r.range_end
+pub fn range_len( view r: Range) -> Int => r.range_end - r.range_start
+pub fn range_is_empty( view r: Range) -> Bool => r.range_start == r.range_end
+
+pub fn range_contains( view r: Range, offset: Int) -> Bool {
+    return offset >= r.range_start && offset < r.range_end
+}
+
+pub fn range_overlaps( view a: Range, view b: Range) -> Bool {
+    return a.range_start < b.range_end && b.range_start < a.range_end
+}
+
+pub fn range_render( view r: Range) -> Str {
+    return fmt"{r.range_start}..{r.range_end}"
+}
+
+/// A selection is a range plus a direction, so that shift-selection and
+/// multi-cursor editing can restore the caret end faithfully.
+pub struct Selection {
+    sel_range: Range
+    /// 0 = anchor before cursor, 1 = cursor before anchor
+    sel_reversed: Int
+}
+
+pub fn selection_new( start: Int, end: Int) -> Selection {
+    return Selection { sel_range: range_new(start, end), sel_reversed: 0 }
+}
+
+pub fn selection_reversed( start: Int, end: Int) -> Selection {
+    return Selection { sel_range: range_new(start, end), sel_reversed: 1 }
+}
+
+pub fn selection_caret( view s: Selection) -> Int {
+    if s.sel_reversed == 1 {
+        return s.sel_range.range_start
+    }
+    return s.sel_range.range_end
+}
+
+pub fn selection_anchor( view s: Selection) -> Int {
+    if s.sel_reversed == 1 {
+        return s.sel_range.range_end
+    }
+    return s.sel_range.range_start
+}
+
+pub fn selection_range( view s: Selection) -> Range => s.sel_range
+
+pub fn selection_render( view s: Selection) -> Str {
+    return range_render(s.sel_range)
+}
+
+/// A view state is pure UI-adjacent data that the kernel stores on behalf of a
+/// client. It is never the source of truth for document content.
+pub struct ViewState {
+    view_scroll_line: Int
+    view_scroll_column: Int
+    view_folds: List<Int>
+    view_selections: List<Selection>
+}
+
+pub fn view_state_new() -> ViewState {
+    return ViewState {
+        view_scroll_line: 0,
+        view_scroll_column: 0,
+        view_folds: [],
+        view_selections: [selection_new(0, 0)]
+    }
+}
+
+pub fn view_state_selections( view v: ViewState) -> List<Selection> => v.view_selections
+
+pub fn view_state_primary( view v: ViewState) -> Selection {
+    if v.view_selections.len() == 0 {
+        return selection_new(0, 0)
+    }
+    return v.view_selections[0]
+}

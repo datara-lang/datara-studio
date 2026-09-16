@@ -1,0 +1,125 @@
+//! ryan-cli :: the headless entry point
+//!
+//! The master prompt requires that the kernel be fully useful with zero AI code
+//! and zero cloud dependency. This CLI is the proof surface for that claim: it
+//! runs with no network, no model and no daemon, and every command it exposes
+//! reads only local state.
+//!
+//! Command surface (deliberately small until the subsystems land):
+//!
+//!   ryan                     banner + self-test
+//!   ryan version             version and ABI
+//!   ryan selftest            run the kernel self-test suite
+//!   ryan capabilities        machine-readable capability inventory
+//!   ryan help                usage
+//!
+//! Exit codes are part of the contract, because CI depends on them:
+//!   0  success
+//!   1  a self-test failed
+//!   2  unknown command or bad arguments
+
+use core
+use text
+use events
+use selftest
+
+/// Exit codes. Named so the CLI and the conformance runner cannot drift.
+pub fn exit_ok() -> Int => 0
+pub fn exit_test_failed() -> Int => 1
+pub fn exit_usage() -> Int => 2
+
+pub fn cli_usage() -> Str {
+    return "ryan - Ryan Harness Core (headless kernel)\n"
+        + "\n"
+        + "usage: ryan [command]\n"
+        + "\n"
+        + "commands:\n"
+        + "  (none)          print the banner and run the self-test suite\n"
+        + "  version         print kernel version and ABI\n"
+        + "  selftest        run the kernel self-test suite\n"
+        + "  capabilities    print the capability inventory, one per line\n"
+        + "  help            print this message\n"
+        + "\n"
+        + "The kernel requires no network and no AI subsystem.\n"
+}
+
+/// `ryan version`
+pub fn cli_version() -> Int {
+    println(kernel_banner())
+    println("abi " + int_to_str(ryan_kernel_abi()))
+    return exit_ok()
+}
+
+/// `ryan capabilities` - one `key=value` per line so the output is greppable and
+/// diffable, which is how conformance checks it.
+pub fn cli_capabilities() -> Int {
+    let caps = kernel_capabilities()
+    mut i = 0
+    while i < caps.len() {
+        println(caps[i])
+        i = i + 1
+    }
+    return exit_ok()
+}
+
+/// `ryan selftest` - run the suite and report. A failure prints the observed
+/// wrong value, not just the test name, so the report is actionable on its own.
+pub fn cli_selftest() -> Int {
+    let suite = kernel_selftests()
+    println(suite_render(suite))
+    if !suite_all_passed(suite) {
+        println("")
+        println("failures:")
+        print(suite_failure_report(suite))
+        return exit_test_failed()
+    }
+    return exit_ok()
+}
+
+/// The default action: banner plus self-test.
+pub fn cli_default() -> Int {
+    println(kernel_banner())
+    return cli_selftest()
+}
+
+/// Dispatch. Returns the process exit code.
+pub fn cli_dispatch( view argv: List<Str>) -> Int {
+    if argv.len() == 0 {
+        return cli_default()
+    }
+    let cmd = argv[0]
+    if cmd == "version" {
+        return cli_version()
+    }
+    if cmd == "selftest" {
+        return cli_selftest()
+    }
+    if cmd == "capabilities" {
+        return cli_capabilities()
+    }
+    if cmd == "help" {
+        print(cli_usage())
+        return exit_ok()
+    }
+    println("ryan: unknown command '" + cmd + "'")
+    print(cli_usage())
+    return exit_usage()
+}
+
+/// Collect argv minus the program name. `args_count()` includes argv[0] on both
+/// the JIT and AOT paths, verified against forgen 1.3.0, so user arguments
+/// start at index 1.
+pub fn cli_args() -> List<Str> {
+    mut a: List<Str> = []
+    let n = args_count()
+    mut i = 1
+    while i < n {
+        a = a.push(args_get(i))
+        i = i + 1
+    }
+    return a
+}
+
+pub fn cli_main() -> Int {
+    return cli_dispatch(cli_args())
+}

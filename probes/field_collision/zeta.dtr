@@ -1,0 +1,7 @@
+pub struct Q { items: List<Str> }
+pub fn q_make() -> Q {
+    mut l: List<Str> = []
+    l = l.push("zz")
+    return Q { items: l }
+}
+pub fn q_get(view x: Q) -> Str => x.items[0]

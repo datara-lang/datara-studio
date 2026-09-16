@@ -1,0 +1,381 @@
+//! ryan-text :: edits, grouped edits, multi-cursor and undo
+//!
+//! An `Edit` is the atomic unit of text change. A `EditBatch` groups edits that
+//! must land together — a multi-cursor keystroke, a refactor, a formatter run.
+//! The undo stack stores *inverses*, so undo is an ordinary edit application and
+//! therefore goes through exactly the same code path as typing.
+
+pub struct Edit {
+    /// byte offset where the change begins
+    edit_start: Int
+    /// bytes removed at `start`
+    edit_removed: Int
+    /// text inserted at `start`
+    edit_inserted: Str
+}
+
+pub fn edit_new( start: Int, removed: Int, inserted: Str) -> Edit {
+    return Edit { edit_start: start, edit_removed: removed, edit_inserted: inserted }
+}
+
+pub fn edit_insert( start: Int, inserted: Str) -> Edit {
+    return Edit { edit_start: start, edit_removed: 0, edit_inserted: inserted }
+}
+
+pub fn edit_delete( start: Int, removed: Int) -> Edit {
+    return Edit { edit_start: start, edit_removed: removed, edit_inserted: "" }
+}
+
+pub fn edit_start( view e: Edit) -> Int => e.edit_start
+pub fn edit_removed( view e: Edit) -> Int => e.edit_removed
+pub fn edit_inserted( view e: Edit) -> Str => e.edit_inserted
+pub fn edit_end( view e: Edit) -> Int => e.edit_start + e.edit_removed
+
+pub fn edit_render( view e: Edit) -> Str {
+    return fmt"@{e.edit_start} -{e.edit_removed} +{str_len(e.edit_inserted)}"
+}
+
+/// Apply an edit to a rope. Returns the new rope.
+pub fn edit_apply( view r: Rope, view e: Edit) -> Rope {
+    return rope_replace(r, e.edit_start, e.edit_removed, e.edit_inserted)
+}
+
+/// The inverse of an edit, given the text that the edit removed.
+/// `removed_text` must be the exact bytes that `e` deleted.
+pub fn edit_invert( view e: Edit, removed_text: Str) -> Edit {
+    return Edit {
+        edit_start: e.edit_start,
+        edit_removed: str_len(e.edit_inserted),
+        edit_inserted: removed_text
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Edit batches (multi-cursor / grouped edits)
+// ---------------------------------------------------------------------------
+
+/// A batch applies atomically: either every edit lands or none does. Edits are
+/// kept sorted by descending start offset so that applying them does not shift
+/// the offsets of the edits that have not been applied yet.
+pub struct EditBatch {
+    batch_edits: List<Edit>
+    batch_label: Str
+    /// set when the batch came from more than one caret
+    batch_cursor_count: Int
+}
+
+pub fn edit_batch_new( label: Str) -> EditBatch {
+    return EditBatch { batch_edits: [], batch_label: label, batch_cursor_count: 1 }
+}
+
+pub fn edit_batch_add( view b: EditBatch, view e: Edit) -> EditBatch {
+    mut edits = b.batch_edits
+    edits = edits.push(e)
+    return EditBatch { batch_edits: edits, batch_label: b.batch_label, batch_cursor_count: b.batch_cursor_count }
+}
+
+pub fn edit_batch_len( view b: EditBatch) -> Int => b.batch_edits.len()
+pub fn edit_batch_label( view b: EditBatch) -> Str => b.batch_label
+pub fn edit_batch_edits( view b: EditBatch) -> List<Edit> => b.batch_edits
+pub fn edit_batch_cursor_count( view b: EditBatch) -> Int => b.batch_cursor_count
+
+pub fn edit_batch_set_cursor_count( view b: EditBatch, n: Int) -> EditBatch {
+    return EditBatch { batch_edits: b.batch_edits, batch_label: b.batch_label, batch_cursor_count: n }
+}
+
+/// Sort descending by start offset (insertion sort; batches are small).
+pub fn edit_batch_sorted_desc( view b: EditBatch) -> EditBatch {
+    mut a = b.batch_edits
+    let n = a.len()
+    mut i = 1
+    while i < n {
+        let key = a[i]
+        mut j = i - 1
+        while j >= 0 && edit_start(a[j]) < edit_start(key) {
+            a[j + 1] = a[j]
+            j = j - 1
+        }
+        a[j + 1] = key
+        i = i + 1
+    }
+    return EditBatch { batch_edits: a, batch_label: b.batch_label, batch_cursor_count: b.batch_cursor_count }
+}
+
+/// Detect overlapping edits. Overlapping edits in one batch are a programming
+/// error and must be rejected *before* anything is written, because a partially
+/// applied batch is exactly the half-applied mutation the transaction system
+/// exists to prevent.
+pub fn edit_batch_validate( view b: EditBatch) -> EditBatchCheck {
+    let sorted = edit_batch_sorted_desc(b)
+    let a = sorted.batch_edits
+    mut i = 1
+    while i < a.len() {
+        // a is descending: a[i] starts at or before a[i-1]
+        if edit_end(a[i]) > edit_start(a[i - 1]) {
+            return EditBatchCheck {
+                check_valid: false,
+                check_reason: fmt"overlapping edits at {edit_start(a[i])} and {edit_start(a[i-1])}"
+            }
+        }
+        i = i + 1
+    }
+    return EditBatchCheck { check_valid: true, check_reason: "" }
+}
+
+pub struct EditBatchCheck {
+    check_valid: Bool
+    check_reason: Str
+}
+
+pub fn edit_batch_check_valid( view c: EditBatchCheck) -> Bool => c.check_valid
+pub fn edit_batch_check_reason( view c: EditBatchCheck) -> Str => c.check_reason
+
+/// Apply a batch. Precondition: `edit_batch_validate` returned valid.
+pub fn edit_batch_apply( view r: Rope, view b: EditBatch) -> Rope {
+    let sorted = edit_batch_sorted_desc(b)
+    mut buf = r
+    let a = sorted.batch_edits
+    mut i = 0
+    while i < a.len() {
+        buf = edit_apply(buf, a[i])
+        i = i + 1
+    }
+    return buf
+}
+
+/// Compute the inverse batch against the *pre-state* text. The result can be
+/// applied to the post-state rope to restore the pre-state exactly.
+pub fn edit_batch_invert( view b: EditBatch, pre_text: Str) -> EditBatch {
+    mut inv = edit_batch_new(b.batch_label)
+    let a = b.batch_edits
+    mut i = 0
+    while i < a.len() {
+        let e = a[i]
+        let removed_text = str_substring(pre_text, e.edit_start, e.edit_removed)
+        inv = edit_batch_add(inv, edit_invert(e, removed_text))
+        i = i + 1
+    }
+    return edit_batch_set_cursor_count(inv, b.batch_cursor_count)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-cursor helpers
+// ---------------------------------------------------------------------------
+
+/// Build a batch that inserts the same text at every caret.
+/// Carets must be sorted ascending; the batch is returned descending so it can
+/// be applied directly.
+pub fn multicursor_insert( carets: List<Int>, text: Str) -> EditBatch {
+    mut b = edit_batch_new("multicursor.insert")
+    mut i = 0
+    while i < carets.len() {
+        b = edit_batch_add(b, edit_insert(carets[i], text))
+        i = i + 1
+    }
+    b = edit_batch_set_cursor_count(b, carets.len())
+    return b
+}
+
+/// Build a batch that deletes every selection. Selections must not overlap.
+pub fn multicursor_delete( selections: List<Selection>) -> EditBatch {
+    mut b = edit_batch_new("multicursor.delete")
+    mut i = 0
+    while i < selections.len() {
+        let r = selection_range(selections[i])
+        b = edit_batch_add(b, edit_delete(range_start(r), range_len(r)))
+        i = i + 1
+    }
+    b = edit_batch_set_cursor_count(b, selections.len())
+    return b
+}
+
+/// Insert text around every selection (e.g. wrap in quotes, add a comment).
+pub fn multicursor_wrap( selections: List<Selection>, prefix: Str, suffix: Str) -> EditBatch {
+    mut b = edit_batch_new("multicursor.wrap")
+    mut i = 0
+    while i < selections.len() {
+        let r = selection_range(selections[i])
+        b = edit_batch_add(b, edit_insert(range_end(r), suffix))
+        b = edit_batch_add(b, edit_insert(range_start(r), prefix))
+        i = i + 1
+    }
+    b = edit_batch_set_cursor_count(b, selections.len())
+    return b
+}
+
+// ---------------------------------------------------------------------------
+// Undo / redo
+// ---------------------------------------------------------------------------
+
+pub struct UndoEntry {
+    entry_batch: EditBatch
+    entry_label: Str
+    /// document revision this entry restores
+    entry_restores_revision: Int
+    /// cursor state before the edit, restored on undo
+    entry_caret_before: Int
+}
+
+pub struct UndoStack {
+    undo_entries: List<UndoEntry>
+    undo_redo: List<UndoEntry>
+    /// grouped edits: consecutive entries sharing a group id collapse into one
+    /// undo step (typing a word, then undoing the whole word)
+    undo_group: Str
+    undo_group_depth: Int
+    undo_limit: Int
+}
+
+pub fn undo_stack_new() -> UndoStack {
+    return UndoStack {
+        undo_entries: [],
+        undo_redo: [],
+        undo_group: "",
+        undo_group_depth: 0,
+        undo_limit: 1024
+    }
+}
+
+pub fn undo_stack_limit( view s: UndoStack) -> Int => s.undo_limit
+
+pub fn undo_stack_set_limit( view s: UndoStack, n: Int) -> UndoStack {
+    return UndoStack {
+        undo_entries: s.undo_entries,
+        undo_redo: s.undo_redo,
+        undo_group: s.undo_group,
+        undo_group_depth: s.undo_group_depth,
+        undo_limit: n
+    }
+}
+
+pub fn undo_stack_depth( view s: UndoStack) -> Int => s.undo_entries.len()
+pub fn undo_stack_redo_depth( view s: UndoStack) -> Int => s.undo_redo.len()
+pub fn undo_stack_can_undo( view s: UndoStack) -> Bool => s.undo_entries.len() > 0
+pub fn undo_stack_can_redo( view s: UndoStack) -> Bool => s.undo_redo.len() > 0
+pub fn undo_stack_group( view s: UndoStack) -> Str => s.undo_group
+
+/// Push an entry, clearing the redo stack (any new edit invalidates redo).
+pub fn undo_stack_push( view s: UndoStack, view batch: EditBatch, restores_revision: Int, caret_before: Int) -> UndoStack {
+    mut entries = s.undo_entries
+    entries = entries.push(UndoEntry {
+        entry_batch: batch,
+        entry_label: batch.batch_label,
+        entry_restores_revision: restores_revision,
+        entry_caret_before: caret_before
+    })
+    // enforce the bounded history
+    mut trimmed: List<UndoEntry> = []
+    let n = entries.len()
+    mut start = 0
+    if n > s.undo_limit {
+        start = n - s.undo_limit
+    }
+    mut i = start
+    while i < n {
+        trimmed = trimmed.push(entries[i])
+        i = i + 1
+    }
+    return UndoStack {
+        undo_entries: trimmed,
+        undo_redo: [],
+        undo_group: s.undo_group,
+        undo_group_depth: s.undo_group_depth,
+        undo_limit: s.undo_limit
+    }
+}
+
+/// Begin a group. Nested groups collapse into the outermost one.
+pub fn undo_stack_begin_group( view s: UndoStack, name: Str) -> UndoStack {
+    if s.undo_group_depth > 0 {
+        return UndoStack {
+            undo_entries: s.undo_entries,
+            undo_redo: s.undo_redo,
+            undo_group: s.undo_group,
+            undo_group_depth: s.undo_group_depth + 1,
+            undo_limit: s.undo_limit
+        }
+    }
+    return UndoStack {
+        undo_entries: s.undo_entries,
+        undo_redo: s.undo_redo,
+        undo_group: name,
+        undo_group_depth: 1,
+        undo_limit: s.undo_limit
+    }
+}
+
+pub fn undo_stack_end_group( view s: UndoStack) -> UndoStack {
+    mut depth = s.undo_group_depth - 1
+    if depth < 0 {
+        depth = 0
+    }
+    mut name = s.undo_group
+    if depth == 0 {
+        name = ""
+    }
+    return UndoStack {
+        undo_entries: s.undo_entries,
+        undo_redo: s.undo_redo,
+        undo_group: name,
+        undo_group_depth: depth,
+        undo_limit: s.undo_limit
+    }
+}
+
+/// Pop the most recent entry and move it to the redo stack.
+pub fn undo_stack_pop( view s: UndoStack) -> UndoPop {
+    if s.undo_entries.len() == 0 {
+        return UndoPop {
+            pop_found: false,
+            pop_entry: UndoEntry {
+                batch: edit_batch_new(""),
+                label: "",
+                restores_revision: 0,
+                caret_before: 0
+            },
+            pop_stack: s
+        }
+    }
+    let last_index = s.undo_entries.len() - 1
+    let entry = s.undo_entries[last_index]
+
+    mut kept: List<UndoEntry> = []
+    mut i = 0
+    while i < last_index {
+        kept = kept.push(s.undo_entries[i])
+        i = i + 1
+    }
+
+    mut redo = s.undo_redo
+    redo = redo.push(entry)
+
+    return UndoPop {
+        pop_found: true,
+        pop_entry: entry,
+        pop_stack: UndoStack {
+            entries: kept,
+            redo: redo,
+            group: s.undo_group,
+            group_depth: s.undo_group_depth,
+            limit: s.undo_limit
+        }
+    }
+}
+
+pub struct UndoPop {
+    pop_found: Bool
+    pop_entry: UndoEntry
+    pop_stack: UndoStack
+}
+
+pub fn undo_pop_found( view p: UndoPop) -> Bool => p.pop_found
+pub fn undo_pop_entry( view p: UndoPop) -> UndoEntry => p.pop_entry
+pub fn undo_pop_stack( view p: UndoPop) -> UndoStack => p.pop_stack
+
+pub fn undo_entry_batch( view e: UndoEntry) -> EditBatch => e.entry_batch
+pub fn undo_entry_label( view e: UndoEntry) -> Str => e.entry_label
+pub fn undo_entry_caret( view e: UndoEntry) -> Int => e.entry_caret_before
+
+pub fn undo_stack_clear( view s: UndoStack) -> UndoStack {
+    return UndoStack { undo_entries: [], undo_redo: [], undo_group: "", undo_group_depth: 0, undo_limit: s.undo_limit }
+}

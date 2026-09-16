@@ -1,0 +1,30 @@
+# Line endings, pinned so a clone behaves identically on every platform.
+#
+# This file exists because of a specific failure. Windows Git defaults to
+# core.autocrlf=true, which rewrites line endings on checkout. A shell script
+# written and committed on Windows therefore arrives on Linux with CRLF, and the
+# kernel refuses it:
+#
+#     bash: ./scripts/build.sh: /bin/bash^M: bad interpreter: No such file or directory
+#
+# That is the classic way a build works for the person who wrote it and for
+# nobody else, and it is why "it runs on Linux too" cannot be left to each
+# developer's local Git settings.
+
+# Everything is normalised to LF in the repository. Checkout is LF as well, so
+# the working tree matches what CI and a Linux clone see.
+* text=auto eol=lf
+
+# Windows batch files are the one exception: cmd.exe is happiest with CRLF, and
+# they are never executed anywhere else.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Never touched. `text=auto` would otherwise be free to mangle these, and a
+# corrupted binary fails in a way that looks like a code bug.
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.pdb binary

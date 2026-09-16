@@ -1,0 +1,3 @@
+pub struct A { f: Int }
+pub fn a_make() -> A => A { f: 7 }
+pub fn a_get(view x: A) -> Int => x.f

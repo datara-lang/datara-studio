@@ -1,0 +1,25 @@
+//! Ryan Harness Core - headless IDE kernel entry point.
+//!
+//! This file exists only to hand control to `cli.dtr` and to carry the process
+//! exit code. All behaviour lives in the library modules so that the kernel can
+//! be linked into a host (LSP server, extension host, test harness) without
+//! going through `main`.
+//!
+//! Exit-code mechanism, measured against forgen 1.3.0:
+//!
+//!   * the `exit()` builtin is declared in the prelude but **not implemented**:
+//!     both `forgen run` and `forgen build` fail codegen with
+//!     `unresolved function call 'datara_rt_exit'`.
+//!   * `fn main() -> Int` is the working mechanism. Under AOT the returned
+//!     value becomes the process exit status (verified: returning 3 yields
+//!     status 3). Under `forgen run` the JIT wrapper discards it and the
+//!     process always reports 0.
+//!
+//! Consequence for CI: exit-code assertions must run the AOT binary
+//! (`scripts/build.sh` then `build/ryan.exe`), never `forgen run`.
+
+use cli
+
+fn main() -> Int {
+    return cli_main()
+}

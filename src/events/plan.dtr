@@ -1,0 +1,241 @@
+//! ryan-events :: delivery plan and pump
+//!
+//! The pump turns a queue of published events into an ordered delivery plan.
+//! It is separated from `bus.dtr` deliberately: the plan is a pure function of
+//! (subscriptions, queue) and can therefore be unit-tested without a bus, and
+//! the bus file stays small enough to audit by eye.
+//!
+//! Ordering rules (asserted by `tests/test_events.dtr`):
+//!   1. events are delivered in publish order (sequence ascending);
+//!   2. within one event, subscriptions are visited by priority descending,
+//!      then by subscription id ascending;
+//!   3. a cancelled subscription receives nothing;
+//!   4. a cancelled event produces no deliveries but is still logged.
+
+/// A delivery is a *description* of a notification, not a callback. Datara has
+/// no closures, so the bus hands the plan to the kernel dispatcher which routes
+/// each entry to the owning module.
+pub struct Delivery {
+    dlv_subscription_id: Int
+    dlv_subscription_scope: Str
+    dlv_subscription_scope_id: Int
+    dlv_kind: Str
+    dlv_sequence: Int
+    dlv_correlation: Int
+    dlv_deferred_mode: Bool
+}
+
+pub fn delivery_kind( view d: Delivery) -> Str => d.dlv_kind
+pub fn delivery_sequence( view d: Delivery) -> Int => d.dlv_sequence
+pub fn delivery_correlation( view d: Delivery) -> Int => d.dlv_correlation
+pub fn delivery_subscription_id( view d: Delivery) -> Int => d.dlv_subscription_id
+pub fn delivery_subscription_scope( view d: Delivery) -> Str => d.dlv_subscription_scope
+pub fn delivery_is_deferred( view d: Delivery) -> Bool => d.dlv_deferred_mode
+
+pub struct PumpResult {
+    pump_bus: Bus
+    pump_deliveries: List<Delivery>
+    pump_deferred: List<Delivery>
+}
+
+pub fn pump_bus( view r: PumpResult) -> Bus => r.pump_bus
+pub fn pump_deliveries( view r: PumpResult) -> List<Delivery> => r.pump_deliveries
+pub fn pump_deferred( view r: PumpResult) -> List<Delivery> => r.pump_deferred
+
+/// Sort subscriptions by descending priority, then ascending id.
+///
+/// Insertion sort over a nearly-ordered list. Subscription counts are small
+/// (tens, not thousands) and this avoids pulling a comparison-sort generic into
+/// the kernel for one call site. The id tiebreak is what makes delivery order
+/// deterministic when two subscribers share a priority.
+pub fn bus_ordered_subs( view bus: Bus) -> List<Subscription> {
+    mut a = bus.bus_subs
+    let n = a.len()
+    mut i = 1
+    while i < n {
+        let cur = a[i]
+        mut j = i - 1
+        mut placed = false
+        while j >= 0 && !placed {
+            let worse = a[j].sub_priority < cur.sub_priority
+            let tied = a[j].sub_priority == cur.sub_priority && a[j].sub_id > cur.sub_id
+            if worse || tied {
+                a[j + 1] = a[j]
+                j = j - 1
+            } else {
+                placed = true
+            }
+        }
+        a[j + 1] = cur
+        i = i + 1
+    }
+    return a
+}
+
+/// Build the delivery plan for a single event.
+pub fn bus_plan_event( view ordered: List<Subscription>, view ev: Event) -> List<Delivery> {
+    mut plan: List<Delivery> = []
+    if ev.ev_cancelled {
+        return plan
+    }
+    mut s = 0
+    while s < ordered.len() {
+        let sub = ordered[s]
+        if subscription_matches(sub, ev) {
+            plan = plan.push(Delivery {
+                dlv_subscription_id: sub.sub_id,
+                dlv_subscription_scope: sub.sub_scope,
+                dlv_subscription_scope_id: sub.sub_scope_id,
+                dlv_kind: ev.ev_kind,
+                dlv_sequence: ev.ev_sequence,
+                dlv_correlation: ev.ev_correlation,
+                dlv_deferred_mode: sub.sub_deferred_mode
+            })
+        }
+        s = s + 1
+    }
+    return plan
+}
+
+pub fn bus_partition_sync( plan: List<Delivery>) -> List<Delivery> {
+    mut res: List<Delivery> = []
+    mut i = 0
+    while i < plan.len() {
+        if !plan[i].dlv_deferred_mode {
+            res = res.push(plan[i])
+        }
+        i = i + 1
+    }
+    return res
+}
+
+pub fn bus_partition_deferred( plan: List<Delivery>) -> List<Delivery> {
+    mut res: List<Delivery> = []
+    mut i = 0
+    while i < plan.len() {
+        if plan[i].dlv_deferred_mode {
+            res = res.push(plan[i])
+        }
+        i = i + 1
+    }
+    return res
+}
+
+pub fn bus_count_by_subscription( plan: List<Delivery>, sub_id: Int) -> Int {
+    mut n = 0
+    mut i = 0
+    while i < plan.len() {
+        if plan[i].dlv_subscription_id == sub_id {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+/// Concatenate a per-event plan list into one flat plan, preserving order.
+pub fn bus_flatten_plans( plans: List<Delivery>) -> List<Delivery> => plans
+
+/// Drain the queue and produce the ordered delivery plan.
+///
+/// This is the only function in the events module that mutates bus state as a
+/// side effect of draining; everything else returns a new bus value.
+pub fn bus_pump( view bus: Bus) -> PumpResult {
+    let ordered = bus_ordered_subs(bus)
+    let queued = bus.bus_queue
+
+    let sync_plan = bus_collect_sync(ordered, queued)
+    let deferred_plan = bus_collect_deferred(ordered, queued)
+
+    return PumpResult {
+        pump_bus: bus_apply_deliveries(bus, sync_plan),
+        pump_deliveries: sync_plan,
+        pump_deferred: deferred_plan
+    }
+}
+
+pub fn bus_collect_sync( view ordered: List<Subscription>, queued: List<Event>) -> List<Delivery> {
+    mut acc: List<Delivery> = []
+    mut e = 0
+    while e < queued.len() {
+        let plan = bus_plan_event(ordered, queued[e])
+        acc = bus_append(acc, bus_partition_sync(plan))
+        e = e + 1
+    }
+    return acc
+}
+
+pub fn bus_collect_deferred( view ordered: List<Subscription>, queued: List<Event>) -> List<Delivery> {
+    mut acc: List<Delivery> = []
+    mut e = 0
+    while e < queued.len() {
+        let plan = bus_plan_event(ordered, queued[e])
+        acc = bus_append(acc, bus_partition_deferred(plan))
+        e = e + 1
+    }
+    return acc
+}
+
+pub fn bus_append( acc: List<Delivery>, more: List<Delivery>) -> List<Delivery> {
+    mut res = acc
+    mut i = 0
+    while i < more.len() {
+        res = res.push(more[i])
+        i = i + 1
+    }
+    return res
+}
+
+/// Fold the pump's effects back into the bus: delivery counters, the bounded
+/// log, a cleared queue and the dispatched total.
+pub fn bus_apply_deliveries( view bus: Bus, plan: List<Delivery>) -> Bus {
+    let bumped = bus_bump_counters(bus, plan)
+    return bus_after_drain(bumped, plan.len())
+}
+
+pub fn bus_bump_counters( view bus: Bus, plan: List<Delivery>) -> Bus {
+    mut subs: List<Subscription> = []
+    mut i = 0
+    while i < bus.bus_subs.len() {
+        let s = bus.bus_subs[i]
+        let hits = bus_count_by_subscription(plan, s.sub_id)
+        subs = subs.push(subscription_with_deliveries(s, s.sub_delivery_count + hits))
+        i = i + 1
+    }
+    return bus_with_subs(bus, subs)
+}
+
+pub fn bus_after_drain( view bus: Bus, delivered: Int) -> Bus {
+    return bus_with_log(bus, bus_append_log(bus.bus_log, bus.bus_queue, bus.bus_log_limit), delivered)
+}
+
+/// Cancel a queued event before it is pumped. Used by pre-delivery validators
+/// (for example: a DocumentChanged whose revision is already stale).
+pub fn bus_cancel_queued( view bus: Bus, sequence: Int, reason: Str) -> Bus {
+    mut queue: List<Event> = []
+    mut i = 0
+    while i < bus.bus_queue.len() {
+        let ev = bus.bus_queue[i]
+        if ev.ev_sequence == sequence {
+            queue = queue.push(event_cancel(ev, reason))
+        } else {
+            queue = queue.push(ev)
+        }
+        i = i + 1
+    }
+    return bus_with_queue(bus, queue)
+}
+
+/// Replay a bounded window of the log. Deterministic mode makes this exact,
+/// which is what the concurrency tests compare between two runs.
+pub fn bus_replay( view bus: Bus, from_sequence: Int) -> List<Event> {
+    mut res: List<Event> = []
+    mut i = 0
+    while i < bus.bus_log.len() {
+        if bus.bus_log[i].ev_sequence >= from_sequence {
+            res = res.push(bus.bus_log[i])
+        }
+        i = i + 1
+    }
+    return res
+}

@@ -1,0 +1,161 @@
+//! ryan-selftest :: kernel self-test aggregation
+//!
+//! Every kernel module exposes a `<module>_selftest() -> Outcome<Str>`. This
+//! module collects them into a single suite so the headless CLI, the conformance
+//! runner and CI all report the same list of facts and can never disagree about
+//! what "passing" means.
+//!
+//! Why `Outcome<Str>` for the detail rather than a message code: on success the
+//! value is a sentence naming what was actually proven, and on failure it is the
+//! observed wrong value. A failure detail is therefore *evidence*, not a label.
+//! The master prompt requires that a claim be reproducible; a test that reports
+//! "text engine self-test failed" without the bad string does not satisfy that.
+
+use core
+use text
+use events
+use stdlib.result.result.Outcome
+
+/// One self-test outcome.
+pub struct TestResult {
+    /// stable identifier, dotted: `text.engine`, `events.bus`
+    tres_name: Str
+    tres_passed: Bool
+    /// on success: what was proven. on failure: the observed wrong value.
+    tres_detail: Str
+}
+
+pub fn test_result_new( name: Str, passed: Bool, detail: Str) -> TestResult {
+    return TestResult { tres_name: name, tres_passed: passed, tres_detail: detail }
+}
+
+pub fn test_result_name( view t: TestResult) -> Str => t.tres_name
+pub fn test_result_passed( view t: TestResult) -> Bool => t.tres_passed
+pub fn test_result_detail( view t: TestResult) -> Str => t.tres_detail
+
+pub fn test_result_render( view t: TestResult) -> Str {
+    mut mark = "FAIL"
+    if t.tres_passed {
+        mark = "PASS"
+    }
+    return fmt"[{mark}] {t.tres_name} :: {t.tres_detail}"
+}
+
+/// Adapt a module self-test into a suite entry.
+pub fn test_from_outcome( name: Str, o: Outcome<Str>) -> TestResult {
+    if o.is_success {
+        return test_result_new(name, true, o.value)
+    }
+    return test_result_new(name, false, o.error_msg)
+}
+
+/// An ordered collection of self-tests.
+pub struct TestSuite {
+    suite_name: Str
+    suite_results: List<TestResult>
+}
+
+pub fn suite_new( name: Str) -> TestSuite {
+    return TestSuite { suite_name: name, suite_results: [] }
+}
+
+pub fn suite_name( view s: TestSuite) -> Str => s.suite_name
+pub fn suite_results( view s: TestSuite) -> List<TestResult> => s.suite_results
+
+pub fn suite_add( view s: TestSuite, view t: TestResult) -> TestSuite {
+    mut rs = s.suite_results
+    rs = rs.push(t)
+    return TestSuite { suite_name: s.suite_name, suite_results: rs }
+}
+
+pub fn suite_add_outcome( view s: TestSuite, name: Str, o: Outcome<Str>) -> TestSuite {
+    return suite_add(s, test_from_outcome(name, o))
+}
+
+pub fn suite_total( view s: TestSuite) -> Int => s.suite_results.len()
+
+pub fn suite_passed( view s: TestSuite) -> Int {
+    mut n = 0
+    mut i = 0
+    while i < s.suite_results.len() {
+        if s.suite_results[i].tres_passed {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub fn suite_failed( view s: TestSuite) -> Int {
+    return suite_total(s) - suite_passed(s)
+}
+
+pub fn suite_all_passed( view s: TestSuite) -> Bool {
+    return suite_failed(s) == 0
+}
+
+pub fn suite_result_at( view s: TestSuite, i: Int) -> TestResult {
+    if i < 0 || i >= s.suite_results.len() {
+        return test_result_new("", false, "no such result")
+    }
+    return s.suite_results[i]
+}
+
+/// Multi-line report. Deterministic: same suite, same bytes.
+pub fn suite_render( view s: TestSuite) -> Str {
+    mut buf = "suite " + s.suite_name
+            + "  " + int_to_str(suite_passed(s)) + "/" + int_to_str(suite_total(s)) + " passed"
+    mut i = 0
+    while i < s.suite_results.len() {
+        buf = buf + "\n  " + test_result_render(s.suite_results[i])
+        i = i + 1
+    }
+    return buf
+}
+
+/// One line per failure, for a terse CI summary. Empty when everything passed.
+pub fn suite_failure_report( view s: TestSuite) -> Str {
+    mut buf = ""
+    mut i = 0
+    while i < s.suite_results.len() {
+        let t = s.suite_results[i]
+        if !t.tres_passed {
+            buf = buf + t.tres_name + ": " + t.tres_detail + "\n"
+        }
+        i = i + 1
+    }
+    return buf
+}
+
+// ---------------------------------------------------------------------------
+// The kernel suite
+// ---------------------------------------------------------------------------
+
+/// Every registered module self-test.
+///
+/// Adding a module means adding one line here. The conformance runner and the
+/// CLI both read this function, so a module cannot be "tested in CI" and
+/// "untested in the CLI" at the same time.
+pub fn kernel_selftests() -> TestSuite {
+    mut s = suite_new("ryan-harness-core")
+    s = suite_add_outcome(s, "core.invariants", kernel_self_check())
+    s = suite_add_outcome(s, "text.engine", text_engine_selftest())
+    s = suite_add_outcome(s, "events.bus", event_bus_selftest())
+    return s
+}
+
+/// Capability inventory. Reported by `ryan capabilities` and asserted by
+/// conformance, so the kernel cannot silently lose a capability it claims.
+pub fn kernel_capabilities() -> List<Str> {
+    mut caps: List<Str> = []
+    caps = caps.push("kernel.version=" + version_to_str(kernel_version()))
+    caps = caps.push("kernel.abi=" + int_to_str(ryan_kernel_abi()))
+    caps = caps.push("kernel.requires_network=" + bool_to_str(ryan_requires_network()))
+    caps = caps.push("kernel.requires_ai=" + bool_to_str(ryan_requires_ai()))
+    caps = caps.push("text.engine=" + text_engine_name())
+    caps = caps.push("text.utf16=" + bool_to_str(text_engine_supports_utf16()))
+    caps = caps.push("text.multi_cursor=" + bool_to_str(text_engine_supports_multi_cursor()))
+    caps = caps.push("text.undo=" + bool_to_str(text_engine_supports_undo()))
+    caps = caps.push("text.snapshots=" + bool_to_str(text_engine_supports_snapshots()))
+    return caps
+}

@@ -1,0 +1,114 @@
+//! ryan-core :: Outcome helpers and kernel error codes
+//!
+//! Datara's error model is explicit: `Outcome<T>` carries `is_success`, `value`
+//! and `error_msg`, and the `?` operator early-returns the failure. These
+//! helpers keep kernel code readable without hiding the error channel.
+//!
+//! `outcome_fail` requires the caller to supply a fallback value, because
+//! Datara has no generic default-value mechanism. That is a deliberate trade:
+//! the fallback is always explicit at the call site.
+
+use stdlib.result.result.Outcome
+
+pub fn outcome_ok<T>(v: T) -> Outcome<T> {
+    return Outcome<T> { is_success: true, value: v, error_msg: "" }
+}
+
+pub fn outcome_fail<T>(fallback: T, msg: Str) -> Outcome<T> {
+    return Outcome<T> { is_success: false, value: fallback, error_msg: msg }
+}
+
+pub fn outcome_is_ok<T>(o: Outcome<T>) -> Bool => o.is_success
+
+pub fn outcome_message<T>(o: Outcome<T>) -> Str => o.error_msg
+
+// ---------------------------------------------------------------------------
+// Structured kernel error
+// ---------------------------------------------------------------------------
+
+pub struct RyanError {
+    err_code: Str
+    err_message: Str
+    err_context: Str
+}
+
+pub fn ryan_error( code: Str, message: Str) -> RyanError {
+    return RyanError { err_code: code, err_message: message, err_context: "" }
+}
+
+pub fn ryan_error_with( code: Str, message: Str, context: Str) -> RyanError {
+    return RyanError { err_code: code, err_message: message, err_context: context }
+}
+
+pub fn ryan_error_render( view e: RyanError) -> Str {
+    if str_len(e.err_context) == 0 {
+        return "[" + e.err_code + "] " + e.err_message
+    }
+    return "[" + e.err_code + "] " + e.err_message + " (" + e.err_context + ")"
+}
+
+pub fn ryan_error_code( view e: RyanError) -> Str => e.err_code
+pub fn ryan_error_message( view e: RyanError) -> Str => e.err_message
+
+// ---------------------------------------------------------------------------
+// Kernel error codes. Stable strings, so adapters, tests and docs can reference
+// them without depending on numeric ordinals.
+// ---------------------------------------------------------------------------
+
+pub fn err_ok() -> Str => "RYAN-OK"
+pub fn err_not_found() -> Str => "RYAN-NOT-FOUND"
+pub fn err_conflict() -> Str => "RYAN-CONFLICT"
+pub fn err_stale() -> Str => "RYAN-STALE"
+pub fn err_capability_denied() -> Str => "RYAN-CAPABILITY-DENIED"
+pub fn err_unsupported() -> Str => "RYAN-UNSUPPORTED"
+pub fn err_invalid_argument() -> Str => "RYAN-INVALID-ARGUMENT"
+pub fn err_timeout() -> Str => "RYAN-TIMEOUT"
+pub fn err_cancelled() -> Str => "RYAN-CANCELLED"
+pub fn err_io() -> Str => "RYAN-IO"
+pub fn err_corrupt_state() -> Str => "RYAN-CORRUPT-STATE"
+pub fn err_abi_mismatch() -> Str => "RYAN-ABI-MISMATCH"
+pub fn err_untrusted() -> Str => "RYAN-UNTRUSTED-WORKSPACE"
+pub fn err_extension_panic() -> Str => "RYAN-EXTENSION-PANIC"
+pub fn err_shutdown() -> Str => "RYAN-SHUTDOWN"
+
+// ---------------------------------------------------------------------------
+// Capability verdict
+// ---------------------------------------------------------------------------
+
+pub struct Verdict {
+    verdict_allowed: Bool
+    verdict_reason: Str
+}
+
+pub fn verdict_allow() -> Verdict => Verdict { verdict_allowed: true, verdict_reason: "" }
+
+pub fn verdict_deny( reason: Str) -> Verdict => Verdict { verdict_allowed: false, verdict_reason: reason }
+
+pub fn verdict_is_allowed( view v: Verdict) -> Bool => v.verdict_allowed
+
+pub fn verdict_reason( view v: Verdict) -> Str => v.verdict_reason
+
+/// Default-deny combinator: an empty capability set denies everything.
+pub fn verdict_all( verdicts: List<Verdict>) -> Verdict {
+    mut i = 0
+    while i < verdicts.len() {
+        if !verdicts[i].verdict_allowed {
+            return verdicts[i]
+        }
+        i = i + 1
+    }
+    return verdict_allow()
+}
+
+pub fn verdict_any( verdicts: List<Verdict>) -> Verdict {
+    mut i = 0
+    mut last_reason = "no verdicts evaluated"
+    while i < verdicts.len() {
+        if verdicts[i].verdict_allowed {
+            return verdict_allow()
+        }
+        last_reason = verdicts[i].verdict_reason
+        i = i + 1
+    }
+    return verdict_deny(last_reason)
+}

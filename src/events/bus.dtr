@@ -1,0 +1,645 @@
+//! ryan-events :: typed event bus
+//!
+//! Ownership and lifecycle rules:
+//!   * The bus owns every published event. Subscribers never hold references to
+//!     events across a pump boundary; a delivery is a small value describing
+//!     *what* happened, and the reducer re-reads authoritative state from the
+//!     subsystem that owns it.
+//!   * Subscriptions are scoped (kernel / workspace / document / session /
+//!     extension) and are removed with the scope, so a closed document cannot
+//!     leak handlers.
+//!   * Unsubscribing is safe at any time: the pump plans against a snapshot of
+//!     the subscription list, and `subscription_matches` re-checks the
+//!     cancelled flag before each delivery.
+//!
+//! Datara has no closures, so the bus does not store callbacks. It computes a
+//! **delivery plan** (see `plan.dtr`); the kernel dispatcher consumes the plan
+//! and routes each entry to the owning module. This keeps the bus testable in
+//! isolation and makes event ordering an assertable property.
+//!
+//! Mutable state is grouped into `BusCounters` and `StormGuard` so that
+//! copy-on-write updates stay readable instead of listing ten fields.
+
+pub struct Field {
+    fld_key: Str
+    fld_text: Str
+}
+
+pub fn field_new( k: Str, v: Str) -> Field => Field { fld_key: k, fld_text: v }
+pub fn field_int( k: Str, v: Int) -> Field => Field { fld_key: k, fld_text: int_to_str(v) }
+pub fn field_bool( k: Str, v: Bool) -> Field {
+    return Field { fld_key: k, fld_text: bool_to_str(v) }
+}
+pub fn field_key( view f: Field) -> Str => f.fld_key
+pub fn field_value( view f: Field) -> Str => f.fld_text
+
+pub struct Event {
+    ev_kind: Str
+    /// monotonic publish order within a bus
+    ev_sequence: Int
+    /// ties together every event caused by one user action
+    ev_correlation: Int
+    /// subsystem or module that published
+    ev_source: Str
+    ev_fields: List<Field>
+    ev_time_ms: Int
+    /// set by a pre-delivery filter; a cancelled event is still logged
+    ev_cancelled: Bool
+    ev_cancel_reason: Str
+}
+
+pub fn event_new( kind: Str, sequence: Int, correlation: Int, source: Str, time_ms: Int) -> Event {
+    return Event {
+        ev_kind: kind,
+        ev_sequence: sequence,
+        ev_correlation: correlation,
+        ev_source: source,
+        ev_fields: [],
+        ev_time_ms: time_ms,
+        ev_cancelled: false,
+        ev_cancel_reason: ""
+    }
+}
+
+pub fn event_with( view ev: Event, view f: Field) -> Event {
+    mut fs = ev.ev_fields
+    fs = fs.push(f)
+    return Event {
+        ev_kind: ev.ev_kind,
+        ev_sequence: ev.ev_sequence,
+        ev_correlation: ev.ev_correlation,
+        ev_source: ev.ev_source,
+        ev_fields: fs,
+        ev_time_ms: ev.ev_time_ms,
+        ev_cancelled: ev.ev_cancelled,
+        ev_cancel_reason: ev.ev_cancel_reason
+    }
+}
+
+pub fn event_kind( view ev: Event) -> Str => ev.ev_kind
+pub fn event_sequence( view ev: Event) -> Int => ev.ev_sequence
+pub fn event_correlation( view ev: Event) -> Int => ev.ev_correlation
+pub fn event_source( view ev: Event) -> Str => ev.ev_source
+pub fn event_time( view ev: Event) -> Int => ev.ev_time_ms
+pub fn event_is_cancelled( view ev: Event) -> Bool => ev.ev_cancelled
+pub fn event_cancel_reason( view ev: Event) -> Str => ev.ev_cancel_reason
+pub fn event_field_count( view ev: Event) -> Int => ev.ev_fields.len()
+
+pub fn event_cancel( view ev: Event, reason: Str) -> Event {
+    return Event {
+        ev_kind: ev.ev_kind,
+        ev_sequence: ev.ev_sequence,
+        ev_correlation: ev.ev_correlation,
+        ev_source: ev.ev_source,
+        ev_fields: ev.ev_fields,
+        ev_time_ms: ev.ev_time_ms,
+        ev_cancelled: true,
+        ev_cancel_reason: reason
+    }
+}
+
+pub fn event_render( view ev: Event) -> Str {
+    return fmt"#{ev.ev_sequence} {ev.ev_kind} corr={ev.ev_correlation} src={ev.ev_source} cancelled={ev.ev_cancelled}"
+}
+
+/// Look up a field value; returns "" when absent so reducers never have to
+/// guard against a missing key.
+pub fn event_field( view ev: Event, k: Str) -> Str {
+    mut i = 0
+    while i < ev.ev_fields.len() {
+        if ev.ev_fields[i].fld_key == k {
+            return ev.ev_fields[i].fld_text
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub fn event_field_int( view ev: Event, k: Str) -> Int {
+    return str_to_int(event_field(ev, k))
+}
+
+// ---------------------------------------------------------------------------
+// Subscriptions
+// ---------------------------------------------------------------------------
+
+pub fn scope_kernel() -> Str => "kernel"
+pub fn scope_workspace() -> Str => "workspace"
+pub fn scope_document() -> Str => "document"
+pub fn scope_session() -> Str => "session"
+pub fn scope_extension() -> Str => "extension"
+
+pub struct Subscription {
+    sub_id: Int
+    /// exact kind, or "" for a wildcard subscription
+    sub_kind: Str
+    /// subsystem filter; "" means any subsystem
+    sub_subsystem: Str
+    /// higher priority is delivered first
+    sub_priority: Int
+    sub_scope: Str
+    sub_scope_id: Int
+    /// deferred listeners are planned separately and delivered on the next tick
+    sub_deferred_mode: Bool
+    sub_cancelled: Bool
+    sub_delivery_count: Int
+    /// kinds this subscription explicitly asked not to receive
+    sub_muted: List<Str>
+}
+
+pub fn subscription_new( id: Int, kind: Str, priority: Int, scope: Str, scope_id: Int) -> Subscription {
+    return Subscription {
+        sub_id: id,
+        sub_kind: kind,
+        sub_subsystem: "",
+        sub_priority: priority,
+        sub_scope: scope,
+        sub_scope_id: scope_id,
+        sub_deferred_mode: false,
+        sub_cancelled: false,
+        sub_delivery_count: 0,
+        sub_muted: []
+    }
+}
+
+pub fn subscription_with_deliveries( view sub: Subscription, n: Int) -> Subscription {
+    return Subscription {
+        sub_id: sub.sub_id,
+        sub_kind: sub.sub_kind,
+        sub_subsystem: sub.sub_subsystem,
+        sub_priority: sub.sub_priority,
+        sub_scope: sub.sub_scope,
+        sub_scope_id: sub.sub_scope_id,
+        sub_deferred_mode: sub.sub_deferred_mode,
+        sub_cancelled: sub.sub_cancelled,
+        sub_delivery_count: n,
+        sub_muted: sub.sub_muted
+    }
+}
+
+pub fn subscription_deferred( view sub: Subscription) -> Subscription {
+    return Subscription {
+        sub_id: sub.sub_id,
+        sub_kind: sub.sub_kind,
+        sub_subsystem: sub.sub_subsystem,
+        sub_priority: sub.sub_priority,
+        sub_scope: sub.sub_scope,
+        sub_scope_id: sub.sub_scope_id,
+        sub_deferred_mode: true,
+        sub_cancelled: sub.sub_cancelled,
+        sub_delivery_count: sub.sub_delivery_count,
+        sub_muted: sub.sub_muted
+    }
+}
+
+pub fn subscription_cancel( view sub: Subscription) -> Subscription {
+    return Subscription {
+        sub_id: sub.sub_id,
+        sub_kind: sub.sub_kind,
+        sub_subsystem: sub.sub_subsystem,
+        sub_priority: sub.sub_priority,
+        sub_scope: sub.sub_scope,
+        sub_scope_id: sub.sub_scope_id,
+        sub_deferred_mode: sub.sub_deferred_mode,
+        sub_cancelled: true,
+        sub_delivery_count: sub.sub_delivery_count,
+        sub_muted: sub.sub_muted
+    }
+}
+
+pub fn subscription_mute( view sub: Subscription, kind: Str) -> Subscription {
+    mut m = sub.sub_muted
+    m = m.push(kind)
+    return Subscription {
+        sub_id: sub.sub_id,
+        sub_kind: sub.sub_kind,
+        sub_subsystem: sub.sub_subsystem,
+        sub_priority: sub.sub_priority,
+        sub_scope: sub.sub_scope,
+        sub_scope_id: sub.sub_scope_id,
+        sub_deferred_mode: sub.sub_deferred_mode,
+        sub_cancelled: sub.sub_cancelled,
+        sub_delivery_count: sub.sub_delivery_count,
+        sub_muted: m
+    }
+}
+
+pub fn subscription_matches( view sub: Subscription, view ev: Event) -> Bool {
+    if sub.sub_cancelled {
+        return false
+    }
+    if sub.sub_kind != "" && sub.sub_kind != ev.ev_kind {
+        return false
+    }
+    if sub.sub_subsystem != "" && sub.sub_subsystem != event_kind_subsystem(ev.ev_kind) {
+        return false
+    }
+    mut i = 0
+    while i < sub.sub_muted.len() {
+        if sub.sub_muted[i] == ev.ev_kind {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+pub fn subscription_id( view sub: Subscription) -> Int => sub.sub_id
+pub fn subscription_kind( view sub: Subscription) -> Str => sub.sub_kind
+pub fn subscription_subsystem( view sub: Subscription) -> Str => sub.sub_subsystem
+pub fn subscription_priority( view sub: Subscription) -> Int => sub.sub_priority
+pub fn subscription_scope( view sub: Subscription) -> Str => sub.sub_scope
+pub fn subscription_scope_id( view sub: Subscription) -> Int => sub.sub_scope_id
+pub fn subscription_deliveries( view sub: Subscription) -> Int => sub.sub_delivery_count
+pub fn subscription_is_cancelled( view sub: Subscription) -> Bool => sub.sub_cancelled
+pub fn subscription_is_deferred( view sub: Subscription) -> Bool => sub.sub_deferred_mode
+pub fn subscription_muted_count( view sub: Subscription) -> Int => sub.sub_muted.len()
+
+// ---------------------------------------------------------------------------
+// Bus state
+// ---------------------------------------------------------------------------
+
+pub struct BusCounters {
+    cnt_sequence: Int
+    cnt_correlation: Int
+    cnt_dispatched: Int
+    cnt_dropped: Int
+    cnt_late_deliveries: Int
+}
+
+pub fn counters_new() -> BusCounters {
+    return BusCounters { cnt_sequence: 1, cnt_correlation: 1, cnt_dispatched: 0, cnt_dropped: 0, cnt_late_deliveries: 0 }
+}
+
+pub struct StormGuard {
+    storm_window_ms: Int
+    storm_limit: Int
+    storm_window_start: Int
+    storm_count: Int
+}
+
+pub fn storm_guard_new() -> StormGuard {
+    return StormGuard { storm_window_ms: 16, storm_limit: 4096, storm_window_start: 0, storm_count: 0 }
+}
+
+pub struct Bus {
+    bus_subs: List<Subscription>
+    bus_next_sub_id: Int
+    bus_queue: List<Event>
+    /// bounded ring of recently published events, for debugging and replay
+    bus_log: List<Event>
+    bus_log_limit: Int
+    bus_counters: BusCounters
+    bus_storm: StormGuard
+    /// deterministic mode: no wall clock, stable ordering, no dropping
+    bus_deterministic: Bool
+    bus_clock: Clock
+}
+
+pub fn bus_new( view clock: Clock) -> Bus {
+    return Bus {
+        bus_subs: [],
+        bus_next_sub_id: 1,
+        bus_queue: [],
+        bus_log: [],
+        bus_log_limit: 512,
+        bus_counters: counters_new(),
+        bus_storm: storm_guard_new(),
+        bus_deterministic: false,
+        bus_clock: clock
+    }
+}
+
+pub fn bus_deterministic( view bus: Bus, view clock: Clock) -> Bus {
+    return Bus {
+        bus_subs: bus.bus_subs,
+        bus_next_sub_id: bus.bus_next_sub_id,
+        bus_queue: bus.bus_queue,
+        bus_log: bus.bus_log,
+        bus_log_limit: bus.bus_log_limit,
+        bus_counters: bus.bus_counters,
+        bus_storm: bus.bus_storm,
+        bus_deterministic: true,
+        bus_clock: clock
+    }
+}
+
+// -- copy-on-write helpers ---------------------------------------------------
+// Every mutation goes through one of these, so a Bus value is never partially
+// updated. That is the same discipline the transaction system applies to
+// documents, applied here to bus state.
+
+pub fn bus_with_subs( view bus: Bus, subs: List<Subscription>) -> Bus {
+    return Bus {
+        bus_subs: subs,
+        bus_next_sub_id: bus.bus_next_sub_id,
+        bus_queue: bus.bus_queue,
+        bus_log: bus.bus_log,
+        bus_log_limit: bus.bus_log_limit,
+        bus_counters: bus.bus_counters,
+        bus_storm: bus.bus_storm,
+        bus_deterministic: bus.bus_deterministic,
+        bus_clock: bus.bus_clock
+    }
+}
+
+pub fn bus_with_queue( view bus: Bus, queue: List<Event>) -> Bus {
+    return Bus {
+        bus_subs: bus.bus_subs,
+        bus_next_sub_id: bus.bus_next_sub_id,
+        bus_queue: queue,
+        bus_log: bus.bus_log,
+        bus_log_limit: bus.bus_log_limit,
+        bus_counters: bus.bus_counters,
+        bus_storm: bus.bus_storm,
+        bus_deterministic: bus.bus_deterministic,
+        bus_clock: bus.bus_clock
+    }
+}
+
+pub fn bus_with_counters( view bus: Bus, view counters: BusCounters) -> Bus {
+    return Bus {
+        bus_subs: bus.bus_subs,
+        bus_next_sub_id: bus.bus_next_sub_id,
+        bus_queue: bus.bus_queue,
+        bus_log: bus.bus_log,
+        bus_log_limit: bus.bus_log_limit,
+        bus_counters: counters,
+        bus_storm: bus.bus_storm,
+        bus_deterministic: bus.bus_deterministic,
+        bus_clock: bus.bus_clock
+    }
+}
+
+pub fn bus_with_storm( view bus: Bus, view storm: StormGuard) -> Bus {
+    return Bus {
+        bus_subs: bus.bus_subs,
+        bus_next_sub_id: bus.bus_next_sub_id,
+        bus_queue: bus.bus_queue,
+        bus_log: bus.bus_log,
+        bus_log_limit: bus.bus_log_limit,
+        bus_counters: bus.bus_counters,
+        bus_storm: storm,
+        bus_deterministic: bus.bus_deterministic,
+        bus_clock: bus.bus_clock
+    }
+}
+
+pub fn bus_with_next_sub_id( view bus: Bus, id: Int) -> Bus {
+    return Bus {
+        bus_subs: bus.bus_subs,
+        bus_next_sub_id: id,
+        bus_queue: bus.bus_queue,
+        bus_log: bus.bus_log,
+        bus_log_limit: bus.bus_log_limit,
+        bus_counters: bus.bus_counters,
+        bus_storm: bus.bus_storm,
+        bus_deterministic: bus.bus_deterministic,
+        bus_clock: bus.bus_clock
+    }
+}
+
+/// Replace the log, clear the queue and record how many deliveries the pump
+/// produced.
+pub fn bus_with_log( view bus: Bus, log: List<Event>, delivered: Int) -> Bus {
+    let c = BusCounters {
+        cnt_sequence: bus.bus_counters.cnt_sequence,
+        cnt_correlation: bus.bus_counters.cnt_correlation,
+        cnt_dispatched: bus.bus_counters.cnt_dispatched + delivered,
+        cnt_dropped: bus.bus_counters.cnt_dropped,
+        cnt_late_deliveries: bus.bus_counters.cnt_late_deliveries
+    }
+    return Bus {
+        bus_subs: bus.bus_subs,
+        bus_next_sub_id: bus.bus_next_sub_id,
+        bus_queue: [],
+        bus_log: log,
+        bus_log_limit: bus.bus_log_limit,
+        bus_counters: c,
+        bus_storm: bus.bus_storm,
+        bus_deterministic: bus.bus_deterministic,
+        bus_clock: bus.bus_clock
+    }
+}
+
+pub fn bus_append_log( log: List<Event>, queued: List<Event>, limit: Int) -> List<Event> {
+    mut all = log
+    mut i = 0
+    while i < queued.len() {
+        all = all.push(queued[i])
+        i = i + 1
+    }
+    mut trimmed: List<Event> = []
+    let n = all.len()
+    mut start = 0
+    if n > limit {
+        start = n - limit
+    }
+    mut t = start
+    while t < n {
+        trimmed = trimmed.push(all[t])
+        t = t + 1
+    }
+    return trimmed
+}
+
+// -- accessors ---------------------------------------------------------------
+
+pub fn bus_is_deterministic( view bus: Bus) -> Bool => bus.bus_deterministic
+pub fn bus_sequence( view bus: Bus) -> Int => bus.bus_counters.cnt_sequence
+pub fn bus_dispatched( view bus: Bus) -> Int => bus.bus_counters.cnt_dispatched
+pub fn bus_dropped( view bus: Bus) -> Int => bus.bus_counters.cnt_dropped
+pub fn bus_late_deliveries( view bus: Bus) -> Int => bus.bus_counters.cnt_late_deliveries
+pub fn bus_correlation( view bus: Bus) -> Int => bus.bus_counters.cnt_correlation
+pub fn bus_queued( view bus: Bus) -> Int => bus.bus_queue.len()
+pub fn bus_subscription_count( view bus: Bus) -> Int => bus.bus_subs.len()
+pub fn bus_log_size( view bus: Bus) -> Int => bus.bus_log.len()
+pub fn bus_clock( view bus: Bus) -> Clock => bus.bus_clock
+
+pub fn bus_log_event( view bus: Bus, index: Int) -> Event {
+    if index < 0 || index >= bus.bus_log.len() {
+        return event_new("", 0, 0, "", 0)
+    }
+    return bus.bus_log[index]
+}
+
+pub fn bus_subscription_at( view bus: Bus, index: Int) -> Subscription {
+    if index < 0 || index >= bus.bus_subs.len() {
+        return subscription_new(0, "", 0, "", 0)
+    }
+    return bus.bus_subs[index]
+}
+
+/// A new correlation id. Every event caused by one user action carries it, so a
+/// trace can reconstruct the causal chain.
+pub fn bus_next_correlation( view bus: Bus) -> Bus {
+    let c = BusCounters {
+        cnt_sequence: bus.bus_counters.cnt_sequence,
+        cnt_correlation: bus.bus_counters.cnt_correlation + 1,
+        cnt_dispatched: bus.bus_counters.cnt_dispatched,
+        cnt_dropped: bus.bus_counters.cnt_dropped,
+        cnt_late_deliveries: bus.bus_counters.cnt_late_deliveries
+    }
+    return bus_with_counters(bus, c)
+}
+
+// ---------------------------------------------------------------------------
+// Subscribe / unsubscribe
+// ---------------------------------------------------------------------------
+
+pub struct SubscribeResult {
+    sres_bus: Bus
+    sres_id: Int
+}
+
+pub fn subscribe_id( view r: SubscribeResult) -> Int => r.sres_id
+pub fn subscribe_bus( view r: SubscribeResult) -> Bus => r.sres_bus
+
+pub fn bus_subscribe( view bus: Bus, kind: Str, priority: Int, scope: Str, scope_id: Int) -> SubscribeResult {
+    let id = bus.bus_next_sub_id
+    mut subs = bus.bus_subs
+    subs = subs.push(subscription_new(id, kind, priority, scope, scope_id))
+    return SubscribeResult {
+        sres_bus: bus_with_next_sub_id(bus_with_subs(bus, subs), id + 1),
+        sres_id: id
+    }
+}
+
+pub fn bus_subscribe_deferred( view bus: Bus, kind: Str, priority: Int, scope: Str, scope_id: Int) -> SubscribeResult {
+    let id = bus.bus_next_sub_id
+    mut subs = bus.bus_subs
+    subs = subs.push(subscription_deferred(subscription_new(id, kind, priority, scope, scope_id)))
+    return SubscribeResult {
+        sres_bus: bus_with_next_sub_id(bus_with_subs(bus, subs), id + 1),
+        sres_id: id
+    }
+}
+
+pub fn bus_unsubscribe( view bus: Bus, id: Int) -> Bus {
+    mut subs: List<Subscription> = []
+    mut i = 0
+    while i < bus.bus_subs.len() {
+        if bus.bus_subs[i].sub_id != id {
+            subs = subs.push(bus.bus_subs[i])
+        }
+        i = i + 1
+    }
+    return bus_with_subs(bus, subs)
+}
+
+/// Remove every subscription belonging to a scope. Called when a document,
+/// workspace or extension goes away.
+pub fn bus_unsubscribe_scope( view bus: Bus, scope: Str, scope_id: Int) -> Bus {
+    mut subs: List<Subscription> = []
+    mut i = 0
+    while i < bus.bus_subs.len() {
+        let s = bus.bus_subs[i]
+        let in_scope = s.sub_scope == scope && s.sub_scope_id == scope_id
+        if !in_scope {
+            subs = subs.push(s)
+        }
+        i = i + 1
+    }
+    return bus_with_subs(bus, subs)
+}
+
+// ---------------------------------------------------------------------------
+// Publish
+// ---------------------------------------------------------------------------
+
+pub struct PublishResult {
+    pres_bus: Bus
+    pres_sequence: Int
+    pres_accepted: Bool
+    pres_reason: Str
+}
+
+pub fn publish_sequence( view r: PublishResult) -> Int => r.pres_sequence
+pub fn publish_accepted( view r: PublishResult) -> Bool => r.pres_accepted
+pub fn publish_reason( view r: PublishResult) -> Str => r.pres_reason
+pub fn publish_bus( view r: PublishResult) -> Bus => r.pres_bus
+
+/// Storm protection: high-frequency kinds are rate limited per window. In
+/// deterministic mode the limiter is disabled so tests observe every event.
+pub fn bus_storm_admits( view bus: Bus, kind: Str) -> Bool {
+    if bus.bus_deterministic {
+        return true
+    }
+    if !event_kind_is_high_frequency(kind) {
+        return true
+    }
+    return bus.bus_storm.storm_count < bus.bus_storm.storm_limit
+}
+
+pub fn bus_publish( view bus: Bus, kind: Str, source: Str, fields: List<Field>) -> PublishResult {
+    let now = clock_now_ms(bus.bus_clock)
+
+    mut window_start = bus.bus_storm.storm_window_start
+    mut window_count = bus.bus_storm.storm_count
+    if now - window_start >= bus.bus_storm.storm_window_ms {
+        window_start = now
+        window_count = 0
+    }
+    let storm = StormGuard {
+        storm_window_ms: bus.bus_storm.storm_window_ms,
+        storm_limit: bus.bus_storm.storm_limit,
+        storm_window_start: window_start,
+        storm_count: window_count + 1
+    }
+
+    if !bus_storm_admits(bus, kind) {
+        let c = BusCounters {
+            cnt_sequence: bus.bus_counters.cnt_sequence,
+            cnt_correlation: bus.bus_counters.cnt_correlation,
+            cnt_dispatched: bus.bus_counters.cnt_dispatched,
+            cnt_dropped: bus.bus_counters.cnt_dropped + 1,
+            cnt_late_deliveries: bus.bus_counters.cnt_late_deliveries
+        }
+        return PublishResult {
+            pres_bus: bus_with_storm(bus_with_counters(bus, c), storm),
+            pres_sequence: 0,
+            pres_accepted: false,
+            pres_reason: "storm protection: high-frequency window saturated"
+        }
+    }
+
+    mut ev = event_new(kind, bus.bus_counters.cnt_sequence, bus.bus_counters.cnt_correlation, source, now)
+    mut i = 0
+    while i < fields.len() {
+        ev = event_with(ev, fields[i])
+        i = i + 1
+    }
+
+    mut queue = bus.bus_queue
+    queue = queue.push(ev)
+
+    let c = BusCounters {
+        cnt_sequence: bus.bus_counters.cnt_sequence + 1,
+        cnt_correlation: bus.bus_counters.cnt_correlation,
+        cnt_dispatched: bus.bus_counters.cnt_dispatched,
+        cnt_dropped: bus.bus_counters.cnt_dropped,
+        cnt_late_deliveries: bus.bus_counters.cnt_late_deliveries
+    }
+
+    return PublishResult {
+        pres_bus: bus_with_storm(bus_with_counters(bus_with_queue(bus, queue), c), storm),
+        pres_sequence: ev.ev_sequence,
+        pres_accepted: true,
+        pres_reason: ""
+    }
+}
+
+/// Convenience wrappers used throughout the kernel.
+pub fn bus_emit( view bus: Bus, kind: Str, source: Str) -> PublishResult {
+    return bus_publish(bus, kind, source, [])
+}
+
+pub fn bus_emit_field( view bus: Bus, kind: Str, source: Str, view f: Field) -> PublishResult {
+    return bus_publish(bus, kind, source, [f])
+}
+
+/// Force the bus into a state where the queue is empty and nothing is pending.
+/// Used by shutdown and by failure-injection tests.
+pub fn bus_drain_silently( view bus: Bus) -> Bus {
+    return bus_with_log(bus, bus_append_log(bus.bus_log, bus.bus_queue, bus.bus_log_limit), 0)
+}

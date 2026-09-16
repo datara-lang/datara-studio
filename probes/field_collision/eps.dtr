@@ -1,0 +1,7 @@
+pub struct P { items: List<Int> }
+pub fn p_make() -> P {
+    mut l: List<Int> = []
+    l = l.push(11)
+    return P { items: l }
+}
+pub fn p_get(view x: P) -> Int => x.items[0]

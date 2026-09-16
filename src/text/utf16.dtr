@@ -1,0 +1,300 @@
+//! ryan-text :: UTF-8 / UTF-16 offset conversion
+//!
+//! The kernel stores text as UTF-8 and addresses it with **byte offsets**. The
+//! Language Server Protocol addresses text with **UTF-16 code units**. Every LSP
+//! adapter therefore needs an exact, allocation-light conversion, and getting it
+//! wrong is the classic source of off-by-one bugs in editor tooling.
+//!
+//! This module decodes UTF-8 by hand (no dependency, no allocation) and reports:
+//!   * the sequence length of the code point starting at a byte offset
+//!   * the code point value
+//!   * the UTF-16 code-unit width (1 for BMP, 2 for supplementary planes)
+//!
+//! Surrogate handling: an isolated continuation byte or a truncated sequence is
+//! reported as a 1-byte, 1-unit replacement rather than panicking. Malformed
+//! input must degrade, never crash the kernel.
+
+/// Number of bytes in the UTF-8 sequence whose lead byte is `b`.
+/// Returns 1 for anything that is not a valid lead byte.
+pub fn utf8_seq_len( b: Int) -> Int {
+    if b < 0 {
+        return 1
+    }
+    if b < 0x80 {
+        return 1
+    }
+    if b >= 0xC2 && b <= 0xDF {
+        return 2
+    }
+    if b >= 0xE0 && b <= 0xEF {
+        return 3
+    }
+    if b >= 0xF0 && b <= 0xF4 {
+        return 4
+    }
+    return 1
+}
+
+/// Decode the code point starting at byte offset `off`.
+/// Returns -1 when the offset is buf of range or the sequence is malformed.
+pub fn utf8_decode( text: Str, off: Int) -> Int {
+    let n = str_len(text)
+    if off < 0 || off >= n {
+        return -1
+    }
+    let b0 = str_byte_at(text, off)
+    if b0 < 0x80 {
+        return b0
+    }
+
+    let need = utf8_seq_len(b0)
+    if need == 1 || off + need > n {
+        return -1
+    }
+
+    mut cp = 0
+    if need == 2 {
+        let b1 = str_byte_at(text, off + 1)
+        if b1 < 0x80 || b1 > 0xBF {
+            return -1
+        }
+        cp = math_or(math_shl(math_and(b0, 0x1F), 6), math_and(b1, 0x3F))
+    } else if need == 3 {
+        let b1 = str_byte_at(text, off + 1)
+        let b2 = str_byte_at(text, off + 2)
+        if b1 < 0x80 || b1 > 0xBF || b2 < 0x80 || b2 > 0xBF {
+            return -1
+        }
+        cp = math_or(math_or(math_shl(math_and(b0, 0x0F), 12), math_shl(math_and(b1, 0x3F), 6)), math_and(b2, 0x3F))
+    } else {
+        let b1 = str_byte_at(text, off + 1)
+        let b2 = str_byte_at(text, off + 2)
+        let b3 = str_byte_at(text, off + 3)
+        if b1 < 0x80 || b1 > 0xBF || b2 < 0x80 || b2 > 0xBF || b3 < 0x80 || b3 > 0xBF {
+            return -1
+        }
+        cp = math_or(math_or(math_or(math_shl(math_and(b0, 0x07), 18), math_shl(math_and(b1, 0x3F), 12)), math_shl(math_and(b2, 0x3F), 6)), math_and(b3, 0x3F))
+    }
+    return cp
+}
+
+/// UTF-16 code units needed to represent a code point (1 or 2).
+pub fn utf16_width( cp: Int) -> Int {
+    if cp < 0 {
+        return 1
+    }
+    if cp > 0xFFFF {
+        return 2
+    }
+    return 1
+}
+
+/// Convert a UTF-8 byte offset into a UTF-16 code-unit offset.
+/// `off` beyond the end of the text clamps to the total UTF-16 length.
+pub fn utf16_offset( text: Str, byte_off: Int) -> Int {
+    let n = str_len(text)
+    mut limit = byte_off
+    if limit > n {
+        limit = n
+    }
+    if limit < 0 {
+        limit = 0
+    }
+
+    mut units = 0
+    mut i = 0
+    while i < limit {
+        let cp = utf8_decode(text, i)
+        if cp < 0 {
+            // malformed: count the byte as one replacement unit
+            units = units + 1
+            i = i + 1
+        } else {
+            units = units + utf16_width(cp)
+            i = i + utf8_seq_len(str_byte_at(text, i))
+        }
+    }
+    return units
+}
+
+/// Convert a UTF-16 code-unit offset back into a UTF-8 byte offset.
+/// A unit offset that lands inside a surrogate pair snaps to the start of the
+/// character, which is what every LSP client expects.
+pub fn utf16_to_byte( text: Str, unit_off: Int) -> Int {
+    let n = str_len(text)
+    if unit_off <= 0 {
+        return 0
+    }
+
+    mut units = 0
+    mut i = 0
+    while i < n {
+        if units >= unit_off {
+            return i
+        }
+        let cp = utf8_decode(text, i)
+        if cp < 0 {
+            units = units + 1
+            i = i + 1
+        } else {
+            units = units + utf16_width(cp)
+            i = i + utf8_seq_len(str_byte_at(text, i))
+        }
+    }
+    return n
+}
+
+/// Total UTF-16 length of a string.
+pub fn utf16_len( text: Str) -> Int {
+    return utf16_offset(text, str_len(text))
+}
+
+/// Total number of Unicode scalar values (characters) in a string.
+pub fn utf8_char_count( text: Str) -> Int {
+    let n = str_len(text)
+    mut count = 0
+    mut i = 0
+    while i < n {
+        let cp = utf8_decode(text, i)
+        if cp < 0 {
+            i = i + 1
+        } else {
+            i = i + utf8_seq_len(str_byte_at(text, i))
+        }
+        count = count + 1
+    }
+    return count
+}
+
+/// Byte offset of the `index`-th character (scalar value).
+pub fn utf8_char_offset( text: Str, index: Int) -> Int {
+    if index <= 0 {
+        return 0
+    }
+    let n = str_len(text)
+    mut seen = 0
+    mut i = 0
+    while i < n {
+        if seen >= index {
+            return i
+        }
+        let cp = utf8_decode(text, i)
+        if cp < 0 {
+            i = i + 1
+        } else {
+            i = i + utf8_seq_len(str_byte_at(text, i))
+        }
+        seen = seen + 1
+    }
+    return n
+}
+
+/// True when the string is well-formed UTF-8. Used by the corruption checks in
+/// `persistence` before a snapshot is written to disk.
+pub fn utf8_is_valid( text: Str) -> Bool {
+    let n = str_len(text)
+    mut i = 0
+    while i < n {
+        let cp = utf8_decode(text, i)
+        if cp < 0 {
+            return false
+        }
+        i = i + utf8_seq_len(str_byte_at(text, i))
+    }
+    return true
+}
+
+/// Classify a byte as a UTF-8 continuation byte (0b10xxxxxx).
+pub fn utf8_is_continuation( b: Int) -> Bool {
+    return b >= 0x80 && b <= 0xBF
+}
+
+/// Snap a byte offset to the nearest character boundary, preferring the start
+/// of the character. Providers are allowed to hand us arbitrary offsets.
+pub fn utf8_snap_to_char_boundary( text: Str, off: Int) -> Int {
+    let n = str_len(text)
+    mut o = off
+    if o <= 0 {
+        return 0
+    }
+    if o >= n {
+        return n
+    }
+    while o > 0 && utf8_is_continuation(str_byte_at(text, o)) {
+        o = o - 1
+    }
+    return o
+}
+
+// ---------------------------------------------------------------------------
+// Line-ending normalisation
+// ---------------------------------------------------------------------------
+
+/// Line-ending policy applied when a document is loaded and when it is saved.
+/// 0 = preserve, 1 = force LF, 2 = force CRLF.
+pub fn eol_preserve() -> Int => 0
+pub fn eol_lf() -> Int => 1
+pub fn eol_crlf() -> Int => 2
+
+pub fn eol_name( policy: Int) -> Str {
+    if policy == 1 {
+        return "lf"
+    }
+    if policy == 2 {
+        return "crlf"
+    }
+    return "preserve"
+}
+
+/// Detect the dominant line ending in a document: returns 1 (LF) or 2 (CRLF).
+pub fn eol_detect( text: Str) -> Int {
+    let n = str_len(text)
+    mut crlf = 0
+    mut lf = 0
+    mut i = 0
+    while i < n {
+        if str_byte_at(text, i) == 10 {
+            if i > 0 && str_byte_at(text, i - 1) == 13 {
+                crlf = crlf + 1
+            } else {
+                lf = lf + 1
+            }
+        }
+        i = i + 1
+    }
+    if crlf > lf {
+        return 2
+    }
+    return 1
+}
+
+/// Normalise all CRLF and lone CR to LF for in-memory storage.
+pub fn eol_normalise_to_lf( text: Str) -> Str {
+    return str_replace(text, "\r\n", "\n")
+}
+
+/// Re-apply CRLF for saving a document that was authored with CRLF.
+pub fn eol_apply_crlf( text: Str) -> Str {
+    return str_replace(text, "\n", "\r\n")
+}
+
+pub fn eol_apply( text: Str, policy: Int) -> Str {
+    if policy == 2 {
+        return eol_apply_crlf(text)
+    }
+    return text
+}
+
+/// Count lines without materialising the document twice.
+pub fn eol_count_lines( text: Str) -> Int {
+    let n = str_len(text)
+    mut count = 1
+    mut i = 0
+    while i < n {
+        if str_byte_at(text, i) == 10 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}

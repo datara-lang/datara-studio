@@ -1,0 +1,108 @@
+use stdlib.result.result.Outcome
+
+//! ryan-core :: identity values
+//!
+//! Every kernel entity carries a stable, comparable identity. Identities are
+//! deliberately *kind-tagged* so that a document id can never be accidentally
+//! used where a task id is expected, and so that persisted ids survive schema
+//! migration without reinterpretation.
+
+pub struct Id {
+    id_kind: Str
+    id_value: Int
+}
+
+// -- generic operations ------------------------------------------------------
+
+pub fn id_new( kind: Str, value: Int) -> Id {
+    return Id { id_kind: kind, id_value: value }
+}
+
+pub fn id_same( view a: Id, view b: Id) -> Bool {
+    return a.id_kind == b.id_kind && a.id_value == b.id_value
+}
+
+pub fn id_render( view i: Id) -> Str {
+    return i.id_kind + ":" + int_to_str(i.id_value)
+}
+
+pub fn id_is_zero( view i: Id) -> Bool {
+    return i.id_value == 0
+}
+
+pub fn id_zero( kind: Str) -> Id {
+    return Id { id_kind: kind, id_value: 0 }
+}
+
+// -- monotonic id allocator --------------------------------------------------
+//
+// A tiny deterministic counter. In deterministic test mode the allocator is
+// seeded, so id sequences are reproducible across runs.
+
+pub struct IdAllocator {
+    alloc_next: Int
+    alloc_kind: Str
+    alloc_issued: Int
+}
+
+pub fn id_allocator_new( kind: Str) -> IdAllocator {
+    return IdAllocator { alloc_next: 1, alloc_kind: kind, alloc_issued: 0 }
+}
+
+pub fn id_allocator_seeded( kind: Str, seed: Int) -> IdAllocator {
+    return IdAllocator { alloc_next: seed, alloc_kind: kind, alloc_issued: 0 }
+}
+
+pub fn id_allocator_next( view a: IdAllocator) -> Id {
+    return Id { id_kind: a.alloc_kind, id_value: a.alloc_next }
+}
+
+pub fn id_allocator_advance( view a: IdAllocator) -> IdAllocator {
+    return IdAllocator {
+        alloc_next: a.alloc_next + 1,
+        alloc_kind: a.alloc_kind,
+        alloc_issued: a.alloc_issued + 1
+    }
+}
+
+pub fn id_allocator_issued( view a: IdAllocator) -> Int {
+    return a.alloc_issued
+}
+
+// -- well-known kinds --------------------------------------------------------
+
+pub fn kind_document() -> Str => "document"
+pub fn kind_project() -> Str => "project"
+pub fn kind_workspace() -> Str => "workspace"
+pub fn kind_session() -> Str => "session"
+pub fn kind_snapshot() -> Str => "snapshot"
+pub fn kind_transaction() -> Str => "transaction"
+pub fn kind_task() -> Str => "task"
+pub fn kind_diagnostic() -> Str => "diagnostic"
+pub fn kind_symbol() -> Str => "symbol"
+pub fn kind_extension() -> Str => "extension"
+pub fn kind_provider() -> Str => "provider"
+pub fn kind_request() -> Str => "request"
+pub fn kind_process() -> Str => "process"
+pub fn kind_terminal() -> Str => "terminal"
+pub fn kind_span() -> Str => "span"
+
+// -- int / str coercion helpers (Datara has no implicit conversions) ---------
+
+pub fn int_to_str( n: Int) -> Str {
+    return fmt"{n}"
+}
+
+pub fn bool_to_str( b: Bool) -> Str {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+pub fn str_to_bool( s: Str) -> Bool {
+    if s == "true" {
+        return true
+    }
+    return false
+}
