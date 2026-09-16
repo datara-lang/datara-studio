@@ -271,7 +271,7 @@ the only component holding a capability grant.
 bash scripts/build.sh
 ```
 
-Eight stages, **324 assertions**, all green:
+Nine stages, **346 assertions**, all green:
 
 | stage | assertions | what it proves |
 |---|---|---|
@@ -279,7 +279,7 @@ Eight stages, **324 assertions**, all green:
 | single-file interface + icons | - | the Tauri icon set is generated from `assets/datara.ico`, and React, htm, app.js and the wasm core inline into one `ui/studio.html` with zero subresources, with the icon inlined as a data URI. **Fails the build** if the mark beside a `.dtr` file is backed by an icon under 32 px - see the icon note below |
 | Rust text core | 40 | the incremental line index matches a full rebuild after every edit |
 | highlighting pipeline | 40 | the token-to-line split is lossless on empty input, trailing newlines, unterminated strings, Cyrillic and emoji, **and every comment token starts with `//` and stops at its own line** - which is what caught the byte-offset bug |
-| interface renders | 170 | the component tree renders without throwing, every piece of chrome is present, the create name rule holds, an empty folder survives into the tree, the compiler's real coloured output parses into line, column and span, and a project check is aimed inside the workspace |
+| interface renders | 192 | the component tree renders without throwing, every piece of chrome is present, the create name rule holds, an empty folder survives into the tree, the compiler's real coloured output parses into line, column and span, and a project check is aimed inside the workspace |
 | the editor, driven as the app drives it | 74 | text, highlight layer, gutter, every editor layer and textarea height agree, and every editing aid leaves the text, the highlight layer and the caret agreeing. 19 of these drive the snippet table: that each keyword expands to a body that parses, that the placeholder is selected, that the caret lands inside it - the `unsafe` one inside the quotes - and that an indented keyword indents its body to match |
 | boot the built artifact | - | the shipped `ui/studio.html` mounts in a DOM, shows the title screen, and defers the editor until a file is open |
 | Datara server | - | `forgen check` reports 100% OK |
