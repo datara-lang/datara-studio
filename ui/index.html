@@ -3,43 +3,74 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ryan Harness</title>
+  <meta name="theme-color" content="#0e1015">
+  <title>Ryan Harness Studio</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <main class="shell">
-    <header class="topbar">
-      <div class="brand"><span class="mark">R</span><span>Ryan Harness</span></div>
-      <span class="badge">kernel UI</span>
-      <span class="spacer"></span>
-      <button class="ghost" id="reset">Reset settings</button>
+  <div class="ide-shell">
+    <header class="titlebar">
+      <div class="brand"><span class="brand-mark">R</span><span>Ryan Harness</span><span class="brand-sub">Studio</span></div>
+      <button class="workspace-button" id="workspaceButton" type="button"><span class="folder-glyph">▰</span><span id="workspaceName">ryan-harness</span><span class="chevron">⌄</span></button>
+      <button class="top-search" id="searchButton" type="button"><span>Search files and commands</span><kbd>Ctrl P</kbd></button>
+      <span class="grow"></span>
+      <button class="title-action" id="settingsButton" title="Settings" type="button">☷</button>
+      <button class="title-action" id="minimizeButton" title="Minimize" type="button">−</button>
+      <button class="title-action close" id="closeButton" title="Close" type="button">×</button>
     </header>
-    <section class="hero">
-      <p class="eyebrow">HEADLESS IDE KERNEL</p>
-      <h1>A calm base for every host.</h1>
-      <p class="lede">A small, offline-first dashboard for the kernel. No AI, no network, no account, no telemetry.</p>
-      <div class="actions"><button id="selfcheck" class="primary">Run self-check</button><span id="result" class="result">Ready</span></div>
-    </section>
-    <section class="grid">
-      <article class="card status-card"><div class="card-head"><h2>Kernel status</h2><span class="dot"></span></div><dl>
-        <div><dt>ABI</dt><dd id="abi">1</dd></div>
-        <div><dt>Version</dt><dd id="version">0.1.0</dd></div>
-        <div><dt>Network</dt><dd class="ok">disabled</dd></div>
-        <div><dt>AI subsystem</dt><dd class="ok">disabled</dd></div>
-      </dl></article>
-      <article class="card"><div class="card-head"><h2>Editor defaults</h2><span class="muted">local only</span></div>
-        <label class="field">Indent width<select data-setting="indent"><option value="2">2 spaces</option><option value="4">4 spaces</option><option value="8">8 spaces</option></select></label>
-        <label class="toggle"><input type="checkbox" data-setting="lineNumbers" checked><span class="track"></span><span>Line numbers</span></label>
-        <label class="toggle"><input type="checkbox" data-setting="wordWrap"><span class="track"></span><span>Word wrap</span></label>
-      </article>
-      <article class="card"><div class="card-head"><h2>Host adapters</h2><span class="muted">ready</span></div>
-        <div class="adapter"><span class="adapter-icon">CLI</span><span><b>Headless CLI</b><small>runs without a window</small></span><span class="ok">active</span></div>
-        <div class="adapter"><span class="adapter-icon">LSP</span><span><b>Language host</b><small>provider boundary</small></span><span class="ok">ready</span></div>
-        <div class="adapter"><span class="adapter-icon">UI</span><span><b>Visual host</b><small>this lightweight page</small></span><span class="ok">active</span></div>
-      </article>
-    </section>
-    <footer><span>Ryan Harness Core</span><span>MIT OR Apache-2.0</span><span>offline by design</span></footer>
-  </main>
+
+    <div class="command-strip">
+      <button class="strip-item active" data-view="explorer" type="button"><span class="strip-icon">▤</span><span>Explorer</span></button>
+      <button class="strip-item" data-view="search" type="button"><span class="strip-icon">⌕</span><span>Search</span></button>
+      <button class="strip-item" data-view="source" type="button"><span class="strip-icon">{} </span><span>Source control</span><span class="count">0</span></button>
+      <span class="strip-spacer"></span>
+      <button class="strip-item" id="runButton" type="button"><span class="play">▶</span><span>Run</span></button>
+      <button class="strip-item" id="checkButton" type="button"><span class="checkmark">✓</span><span>Check</span></button>
+    </div>
+
+    <main class="workbench">
+      <aside class="activity-rail">
+        <button class="rail-button active" data-view="explorer" title="Explorer" type="button">▤</button>
+        <button class="rail-button" data-view="search" title="Search" type="button">⌕</button>
+        <button class="rail-button" data-view="source" title="Source control" type="button">{}<i>0</i></button>
+        <span class="rail-spacer"></span>
+        <button class="rail-button" id="selfCheckButton" title="Kernel check" type="button">✓</button>
+        <button class="rail-button" id="railSettings" title="Settings" type="button">⚙</button>
+      </aside>
+
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-title"><span id="sidebarTitle">EXPLORER</span><span class="sidebar-actions"><button id="newFileButton" title="New file" type="button">+</button><button id="collapseButton" title="Collapse all" type="button">⌃</button></span></div>
+        <div class="sidebar-filter"><span>⌕</span><input id="fileFilter" type="search" placeholder="Filter files" spellcheck="false"></div>
+        <div class="tree" id="tree"></div>
+        <div class="sidebar-footer"><span class="status-dot"></span><span id="sidebarStatus">Workspace ready</span></div>
+      </aside>
+
+      <section class="editor-column">
+        <div class="tabs" id="tabs"></div>
+        <div class="breadcrumbs"><span class="crumb-muted">ryan-harness</span><span>/</span><span id="breadcrumbPath">src</span><span>/</span><strong id="breadcrumbFile">main.dtr</strong><span class="crumb-spacer"></span><button id="splitButton" title="Split editor" type="button">▥</button><button id="editorMore" title="More" type="button">···</button></div>
+        <div class="editor-wrap">
+          <div class="line-numbers" id="lineNumbers" aria-hidden="true"></div>
+          <textarea id="editor" class="editor" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" aria-label="Source editor"></textarea>
+          <div class="minimap" id="minimap" aria-hidden="true"></div>
+        </div>
+        <div class="editor-message" id="editorMessage"></div>
+      </section>
+
+      <aside class="inspector" id="inspector">
+        <div class="inspector-tabs"><button class="inspector-tab active" data-panel="problems" type="button">Problems <b id="problemCount">0</b></button><button class="inspector-tab" data-panel="structure" type="button">Structure</button><button class="inspector-tab" data-panel="project" type="button">Project</button><button class="inspector-tab" data-panel="layout" type="button">Layout</button><button class="inspector-tab" data-panel="output" type="button">Output</button></div>
+        <div class="inspector-body" id="inspectorBody"></div>
+      </aside>
+    </main>
+
+    <footer class="statusbar">
+      <div class="status-left"><span class="status-live"><i></i> Ready</span><span id="currentLanguage">Datara</span><span id="currentFileLabel">main.dtr</span></div>
+      <button class="status-branch" id="branchButton" type="button"><span>⑂</span> main <em>clean</em></button>
+      <div class="status-right"><span id="encoding">UTF-8</span><span>LF</span><span id="cursorPosition">Ln 1, Col 1</span><span id="kernelStatus">Kernel 0.1.0</span></div>
+    </footer>
+  </div>
+
+  <div class="overlay hidden" id="paletteOverlay"><div class="palette" role="dialog" aria-label="Command palette"><div class="palette-input"><span>⌕</span><input id="paletteInput" placeholder="Search commands and files" autocomplete="off" spellcheck="false"></div><div class="palette-list" id="paletteList"></div><div class="palette-footer"><span>↑↓ navigate</span><span>Enter open</span><span>Esc close</span></div></div></div>
+  <div class="overlay hidden" id="settingsOverlay"><div class="settings-dialog" role="dialog" aria-label="Settings"><div class="dialog-title"><strong>Settings</strong><button class="dialog-close" data-close="settingsOverlay" type="button">×</button></div><div class="settings-row"><div><b>Editor font size</b><small>Comfortable text without heavy rendering</small></div><select id="fontSizeSetting"><option value="13">13 px</option><option value="14">14 px</option><option value="15">15 px</option><option value="16">16 px</option></select></div><div class="settings-row"><div><b>Line numbers</b><small>Show the source line gutter</small></div><label class="switch"><input id="lineNumberSetting" type="checkbox" checked><span></span></label></div><div class="settings-row"><div><b>Word wrap</b><small>Wrap long source lines</small></div><label class="switch"><input id="wrapSetting" type="checkbox"><span></span></label></div><div class="settings-row"><div><b>Indent width</b><small>Applied when inserting a new line</small></div><select id="indentSetting"><option value="2">2 spaces</option><option value="4" selected>4 spaces</option><option value="8">8 spaces</option></select></div><div class="dialog-note">Settings are stored locally in this browser. The kernel remains usable without this page.</div></div></div>
   <script src="app.js"></script>
 </body>
 </html>
