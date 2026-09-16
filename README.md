@@ -18,7 +18,7 @@ and `kernel_self_check()` verifies them.
 - `conformance/` and `tests/` - executable contracts
 - `ui/` - a minimal no-AI visual host with local settings
 
-## Start the base UI
+## Start the kernel IDE UI
 
 Windows:
 
@@ -32,9 +32,18 @@ Linux and macOS:
 ./scripts/serve-ui.sh
 ```
 
-Then open `http://127.0.0.1:8088`. The UI is a static, dependency-free page;
-settings stay in the browser's local storage. It is a visual host for the
-kernel, not the full Datara Studio and not an AI client.
+Then open `http://127.0.0.1:8088`. The page is a static, dependency-free IDE
+host with the useful Studio chrome and no AI surface:
+
+- workspace explorer, file filter, new-file action and tabs;
+- direct source editor with line numbers, minimap, indentation and word wrap;
+- Problems, Structure, Project, Layout and Output panels;
+- command palette with `Ctrl+P`, save with `Ctrl+S`, run and source check;
+- local settings for font size, line numbers, wrapping and indentation;
+- local persistence for settings, open files and edits.
+
+It is a visual host for the kernel, not a network client and not a companion
+front end. No generation, suggestions, remote calls or AI controls are present.
 
 ## Run the kernel
 
