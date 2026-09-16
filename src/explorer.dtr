@@ -1,0 +1,1334 @@
+//! datara-studio :: the built-in explorer
+//!
+//! A directory browser, in Datara, for opening a project folder. Written here
+//! rather than delegated to a native dialog because browsing the filesystem is
+//! the one thing this IDE needs from the platform, and doing it in the kernel's
+//! own language means one implementation serves Windows, Linux and macOS
+//! instead of one per platform.
+//!
+//! Cross-platform by asking the environment rather than the compiler: Windows
+//! always sets `SystemRoot` and Unix never does. Measured, not assumed - see
+//! `st_is_windows`.
+//!
+//! # Rewritten for forgen 1.4.0: the shell is gone from the listing path
+//!
+//! The first version asked the platform shell for everything - `cd` to test a
+//! directory, `dir /b /s` to list a tree, `dir /b /ad` to list folders. That
+//! worked, and it cost three things that are all now fixed by calling the
+//! runtime instead:
+//!
+//!   * **`dir /b /s` from a drive root walked the entire disk.** Measured: the
+//!     server grew to **3.9 GB** and stopped answering, and the interface showed
+//!     "workspace unreadable" with no way out. The response cap could not help,
+//!     because the listing had to finish before anything could be capped. The
+//!     workaround was to list a drive root one level deep and report
+//!     `shallow: true`. **`dir_list` is native, so the walk is bounded as it
+//!     goes** and the drive root needs no special case at all: `st_tree` carries
+//!     a budget and stops, whether the root is `D:/` or a project folder.
+//!   * **`/api/tree` cost 487 ms** - two shell listings, two process starts.
+//!     Native `dir_list` is a directory read, and the tree is now walked in
+//!     process.
+//!   * **`cd` was the only reliable directory test**, because `file_exists`
+//!     returns false for a folder. `path_exists` answers for a folder, a file, a
+//!     missing path and a drive root alike, so `st_dir_exists` is now
+//!     `path_exists && !file_exists` instead of a process launch.
+//!
+//! Three things still need the shell, and they are named rather than hidden:
+//! creating a directory, moving a file, and content search. forgen 1.4.0 has no
+//! builtin for any of the three - `dir_list`, `path_exists`, `file_exists`,
+//! `file_read`, `file_read_bytes`, `file_write`, `file_append`,
+//! `file_write_bytes` are the whole filesystem surface. So `st_sh` survives for
+//! exactly `st_mkdir`, `st_move` and `st_find`, and each of those verifies its
+//! own result by looking at the filesystem rather than by reading the shell's
+//! message, because that message is translated.
+//!
+//! # The encoding, and the one defect that is not ours
+//!
+//! Text that comes out of the shell is console-codepage bytes (cp866 on a
+//! Russian Windows). Text that comes out of the **native** builtins is **ANSI**
+//! bytes (cp1251), and that is a runtime defect with a precise cause:
+//! `src/runtime/datara_runtime.c:2623` calls `FindFirstFileA` with a
+//! `WIN32_FIND_DATAA`, so the ANSI Win32 API hands back cp1251 and a name
+//! outside the ANSI codepage cannot be represented at all. Measured: the folder
+//! `тест папка 123` comes back as the fourteen bytes
+//! `242 229 241 242 32 239 224 239 234 224 32 49 50 51`, which is cp1251, and
+//! `validate_utf8` on it is false.
+//!
+//! The fix belongs in the runtime: `FindFirstFileW` plus
+//! `WideCharToMultiByte(CP_UTF8, ...)`. When that lands, `st_from_ansi` and its
+//! two tables are deleted and nothing else changes. Until then both conversions
+//! exist, each in one place, and `st_from_ansi` is the one the listing path
+//! uses.
+
+use http
+
+/// The marker every shell call echoes on success.
+///
+/// Success is decided by this string appearing, never by matching error text,
+/// because error text is translated and the translation is not ours to guess.
+pub fn st_ok_mark() -> Str {
+    return "__DS_OK__"
+}
+
+/// Run a command through the platform shell and return stdout and stderr
+/// together.
+///
+/// Only three callers are left: `st_mkdir`, `st_move` and `st_find`. Everything
+/// that only needed to *look* at the filesystem now calls a builtin instead.
+pub fn st_sh( cmd: Str) -> Str {
+    // not named `out`: it is a reserved word in Datara
+    mut res = ""
+    unsafe(justification: "the shell is needed for mkdir, move, delete and content search, which have no builtin") {
+        res = exec(cmd)
+    }
+    return res
+}
+
+/// Is something already listening on a loopback port?
+///
+/// There is no client-side socket builtin - the runtime has create, bind,
+/// listen, accept, recv, send and close, and nothing that connects - so this asks
+/// the operating system instead. One `netstat -an` is a process launch, about
+/// 220 ms on this machine, which is why it is only on the path where a person has
+/// explicitly asked for something to be started.
+///
+/// Why it exists at all. The runtime does not refuse a second bind on a port, so
+/// every "start the companion" that arrived while one was already running started
+/// another one, and every one of them bound 7890 without error. Measured on this
+/// machine: **115 python processes, 2.64 GB resident**, about thirty of them
+/// listening on that single port. A request then went to whichever one Windows
+/// happened to pick, so the companion's answers were not reproducible between two
+/// identical keystrokes - which from the outside is "the suggestions are unclear".
+pub fn st_port_busy( port: Int) -> Bool {
+    let out = st_sh("netstat -an")
+    // the trailing space matters: ":7890 " cannot match ":78900", and netstat
+    // pads every address field so the space is always there
+    return str_index_of(out, ":" + int_to_str(port) + " ") >= 0
+}
+
+// --------------------------------------------------------------- cp1251 -> UTF-8
+//
+// The native builtins return ANSI bytes. Two tables and one walker cover the
+// whole codepage: `st_ansi_lo` is 0x80..0xBF and `st_ansi_hi` is 0xC0..0xFF,
+// whose 64 Cyrillic letters are contiguous and in order.
+//
+// 0x98 has no cp1251 mapping and 0xAD is a soft hyphen, which is invisible in a
+// filename; both are rendered as `?` so a name containing one still reads as a
+// name instead of collapsing.
+
+/// cp1251 0x80..0xBF, one character per position.
+fn st_ansi_lo() -> Str {
+    return "ЂЃ‚ѓ„…†‡€‰Љ‹ЊЌЋЏ"
+         + "ђ‘’“”•–—?™љ›њќћџ"
+         + " ЎўЈ¤Ґ¦§Ё©Є«¬?®Ї"
+         + "°±Ііґµ¶·ё№є»јЅѕї"
+}
+
+/// cp1251 0xC0..0xFF: А..Я then а..я.
+fn st_ansi_hi() -> Str {
+    return "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+         + "абвгдежзийклмнопрстуфхцчшщъыьэюя"
+}
+
+/// The character at position `idx` of a table.
+///
+/// By walking character boundaries, not by arithmetic: `str_substring` indexes
+/// bytes and the table mixes two-byte Cyrillic with three-byte box drawing, so
+/// `idx * 2` would land in the middle of a character.
+fn st_char_idx( table: Str, idx: Int) -> Str {
+    let total = byte_len(table)
+    mut i = 0
+    mut n = 0
+    while n < idx && i < total {
+        let j = str_next_offset(table, i)
+        if j <= i {
+            i = total
+        } else {
+            i = j
+        }
+        n = n + 1
+    }
+    if i >= total {
+        return "?"
+    }
+    let j2 = str_next_offset(table, i)
+    mut width = j2 - i
+    if width <= 0 {
+        width = 1
+    }
+    return str_substring(table, i, width)
+}
+
+fn st_has_high_byte( s: Str) -> Bool {
+    let n = byte_len(s)
+    mut i = 0
+    while i < n {
+        if str_byte_at(s, i) > 127 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// Translate ANSI text from a native builtin into UTF-8.
+///
+/// The fast path matters: the workspace tree is mostly ASCII, and returning the
+/// string untouched when no high byte is present means the tree poll costs
+/// nothing for the usual case.
+pub fn st_from_ansi( s: Str) -> Str {
+    if !st_is_windows() {
+        return s
+    }
+    if !st_has_high_byte(s) {
+        return s
+    }
+    mut parts: List<Str> = []
+    let n = byte_len(s)
+    mut i = 0
+    while i < n {
+        let b = str_byte_at(s, i)
+        if b < 128 {
+            parts = parts.push(str_substring(s, i, 1))
+        } else {
+            if b < 192 {
+                parts = parts.push(st_char_idx(st_ansi_lo(), b - 128))
+            } else {
+                parts = parts.push(st_char_idx(st_ansi_hi(), b - 192))
+            }
+        }
+        i = i + 1
+    }
+    // joined rather than concatenated in the loop: `+` in a loop is quadratic,
+    // and a tree listing can be a few hundred kilobytes
+    return str_join(parts, "")
+}
+
+/// A string that is guaranteed to be valid UTF-8, for anything that becomes JSON.
+///
+/// Two kinds of text reach this module and only one of them is UTF-8:
+///
+///   * what the browser sent, which is already UTF-8;
+///   * what the runtime's filesystem builtins and the shell handed back, which
+///     is the ANSI codepage (cp1251) or the console codepage (cp866).
+///
+/// A raw cp1251 path inside a JSON string makes the whole document invalid: a
+/// parser is entitled to reject it and a browser shows mojibake. So a value that
+/// is already correct is never converted twice - `validate_utf8` decides which
+/// case it is. Measured on the check endpoint: the `path` field was correct
+/// while the `cmd` field, which echoed the raw path, carried `f2 e5 f1 f2` for
+/// `тест`.
+pub fn st_display( s: Str) -> Str {
+    if !st_has_high_byte(s) {
+        return s
+    }
+    mut ok = true
+    unsafe(justification: "the IDE must not put invalid UTF-8 into a JSON reply") {
+        ok = validate_utf8(s)
+    }
+    if ok {
+        return s
+    }
+    return st_from_ansi(s)
+}
+
+/// Like `st_display`, but for text that came back from a shell.
+///
+/// Two writers share one output stream and they do not agree on an encoding.
+/// `cmd` writes the console codepage (cp866) for its own messages; a program it
+/// launched writes whatever its runtime uses, and forgen writes UTF-8. Because
+/// the output is redirected to a *file* rather than a pipe, nothing transcodes it
+/// on the way, so the buffer is a mix.
+///
+/// Validity is the only rule that handles both: correct UTF-8 is left alone, and
+/// anything else is read as cp866. Measured: reading forgen's own diagnostics as
+/// cp866 turned the folder `тест папка 123` into `╤В╨╡╤Б╤В ╨┐╨░╨┐╨║╨░ 123`, which is
+/// exactly those UTF-8 bytes seen through cp866.
+pub fn st_display_shell( s: Str) -> Str {
+    if !st_has_high_byte(s) {
+        return s
+    }
+    mut ok = true
+    unsafe(justification: "the IDE must not put invalid UTF-8 into a JSON reply") {
+        ok = validate_utf8(s)
+    }
+    if ok {
+        return s
+    }
+    return st_from_oem(s)
+}
+
+// ------------------------------------------------------------------ cp866 -> UTF-8
+//
+// Shell output only. `findstr` prints paths, and a failure prints the shell's
+// own message; both arrive in the console codepage.
+
+/// The OEM codepage's upper half, 0x80..0xFE, in order.
+///
+/// `exec("dir /b /ad \"D:/\")` returns the folder "Шахматная школа 64 линии" as
+/// the bytes 152 160 229 172 160 226 173 160 239 32 ... That is **cp866**, the
+/// OEM codepage of a console on a Russian Windows. The runtime keeps whatever
+/// the child wrote, byte for byte, and `str_len` counts those bytes - so the
+/// string is not UTF-8, and the explorer showed mojibake.
+///
+/// `chcp 65001` does **not** fix it: measured with and without, the bytes are
+/// identical, because cmd writes a redirected pipe in the OEM codepage
+/// regardless of the console codepage.
+///
+/// 0xFF is a non-breaking space in cp866 and is handled in `st_from_oem`
+/// instead of here, because a literal NBSP in source is invisible and unsafe to
+/// edit. Regenerate the table with:
+///
+///   python -c "print('АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ' \
+///     'абвгдежзийклмноп' '░▒▓│┤╡╢╖╕╣║╗╝╜╛┐' '└┴┬├─┼╞╟╚╔╩╦╠═╬╧' \
+///     '╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀' 'рстуфхцчшщъыьэюя' 'ЁёЄєЇїЎў°∙·√№¤■')"
+fn st_oem_table() -> Str {
+    return "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧ"
+         + "ШЩЪЫЬЭЮЯабвгдежзийклмноп"
+         + "░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟"
+         + "╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀"
+         + "рстуфхцчшщъыьэюяЁёЄєЇїЎў"
+         + "°∙·√№¤■"
+}
+
+/// Translate OEM-encoded text from the shell into UTF-8.
+///
+/// Used for `findstr` output and for the shell's own error text. `st_mkdir` and
+/// `st_move` do not need it: they confirm their result with `path_exists`, so
+/// the message only ever reaches the user when something actually failed.
+pub fn st_from_oem( s: Str) -> Str {
+    if !st_is_windows() {
+        return s
+    }
+    if !st_has_high_byte(s) {
+        return s
+    }
+    mut parts: List<Str> = []
+    let n = byte_len(s)
+    mut i = 0
+    while i < n {
+        let b = str_byte_at(s, i)
+        if b < 128 {
+            parts = parts.push(str_substring(s, i, 1))
+        } else {
+            if b == 255 {
+                parts = parts.push(" ")
+            } else {
+                parts = parts.push(st_char_idx(st_oem_table(), b - 128))
+            }
+        }
+        i = i + 1
+    }
+    return str_join(parts, "")
+}
+
+// ------------------------------------------------------------------ platform
+
+pub fn st_is_windows() -> Bool {
+    // Measured, not assumed: `env_get("OS")`, `ComSpec` and `SHELL` all come
+    // back empty in this runtime, while `SystemRoot` returns "C:\\Windows".
+    // Windows always sets it and Unix never does, so it is the reliable signal.
+    if byte_len(env_get("SystemRoot")) > 0 {
+        return true
+    }
+    return st_has_infix(env_get("OS"), "Windows")
+}
+
+/// Every path in this module is stored with forward slashes.
+///
+/// Measured: mixing separators produced `D:/IDE datara\ryan-harness`, which
+/// Windows tolerates but which then travelled into `/api/tree` and `/api/read`
+/// as a different string from the one the user picked. Forward slashes work on
+/// Windows too, so one separator everywhere removes the whole class of problem.
+pub fn st_slash( p: Str) -> Str {
+    return str_replace(p, "\\", "/")
+}
+
+/// Is this `X:/` - a drive root and not a directory on a drive?
+pub fn st_is_drive_root( s: Str) -> Bool {
+    if byte_len(s) != 3 {
+        return false
+    }
+    if str_substring(s, 1, 1) != ":" {
+        return false
+    }
+    return str_substring(s, 2, 1) == "/"
+}
+
+/// Normalise a user-supplied path into the one form the rest of the code uses.
+///
+/// The `X:` case is the important one: a bare drive letter names the drive's
+/// *current directory*, so `D:` and `D:/` are different places and `/` is not
+/// the empty string. A trailing separator is stripped from ordinary paths but
+/// never from a root.
+pub fn st_norm_path( p: Str) -> Str {
+    let s0 = st_slash(str_trim(p))
+    if byte_len(s0) == 0 {
+        return "."
+    }
+    if byte_len(s0) == 2 {
+        if str_substring(s0, 1, 1) == ":" {
+            return s0 + "/"
+        }
+    }
+    mut s = s0
+    while byte_len(s) > 3 && st_has_suffix(s, "/") {
+        s = str_substring(s, 0, byte_len(s) - 1)
+    }
+    return s
+}
+
+/// The directory above `path`, or the path itself at a root.
+///
+/// There is no `str_rfind`, so the parent is found by scanning forward and
+/// keeping the last separator seen. The drive case is why this is not one line:
+/// the parent of `D:/ryan` is `D:/`, not `D:`.
+pub fn st_parent_of( p: Str) -> Str {
+    let norm = st_norm_path(p)
+    if norm == "/" || norm == "." || st_is_drive_root(norm) {
+        return norm
+    }
+    mut last = -1
+    let n = byte_len(norm)
+    mut i = 0
+    while i < n {
+        if str_substring(norm, i, 1) == "/" {
+            last = i
+        }
+        i = i + 1
+    }
+    if last <= 0 {
+        return "/"
+    }
+    let head = str_substring(norm, 0, last)
+    if byte_len(head) == 2 {
+        if str_substring(head, 1, 1) == ":" {
+            return head + "/"
+        }
+    }
+    return head
+}
+
+/// A short name for the folder, for the dialog title.
+pub fn st_base_of( p: Str) -> Str {
+    let norm = st_norm_path(p)
+    if st_is_drive_root(norm) {
+        return str_substring(norm, 0, 2)
+    }
+    if norm == "/" {
+        return "/"
+    }
+    let n = byte_len(norm)
+    mut last = -1
+    mut i = 0
+    while i < n {
+        if str_substring(norm, i, 1) == "/" {
+            last = i
+        }
+        i = i + 1
+    }
+    if last < 0 {
+        return norm
+    }
+    let tail = str_substring(norm, last + 1, n - last - 1)
+    if byte_len(tail) == 0 {
+        return norm
+    }
+    return tail
+}
+
+/// Join with a forward slash on every platform.
+pub fn st_join( a: Str, b: Str) -> Str {
+    let norm = st_slash(a)
+    if st_has_suffix(norm, "/") {
+        return norm + b
+    }
+    return norm + "/" + b
+}
+
+/// The same path in backslashes.
+///
+/// Needed because of a measured asymmetry, and only for the shell commands that
+/// are left. `dir`, `cd`, `mkdir` and `type` all accept forward slashes, so the
+/// whole codebase uses them. But `move`, `ren` and `del` do **not** - with a
+/// forward slash they print "Системе не удается найти указанный путь." and fail.
+/// Tested both ways:
+///
+///   move "D:\...\c.txt" "D:\...\d.txt"   -> Перемещено файлов: 1.   OK
+///   move "D:/.../d.txt" "D:/.../e.txt"   -> путь не найден          fails
+///
+/// Rather than converting the whole codebase to backslashes - which is how the
+/// mixed-separator bug started - the conversion is confined to the call sites
+/// that need it.
+pub fn st_back_path( p: Str) -> Str {
+    return str_replace(p, "/", "\\")
+}
+
+// ------------------------------------------------------- native filesystem
+
+/// Does `path` name an existing directory? **Takes a filesystem path.**
+///
+/// `file_exists` returns false for a folder (measured), and `path_exists`
+/// answers true for a folder, a file, a missing path and a drive root alike
+/// (measured on 1.4.0: `D:/` is true). So the two together are exactly the test,
+/// with no process launch.
+///
+/// The path must be in the form the filesystem uses - see `st_list_names` for
+/// why that is not the same as the form a person reads. Callers holding a path
+/// from the browser run it through `st_fs_path` first.
+pub fn st_dir_exists( path: Str) -> Bool {
+    let p = st_norm_path(path)
+    if byte_len(p) == 0 {
+        return false
+    }
+    mut present = false
+    mut is_file = false
+    unsafe(justification: "the explorer must tell a folder from a file") {
+        present = path_exists(p)
+        if present {
+            is_file = file_exists(p)
+        }
+    }
+    return present && !is_file
+}
+
+/// Does `path` name an existing file? **Takes a filesystem path.**
+pub fn st_file_exists( path: Str) -> Bool {
+    let p = st_norm_path(path)
+    if byte_len(p) == 0 {
+        return false
+    }
+    mut r = false
+    unsafe(justification: "the explorer must check whether the file exists") {
+        r = file_exists(p)
+    }
+    return r
+}
+
+/// A Datara `Bool` as the JSON literal.
+///
+/// Lives here rather than in `layout.dtr` because everything below this module
+/// needs it, and `layout` imports `explorer` - the reverse would be a cycle.
+pub fn st_bool( v: Bool) -> Str {
+    if v {
+        return "true"
+    }
+    return "false"
+}
+
+/// Entry names inside `dir`, **raw**, exactly as the runtime handed them over.
+///
+/// Raw, not UTF-8, and that is the whole design of this module. The runtime's
+/// filesystem builtins are ANSI on Windows in *both* directions - `dir_list`
+/// returns cp1251 (`FindFirstFileA`, `datara_runtime.c:2623`) and
+/// `path_exists`/`file_exists`/`file_read` expect cp1251 back. Measured: a path
+/// spelled in UTF-8 for the folder `тест папка 123` answers `false`, while the
+/// same path built from the cp1251 bytes answers `true`.
+///
+/// So a name has two lives, and mixing them is the bug this module exists to
+/// avoid:
+///
+///   * **raw** - what the filesystem understands. Use it to join, to test and
+///     to descend.
+///   * **`st_from_ansi(raw)`** - what a person reads. Use it only when the value
+///     is about to become JSON.
+///
+/// A client path arrives in UTF-8, so anything that takes one from the wire goes
+/// through `st_fs_path` first, which turns it back into raw. That function is a
+/// no-op for the ASCII paths that are almost all of them.
+pub fn st_list_names( dir: Str) -> List<Str> {
+    mut raw: List<Str> = []
+    unsafe(justification: "the explorer lists the folder the user is browsing") {
+        raw = dir_list(st_norm_path(dir))
+    }
+    return raw
+}
+
+/// The raw entry name inside `parent` whose readable form is `want`, or "".
+///
+/// This is how a UTF-8 path from the browser is turned back into something the
+/// filesystem accepts: the name is *found* in the parent's own listing rather
+/// than reconstructed, because a Datara string cannot be built from byte values
+/// and cp1251 has no arithmetic relationship to UTF-8.
+fn st_raw_name_for( parent: Str, want: Str) -> Str {
+    let names = st_list_names(parent)
+    let n = names.len()
+    mut i = 0
+    while i < n {
+        let raw = names[i]
+        i = i + 1
+        if st_from_ansi(raw) == want {
+            return raw
+        }
+    }
+    return ""
+}
+
+/// Turn a path from the browser (UTF-8) into a path the filesystem accepts.
+///
+/// Free for ASCII, which is the case that matters for speed: one scan finds no
+/// high byte and the string is returned untouched. Only a segment that actually
+/// contains one costs a directory read.
+///
+/// Returns "" when a segment cannot be found, so a caller reports "not found"
+/// rather than inventing a path.
+pub fn st_fs_path( p: Str) -> Str {
+    let norm = st_norm_path(p)
+    if !st_has_high_byte(norm) {
+        return norm
+    }
+    let parts = str_split(norm, "/")
+    let n = parts.len()
+    // the first segment is the root: "D:" for "D:/x", empty for "/x"
+    mut cur = "/"
+    mut i = 0
+    if n > 0 && byte_len(parts[0]) > 1 {
+        cur = parts[0]
+        i = 1
+        if i < n && byte_len(parts[i]) == 0 {
+            cur = cur + "/"
+            i = i + 1
+        }
+    } else {
+        i = 1
+    }
+    while i < n {
+        let seg = parts[i]
+        i = i + 1
+        if byte_len(seg) == 0 {
+            continue
+        }
+        if !st_has_high_byte(seg) {
+            cur = st_join(cur, seg)
+            continue
+        }
+        let raw = st_raw_name_for(cur, seg)
+        if byte_len(raw) == 0 {
+            return ""
+        }
+        cur = st_join(cur, raw)
+    }
+    return cur
+}
+
+/// The one honest sentence for a name the runtime cannot be handed.
+///
+/// A path that is being *created* does not exist yet, so it cannot be found in
+/// its parent's listing and its raw spelling cannot be recovered. Everything
+/// except the last segment resolves the normal way; the last segment is usable
+/// only while it stays ASCII, because a Datara string cannot be built from byte
+/// values and cp1251 has no arithmetic relationship to UTF-8.
+///
+/// So a new folder whose name is not ASCII is refused with a reason rather than
+/// created under a mojibake name, which is what handing UTF-8 to a shell that
+/// reads cp1251 used to do.
+pub fn st_no_bytes_msg() -> Str {
+    return "this name leaves ASCII, and a name that does not exist yet cannot be "
+         + "spelled for the filesystem: the runtime builds paths in the ANSI "
+         + "codepage and a Datara string cannot be built from raw bytes"
+}
+
+/// Like `st_fs_path`, but for a path that may not exist yet.
+///
+/// Free for ASCII. Otherwise the parent is resolved against the filesystem and
+/// the last segment is appended only when it is ASCII. Returns "" when that is
+/// impossible, so the caller reports it instead of inventing a name.
+pub fn st_fs_create_path( p: Str) -> Str {
+    let norm = st_norm_path(p)
+    if !st_has_high_byte(norm) {
+        return norm
+    }
+    let name = st_base_of(norm)
+    if byte_len(name) == 0 || st_has_high_byte(name) {
+        return ""
+    }
+    let parent = st_fs_path(st_parent_of(norm))
+    if byte_len(parent) == 0 {
+        return ""
+    }
+    return st_join(parent, name)
+}
+
+/// Directory names that are never worth showing.
+///
+/// Only the ones that are unambiguously generated and can hold tens of
+/// thousands of entries. `dist` and `build` are deliberately *not* here: they
+/// are often real folders someone made on purpose, and hiding a folder the user
+/// created is worse than showing one they did not.
+pub fn st_skip_name( name: Str) -> Bool {
+    if name == "node_modules" {
+        return true
+    }
+    if name == "target" {
+        return true
+    }
+    if name == ".git" {
+        return true
+    }
+    if name == "__pycache__" {
+        return true
+    }
+    if name == ".venv" {
+        return true
+    }
+    if name == "venv" {
+        return true
+    }
+    if name == ".forgen_cache" {
+        return true
+    }
+    if name == ".next" {
+        return true
+    }
+    if name == ".cache" {
+        return true
+    }
+    if name == ".mypy_cache" {
+        return true
+    }
+    return name == ".pytest_cache"
+}
+
+// ------------------------------------------------------------------- the tree
+
+/// How deep the walk goes before it stops. A real project is far shallower.
+fn st_max_depth() -> Int => 10
+
+/// How many entries the walk collects before it stops.
+fn st_max_entries() -> Int => 6000
+
+/// Walk `dir` and return one flat list of entries.
+///
+/// Each element is `"D" + path` for a folder or `"F" + path` for a file, so a
+/// single return value carries both and the recursion needs no shared mutable
+/// state. The budget is checked **before** descending, which is the whole point:
+/// the first version handed `dir /b /s` a drive root and had to wait for the
+/// disk to be enumerated before any cap could apply.
+fn st_walk( root: Str, budget: Int) -> List<Str> {
+    mut acc: List<Str> = []
+    // Breadth first, and that is the point of the shape. A depth-first walk
+    // spends its whole budget inside the first folder it meets, so opening a
+    // drive root showed 5998 files and 2 folders - measured - because it had
+    // descended into one branch and never come back. Level by level, the top of
+    // the tree is always complete and only the deep end is cut off.
+    mut level: List<Str> = [root]
+    mut d = 0
+    while d <= st_max_depth() {
+        mut next: List<Str> = []
+        let ln = level.len()
+        mut li = 0
+        while li < ln {
+            let dir = level[li]
+            li = li + 1
+            let names = st_list_names(dir)
+            let n = names.len()
+            mut i = 0
+            while i < n {
+                let name = names[i]
+                i = i + 1
+                if st_skip_name(name) {
+                    continue
+                }
+                if acc.len() >= budget {
+                    return acc
+                }
+                let full = st_join(dir, name)
+                if st_dir_exists(full) {
+                    acc = acc.push("D" + full)
+                    next = next.push(full)
+                } else {
+                    acc = acc.push("F" + full)
+                }
+            }
+        }
+        level = next
+        if level.len() == 0 {
+            return acc
+        }
+        d = d + 1
+    }
+    return acc
+}
+
+/// The workspace, flat: every file and every folder.
+///
+/// Flat rather than a tree because the UI builds a tree from paths in ten lines
+/// of JavaScript, and a flat list is also exactly what a file picker wants.
+///
+/// **Folders are listed, not just files.** The first version ran `dir /b /s /a-d`
+/// (the `/a-d` means "not directories"), so a folder could never appear in the
+/// explorer at all - creating one appeared to do nothing. Both files and folders
+/// now come from one walk.
+///
+/// The resolved root is returned, so the interface can show names relative to
+/// it instead of a `D:` / `IDE datara` ladder at the top of the tree. (It used to
+/// be three rungs - `D:` / `ryan` / `IDE datara` - because the studio sat inside
+/// the forgen_ai project; moving it to the drive root took one rung out.)
+///
+/// **A drive root is no longer a special case.** `dir /b /s` from `D:/` walked
+/// the whole disk - measured at 3.9 GB - so the old code listed a drive root one
+/// level deep and said `shallow: true`. `st_walk` checks its budget before every
+/// descent, so a drive root is walked exactly as far as the budget allows and
+/// stops. The `shallow` flag is kept in the response because the interface shows
+/// it, and it is now simply "the walk hit its budget".
+pub fn st_tree( root: Str) -> Str {
+    let asked = str_trim(root)
+    let shown = st_norm_path(asked)
+    let base_dir = st_fs_path(asked)
+    if !st_dir_exists(base_dir) {
+        return "{\"ok\":false,\"root\":\"" + st_json_escape(shown) + "\""
+             + ",\"files\":[],\"dirs\":[]"
+             + ",\"error\":\"cannot read that folder\""
+             + ",\"detail\":\"not a folder: " + st_json_escape(shown) + "\"}"
+    }
+
+    let all = st_walk(base_dir, st_max_entries())
+
+    mut files = "["
+    mut dirs = "["
+    let n = all.len()
+    mut fcount = 0
+    mut dcount = 0
+    mut i = 0
+    while i < n {
+        let entry = all[i]
+        i = i + 1
+        if byte_len(entry) < 2 {
+            continue
+        }
+        let kind = str_substring(entry, 0, 1)
+        let path = str_substring(entry, 1, byte_len(entry) - 1)
+        if path == base_dir {
+            continue
+        }
+        // raw on the inside, readable on the wire
+        let shown_path = st_from_ansi(path)
+        if kind == "D" {
+            if dcount > 0 {
+                dirs = dirs + ","
+            }
+            dirs = dirs + "\"" + st_json_escape(shown_path) + "\""
+            dcount = dcount + 1
+        } else {
+            if fcount > 0 {
+                files = files + ","
+            }
+            files = files + "\"" + st_json_escape(shown_path) + "\""
+            fcount = fcount + 1
+        }
+    }
+    files = files + "]"
+    dirs = dirs + "]"
+
+    return "{\"ok\":true,\"root\":\"" + st_json_escape(shown) + "\""
+         + ",\"asked\":\"" + st_json_escape(asked) + "\""
+         + ",\"files\":" + files + ",\"dirs\":" + dirs
+         + ",\"file_count\":" + int_to_str(fcount)
+         + ",\"dir_count\":" + int_to_str(dcount)
+         + ",\"shallow\":" + st_bool(n >= st_max_entries())
+         + ",\"truncated\":" + st_bool(n >= st_max_entries()) + "}"
+}
+
+// ------------------------------------------------------------------ browsing
+
+/// Directories inside `path`, as JSON, for the folder dialog.
+///
+/// Never invents an entry: an unreadable folder comes back with `ok:false` and
+/// a readable reason, because a browser that shows a folder called "Системе не
+/// удается найти указанный путь." is worse than one that admits it could not
+/// open the folder.
+///
+/// `parent` and `roots` are returned even on failure, so the dialog always has
+/// somewhere to go.
+pub fn st_list_dir( path: Str) -> Str {
+    // what the browser asked for, in the form it understands
+    let shown = st_norm_path(path)
+    // what the filesystem needs
+    let base_dir = st_fs_path(path)
+
+    let head = ",\"path\":\"" + st_json_escape(shown) + "\""
+             + ",\"name\":\"" + st_json_escape(st_base_of(shown)) + "\""
+             + ",\"parent\":\"" + st_json_escape(st_parent_of(shown)) + "\""
+             + ",\"roots\":" + st_roots_json()
+             + ",\"windows\":" + st_bool(st_is_windows())
+
+    if !st_dir_exists(base_dir) {
+        return "{\"ok\":false" + head
+             + ",\"count\":0,\"dirs\":[],\"files\":[]"
+             + ",\"error\":\"cannot open that folder\""
+             + ",\"detail\":\"not a folder: " + st_json_escape(shown) + "\"}"
+    }
+
+    let names = st_list_names(base_dir)
+    let n = names.len()
+    mut dirs = "["
+    mut files = "["
+    mut dcount = 0
+    mut fcount = 0
+    mut i = 0
+    while i < n {
+        let name = names[i]
+        i = i + 1
+        if name == "." || name == ".." || byte_len(name) == 0 {
+            continue
+        }
+        // classify by the RAW name, because that is what the filesystem
+        // accepts; only the values that reach the browser are converted
+        let full = st_join(base_dir, name)
+        let shown_full = st_join(shown, st_from_ansi(name))
+        let item = "{\"name\":\"" + st_json_escape(st_from_ansi(name)) + "\",\"path\":\""
+                 + st_json_escape(shown_full) + "\"}"
+        if st_dir_exists(full) {
+            if dcount > 0 {
+                dirs = dirs + ","
+            }
+            dirs = dirs + item
+            dcount = dcount + 1
+        } else {
+            if fcount < 300 {
+                if fcount > 0 {
+                    files = files + ","
+                }
+                files = files + item
+                fcount = fcount + 1
+            }
+        }
+    }
+    dirs = dirs + "]"
+    files = files + "]"
+
+    return "{\"ok\":true" + head
+         + ",\"count\":" + int_to_str(dcount)
+         + ",\"dirs\":" + dirs
+         + ",\"files\":" + files + "}"
+}
+
+/// Every drive that actually exists, as a JSON array.
+///
+/// Twenty-six `path_exists` probes rather than a shell loop. `path_exists` is
+/// true for a drive root (measured: `D:/` is true), and it is one native call
+/// with no process launch, so the old `for %d in (A B C ...) do @if exist %d:\`
+/// line and its quoting are gone.
+pub fn st_roots_json() -> Str {
+    if !st_is_windows() {
+        return "[\"/\"]"
+    }
+    mut arr = "["
+    mut count = 0
+    let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    let n = byte_len(letters)
+    mut i = 0
+    while i < n {
+        let root = str_substring(letters, i, 1) + ":/"
+        i = i + 1
+        mut present = false
+        unsafe(justification: "the folder dialog must offer the drives that exist") {
+            present = path_exists(root)
+        }
+        if present {
+            if count > 0 {
+                arr = arr + ","
+            }
+            arr = arr + "\"" + root + "\""
+            count = count + 1
+        }
+    }
+    arr = arr + "]"
+    return arr
+}
+
+// ------------------------------------------------------------------ mutation
+//
+// Three operations have no builtin in forgen 1.4.0, so they go through the
+// shell - and each one then confirms its result by looking at the filesystem,
+// because the shell's success message is translated and the translation is not
+// ours to guess.
+
+/// Create a directory, parents included.
+///
+/// `path` comes from the browser, so it is UTF-8 and goes through
+/// `st_fs_create_path` before anything touches the filesystem. `shown` is the
+/// same path in the form the browser understands, and it is what every reply
+/// echoes: the raw spelling is an implementation detail of this module and the
+/// interface must never see it.
+pub fn st_mkdir( path: Str) -> Str {
+    let shown = st_norm_path(path)
+    if byte_len(shown) == 0 || shown == "." {
+        return "{\"ok\":false,\"error\":\"empty path\"}"
+    }
+    let target = st_fs_create_path(shown)
+    if byte_len(target) == 0 {
+        return "{\"ok\":false,\"path\":\"" + st_json_escape(shown) + "\""
+             + ",\"error\":\"cannot create that folder\""
+             + ",\"detail\":\"" + st_json_escape(st_no_bytes_msg()) + "\"}"
+    }
+    return st_mkdir_do(target, shown)
+}
+
+/// The body of `st_mkdir`, for callers that already hold a filesystem path.
+///
+/// `st_move` and `st_new_file` resolve their destination once and pass the raw
+/// form down, so this takes both spellings rather than converting twice.
+fn st_mkdir_do( target: Str, shown: Str) -> Str {
+    if st_dir_exists(target) {
+        return "{\"ok\":true,\"path\":\"" + st_json_escape(shown) + "\"}"
+    }
+
+    mut res = ""
+    if st_is_windows() {
+        res = st_sh("(mkdir \"" + st_back_path(target) + "\") 2>&1")
+    } else {
+        res = st_sh("(mkdir -p \"" + target + "\") 2>&1")
+    }
+
+    if st_dir_exists(target) {
+        return "{\"ok\":true,\"path\":\"" + st_json_escape(shown) + "\"}"
+    }
+    return "{\"ok\":false,\"path\":\"" + st_json_escape(shown) + "\""
+         + ",\"error\":\"could not create the folder\""
+         + ",\"detail\":\"" + st_json_escape(st_from_oem(str_trim(res))) + "\"}"
+}
+
+/// Move or rename a file or a folder.
+///
+/// The destination's folder is created first when it is missing, so dragging a
+/// file into a folder that does not exist yet does the obvious thing instead of
+/// failing with a shell message.
+///
+/// The parameters are not called `from` and `to`: `from` is a reserved word and
+/// using it is a parse error, not a warning.
+pub fn st_move( src_path: Str, dst_path: Str) -> Str {
+    // both arrive from the browser in UTF-8; `shown` is what the reply echoes,
+    // the resolved pair is what the filesystem and the shell are given
+    let a_shown = st_norm_path(src_path)
+    let b_shown = st_norm_path(dst_path)
+    if byte_len(a_shown) == 0 || byte_len(b_shown) == 0 {
+        return "{\"ok\":false,\"error\":\"empty path\"}"
+    }
+    if a_shown == b_shown {
+        return "{\"ok\":true,\"path\":\"" + st_json_escape(b_shown) + "\",\"moved\":false}"
+    }
+
+    let a = st_fs_path(a_shown)
+    let b = st_fs_create_path(b_shown)
+    if byte_len(a) == 0 || byte_len(b) == 0 {
+        return "{\"ok\":false,\"from\":\"" + st_json_escape(a_shown) + "\""
+             + ",\"to\":\"" + st_json_escape(b_shown) + "\""
+             + ",\"error\":\"cannot move to that name\""
+             + ",\"detail\":\"" + st_json_escape(st_no_bytes_msg()) + "\"}"
+    }
+    if !st_file_exists(a) && !st_dir_exists(a) {
+        return "{\"ok\":false,\"from\":\"" + st_json_escape(a_shown) + "\""
+             + ",\"error\":\"nothing to move there\"}"
+    }
+    if st_file_exists(b) || st_dir_exists(b) {
+        return "{\"ok\":false,\"to\":\"" + st_json_escape(b_shown) + "\""
+             + ",\"error\":\"something is already there\"}"
+    }
+
+    let parent = st_parent_of(b)
+    if byte_len(parent) > 0 && parent != "." && !st_dir_exists(parent) {
+        let made = st_mkdir_do(parent, st_from_ansi(parent))
+        if !st_has_infix(made, "\"ok\":true") {
+            return "{\"ok\":false,\"to\":\"" + st_json_escape(b_shown) + "\""
+                 + ",\"error\":\"could not create the destination folder\"}"
+        }
+    }
+
+    // `move` is one of the three commands that reject forward slashes
+    let res = st_sh("(move \"" + st_back_path(a) + "\" \"" + st_back_path(b) + "\") 2>&1")
+
+    // confirmed by looking, not by reading the shell's message
+    if st_file_exists(b) || st_dir_exists(b) {
+        return "{\"ok\":true,\"from\":\"" + st_json_escape(a_shown) + "\""
+             + ",\"path\":\"" + st_json_escape(b_shown) + "\",\"moved\":true}"
+    }
+    return "{\"ok\":false,\"from\":\"" + st_json_escape(a_shown) + "\""
+         + ",\"to\":\"" + st_json_escape(b_shown) + "\""
+         + ",\"error\":\"could not move it\""
+         + ",\"detail\":\"" + st_json_escape(st_from_oem(str_trim(res))) + "\"}"
+}
+
+/// Create a file, making its folder first when that folder does not exist.
+///
+/// `file_write` cannot create a directory, so typing `tools/check.dtr` used to
+/// fail with no explanation when `tools` was absent. Making the parents here
+/// means the name the user typed is the name they get.
+pub fn st_new_file( path: Str, content: Str) -> Str {
+    let shown = st_norm_path(path)
+    if byte_len(shown) == 0 || shown == "." {
+        return "{\"ok\":false,\"error\":\"empty path\"}"
+    }
+    let target = st_fs_create_path(shown)
+    if byte_len(target) == 0 {
+        return "{\"ok\":false,\"path\":\"" + st_json_escape(shown) + "\""
+             + ",\"error\":\"cannot create that file\""
+             + ",\"detail\":\"" + st_json_escape(st_no_bytes_msg()) + "\"}"
+    }
+
+    let parent = st_parent_of(target)
+    if byte_len(parent) > 0 && parent != "." && !st_dir_exists(parent) {
+        let made = st_mkdir_do(parent, st_from_ansi(parent))
+        if !st_has_infix(made, "\"ok\":true") {
+            return "{\"ok\":false,\"path\":\"" + st_json_escape(shown) + "\""
+                 + ",\"error\":\"could not create the folder "
+                 + st_json_escape(st_from_ansi(parent)) + "\"}"
+        }
+    }
+
+    unsafe(justification: "the explorer must create the file the user asked for") {
+        file_write(target, content)
+    }
+
+    if st_file_exists(target) {
+        return "{\"ok\":true,\"path\":\"" + st_json_escape(shown) + "\""
+             + ",\"bytes\":" + int_to_str(byte_len(content)) + "}"
+    }
+    return "{\"ok\":false,\"path\":\"" + st_json_escape(shown) + "\""
+         + ",\"error\":\"could not create the file\"}"
+}
+
+// ------------------------------------------------------------------- search
+
+/// Extensions worth searching, as findstr masks.
+///
+/// A fixed list rather than "everything": a content search over a workspace that
+/// includes `node_modules` or a `target` directory spends all its time in files
+/// nobody wrote.
+fn st_search_masks() -> Str {
+    return "\"*.dtr\" \"*.md\" \"*.toml\" \"*.txt\" \"*.json\" \"*.js\" \"*.mjs\""
+         + " \"*.ts\" \"*.rs\" \"*.py\" \"*.sh\" \"*.html\" \"*.css\" \"*.c\" \"*.h\""
+         + " \"*.cpp\" \"*.hpp\" \"*.yml\" \"*.yaml\" \"*.gitignore\""
+}
+
+/// Content search across the workspace.
+///
+/// `findstr /s /n /i /c:"query"` prints `path:line:text` and is fast enough to
+/// run on every Enter in the search box. The query is rejected if it contains a
+/// quote, because that would end the `/c:` argument and turn a search into
+/// whatever the rest of the string happened to be.
+pub fn st_find( root: Str, query: Str) -> Str {
+    let q = str_trim(query)
+    if byte_len(q) == 0 {
+        return "{\"ok\":false,\"error\":\"empty query\"}"
+    }
+    if st_has_infix(q, "\"") {
+        return "{\"ok\":false,\"error\":\"quotes are not allowed in a search\"}"
+    }
+    let shown = st_norm_path(root)
+    let base_dir = st_fs_path(shown)
+    if byte_len(base_dir) == 0 || !st_dir_exists(base_dir) {
+        return "{\"ok\":false,\"root\":\"" + st_json_escape(shown) + "\""
+             + ",\"hits\":[],\"count\":0"
+             + ",\"error\":\"search failed\""
+             + ",\"detail\":\"not a folder\"}"
+    }
+
+    mut listing = ""
+    if st_is_windows() {
+        listing = st_sh("(cd /d \"" + st_back_path(base_dir) + "\" && echo " + st_ok_mark()
+                        + " && cd && findstr /s /n /i /c:\"" + q + "\" " + st_search_masks()
+                        + ") 2>&1")
+    } else {
+        listing = st_sh("(cd \"" + base_dir + "\" && echo " + st_ok_mark()
+                        + " && pwd && grep -rn -i --include=\"*.dtr\" --include=\"*.md\""
+                        + " --include=\"*.toml\" --include=\"*.txt\" --include=\"*.js\""
+                        + " --include=\"*.rs\" --include=\"*.py\" -e \"" + q + "\" .) 2>&1")
+    }
+
+    if !st_has_infix(listing, st_ok_mark()) {
+        return "{\"ok\":false,\"root\":\"" + st_json_escape(shown) + "\""
+             + ",\"hits\":[],\"count\":0"
+             + ",\"error\":\"search failed\""
+             + ",\"detail\":\"" + st_json_escape(st_from_oem(st_first_line_of(listing))) + "\"}"
+    }
+
+    // line 0 after the marker is the resolved root, echoed by `cd` / `pwd`, so
+    // the hits come back absolute whatever the caller passed in
+    let all = st_lines_after_marker(listing)
+    let resolved = all[0]
+
+    mut arr = "["
+    mut kept = 0
+    let n = all.len()
+    mut i = 1
+    while i < n && kept < 400 {
+        let raw = all[i]
+        i = i + 1
+        let parts = str_split(raw, ":")
+        // windows: path:line:text   unix grep -rn: ./path:line:text
+        if parts.len() < 2 {
+            continue
+        }
+        let file = parts[0]
+        let num = parts[1]
+        if byte_len(file) == 0 || byte_len(num) == 0 || !st_is_number(num) {
+            continue
+        }
+        let text = st_after_n_colons(raw, 2)
+        let full = st_abs(st_slash(file), resolved)
+        if kept > 0 {
+            arr = arr + ","
+        }
+        arr = arr + "{\"file\":\"" + st_json_escape(st_from_oem(full)) + "\""
+                 + ",\"line\":" + num
+                 + ",\"text\":\"" + st_json_escape(st_from_oem(st_strip_ansi(str_trim(text)))) + "\"}"
+        kept = kept + 1
+    }
+    arr = arr + "]"
+    return "{\"ok\":true,\"root\":\"" + st_json_escape(st_from_oem(resolved)) + "\""
+         + ",\"query\":\"" + st_json_escape(q) + "\""
+         + ",\"count\":" + int_to_str(kept) + ",\"hits\":" + arr + "}"
+}
+
+/// True when every byte of `s` is a digit and it is not empty.
+fn st_is_number( s: Str) -> Bool {
+    if byte_len(s) == 0 {
+        return false
+    }
+    let n = byte_len(s)
+    mut i = 0
+    while i < n {
+        let c = str_substring(s, i, 1)
+        if !st_has_infix("0123456789", c) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// Everything after the `skip`-th colon.
+///
+/// `str_split` cannot be used for the text, because the matched line usually
+/// contains colons of its own and splitting then rejoining would collapse runs
+/// of them.
+fn st_after_n_colons( s: Str, skip: Int) -> Str {
+    let n = byte_len(s)
+    mut seen = 0
+    mut i = 0
+    while i < n && seen < skip {
+        if str_substring(s, i, 1) == ":" {
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    if i >= n {
+        return ""
+    }
+    return str_substring(s, i, n - i)
+}
+
+// ---------------------------------------------------------------- shell text
+
+/// Make a listed path absolute.
+///
+/// Windows `dir /s` already prints absolute paths; `findstr /s` prints paths
+/// relative to the folder we entered, so the folder has to go back in front.
+/// This lives here rather than in `api.dtr` because path arithmetic belongs in
+/// one module - and `api` already depends on `explorer`, so the reverse would
+/// have been a cycle.
+pub fn st_abs( p: Str, root: Str) -> Str {
+    let s = st_slash(p)
+    if st_has_prefix(s, "/") {
+        return s
+    }
+    if byte_len(s) > 1 && str_substring(s, 1, 1) == ":" {
+        return s
+    }
+    mut rel = s
+    if st_has_prefix(rel, "./") {
+        rel = str_substring(rel, 2, byte_len(rel) - 2)
+    }
+    return st_join(root, rel)
+}
+
+/// Lines that follow the success marker, trimmed, empties dropped.
+///
+/// The marker is what makes a shell call's outcome readable without reading its
+/// error text, and everything after it is the payload.
+pub fn st_lines_after_marker( raw: Str) -> List<Str> {
+    let lines = str_split(raw, "\n")
+    mut kept: List<Str> = []
+    let n = lines.len()
+    mut i = 0
+    mut seen = false
+    while i < n {
+        let t = str_trim(lines[i])
+        i = i + 1
+        if !seen {
+            if st_has_infix(t, st_ok_mark()) {
+                seen = true
+            }
+            continue
+        }
+        if byte_len(t) > 0 {
+            kept = kept.push(t)
+        }
+    }
+    return kept
+}
+
+/// The first non-empty line of a failed command, for the error message.
+pub fn st_first_line_of( s: Str) -> Str {
+    let lines = str_split(s, "\n")
+    let n = lines.len()
+    mut i = 0
+    while i < n {
+        let t = str_trim(lines[i])
+        i = i + 1
+        if byte_len(t) > 0 && !st_has_infix(t, st_ok_mark()) {
+            return t
+        }
+    }
+    return ""
+}
+
+/// The directory holding the `datara.toml` that governs `path`, or `""`.
+///
+/// A project-wide check has to be aimed at the project. Measured on 1.4.0:
+/// `forgen check` on a directory that contains two sibling projects merges them
+/// into one namespace and reports `E-RESOLVE-002: Duplicate function definition`
+/// for every name they share - two files called `helper`, two `main` - so a
+/// folder that is not itself a project cannot be checked.
+///
+/// Walks up from `path` (or from its directory when `path` is a file) and stops
+/// at the first `datara.toml`. `within` bounds the search: when it is not empty
+/// the walk never goes above it, so a check aimed at a workspace root can never
+/// escape into an unrelated project that happens to sit above it. That is not
+/// hypothetical - it is what happened while the studio lived at
+/// `D:/ryan/IDE datara`, where walking up landed on `D:/ryan` and its forgen_ai
+/// `datara.toml`. The studio has since moved to `D:/IDE datara`, which has no
+/// project file above it, so the bound is no longer load-bearing here - but it
+/// is kept, because the studio is installed wherever a person puts it and the
+/// bound is what makes the answer independent of that. The loop is bounded as
+/// well as root-terminated, because a path cycle would otherwise spin the server.
+pub fn st_project_root( path: Str, within: Str) -> Str {
+    // the walk is done in the filesystem's own spelling and converted once at
+    // the end, because the answer is shown to a person
+    let limit = st_fs_path(st_norm_path(within))
+    mut dir = st_fs_path(st_norm_path(path))
+    if byte_len(dir) == 0 {
+        return ""
+    }
+    if !st_dir_exists(dir) {
+        dir = st_parent_of(dir)
+    }
+    let bounded = byte_len(str_trim(within)) > 0 && byte_len(limit) > 0
+    mut guard = 0
+    while guard < 64 {
+        if st_file_exists(st_join(dir, "datara.toml")) {
+            return st_from_ansi(dir)
+        }
+        let up = st_parent_of(dir)
+        if up == dir {
+            return ""
+        }
+        if bounded && dir == limit {
+            return ""
+        }
+        dir = up
+        guard = guard + 1
+    }
+    return ""
+}

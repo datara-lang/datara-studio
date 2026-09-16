@@ -1,0 +1,28 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Window controls for the custom title bar. The studio page is served over loopback by the Datara server, and Tauri treats every origin that is not its own as REMOTE - so those origins have to be listed here or each invoke is refused with 'not allowed on origin'. Without this file the title bar draws and its buttons do nothing, which is the one failure mode that looks like the buttons are broken rather than the permission missing.",
+  "windows": ["main"],
+  "local": true,
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:7878/*",
+      "http://127.0.0.1:7879/*",
+      "http://127.0.0.1:7880/*",
+      "http://127.0.0.1:7881/*",
+      "http://localhost:7878/*",
+      "http://localhost:7879/*",
+      "http://localhost:7880/*",
+      "http://localhost:7881/*"
+    ]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-is-maximized",
+    "core:window:allow-start-dragging"
+  ]
+}

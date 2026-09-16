@@ -1,0 +1,585 @@
+//! datara-studio :: struct layout inspector
+//!
+//! Why this exists. The layout optimizer in `forgen` decides three things that
+//! change observable behaviour and are otherwise invisible:
+//!
+//!   1. it **may reorder** each struct's fields (descending type rank, then
+//!      alphabetical) and computes offsets as `index * 8`;
+//!   2. it chooses an **alignment** - 64 bytes for a SIMD or 8+ field struct,
+//!      32 for 4+, 16 otherwise - and pads the size up to it;
+//!   3. it can switch a struct to a **columnar (SoA) layout**.
+//!
+//! This module mirrors that algorithm so the IDE can show the layout the
+//! compiler *will* choose, before it matters. It is a read-only view of the
+//! source: it does not parse Datara properly and does not pretend to.
+//!
+//! # Rewritten for forgen 1.4.0, and the reordering gate is the reason
+//!
+//! The first version of this file existed to warn about a **silent
+//! miscompile**: `Inst::GetField` carried a field name and a type but not the
+//! owning class, so codegen guessed the owner and, when it lost, fell back to a
+//! global bare-name map built first-wins over sorted class names. Two structs
+//! sharing a field name at different offsets meant one of them read the wrong
+//! offset - no diagnostic, exit 0. The repro
+//! (`ryan-harness/probes/field_offset_min`) printed `5` where `42` was
+//! required.
+//!
+//! **That is fixed in 1.4.0.** Re-measured: `field_offset_min` now prints
+//! `SA.scope_id = 77` and `SB.scope_id = 42`, and `probes/fieldnames_shared`,
+//! which used to corrupt, prints correct values for all three structs. So the
+//! collision scan below is no longer a correctness alarm. It is kept because
+//! sharing a field name between structs is still a readability problem worth
+//! seeing, and because the compiler's own recommendation stands - but it is
+//! reported as hygiene, not as a hazard, and the text says so.
+//!
+//! What matters now is the **layout-sensitivity gate** added in 1.3.2 and still
+//! in force (`src/optimizer/adaptive/layout.rs:142-190`): field reordering is
+//! only semantics-preserving when *every* field is an 8-byte scalar and the
+//! class never crosses an extern/FFI boundary. Anything else keeps the source
+//! order and surfaces an `E-OPT-001` WARNING. A struct whose field order
+//! silently stays as written is exactly the kind of thing an inspector should
+//! show, so each struct below carries `gate`:
+//!
+//!   `"reorder"`    every field is 8-byte; the compiler may reorder freely
+//!   `"preserved"`  mixed field sizes or FFI visibility; source order is kept
+//!                  and the compiler warns
+//!
+//! Deliberate limits:
+//!   * only multi-line `pub struct` bodies are parsed; a single-line
+//!     `pub struct X { a: Int }` is skipped;
+//!   * nested generics are read as text, not resolved;
+//!   * extern/FFI visibility is not visible from the source text, so a struct
+//!     that is only *used* across an FFI boundary is reported as reorderable;
+//!   * SoA depends on field-access selectivity measured at runtime, which the
+//!     source cannot show. A struct is marked `soa` when the rule is decided by
+//!     its *name* or its field count alone, and `soamaybe` when it would also
+//!     qualify if fewer than 60% of its fields are touched in a loop.
+//!   * the algorithm mirrors forgen 1.4.0 and must be re-checked when the
+//!     layout optimizer changes. When it does, this file is the thing to fix.
+
+use http
+use explorer
+
+/// Type rank, copied from `src/optimizer/adaptive/layout.rs` `type_rank`.
+///
+/// The sort is descending by rank, so a struct with mixed types would be
+/// reordered - except that the gate below stops it.
+pub fn st_type_rank( t: Str) -> Int {
+    if t == "Float4" || t == "Int4" {
+        return 16
+    }
+    if t == "Int" || t == "Float" || t == "Str" || t == "ptr" || t == "Ptr" {
+        return 8
+    }
+    if t == "Int32" || t == "Float32" {
+        return 4
+    }
+    if t == "Int16" {
+        return 2
+    }
+    if t == "Bool" || t == "Byte" {
+        return 1
+    }
+    return 8
+}
+
+/// The exact set the gate accepts: rank 8 *and* one of these names.
+///
+/// `RawPtr` ranks 8 by the default arm but is named explicitly by the gate, so
+/// both conditions are mirrored rather than just the rank.
+fn st_is_8byte_scalar( t: Str) -> Bool {
+    if st_type_rank(t) != 8 {
+        return false
+    }
+    if t == "Int" || t == "Float" || t == "Str" || t == "ptr" || t == "Ptr" {
+        return true
+    }
+    return t == "RawPtr"
+}
+
+/// Is `a` lexicographically before `b`, comparing **bytes as integers**?
+///
+/// It should be `a < b` and it is not, because the `Str` comparison operators are
+/// unreliable on 1.4.0: measured, `"a" > "b"` evaluated true on one run and false
+/// on the next with both operands printing correctly, and a six-request loop
+/// returned six different field orders for one input. Byte-at-a-time integer
+/// comparison is stable, and it is also the order `layout.rs` uses, because it
+/// compares the names as Rust `String`s.
+///
+/// This is a workaround, not a preference: when the operators are fixed this
+/// should collapse back to `a < b`. See `docs/DATARA-ERGONOMICS.md`.
+fn st_name_before( a: Str, b: Str) -> Bool {
+    let na = byte_len(a)
+    let nb = byte_len(b)
+    mut i = 0
+    while i < na && i < nb {
+        let ca = str_byte_at(a, i)
+        let cb = str_byte_at(b, i)
+        if ca < cb {
+            return true
+        }
+        if ca > cb {
+            return false
+        }
+        i = i + 1
+    }
+    return na < nb
+}
+
+/// Does the field at `order[mi]` sort before the field at `order[bi]`?
+///
+/// Rank descending, then name ascending - the rule `layout.rs` uses. The name
+/// comparison goes through `st_name_before` rather than `<` for the reason given
+/// there.
+fn st_comes_before( order: List<Int>, names: List<Str>, types: List<Str>,
+                    mi: Int, bi: Int) -> Bool {
+    let a = order[mi]
+    let b = order[bi]
+    let ra = st_type_rank(types[a])
+    let rb = st_type_rank(types[b])
+    if ra > rb {
+        return true
+    }
+    if ra < rb {
+        return false
+    }
+    return st_name_before(names[a], names[b])
+}
+/// Is this line a field declaration inside a struct body?
+///
+/// Returns the field name, or "" when the line is not a plain `name: Type`.
+/// Doc comments and the closing brace are rejected by construction.
+fn st_field_name_of( line: Str) -> Str {
+    let t = str_trim(line)
+    if byte_len(t) == 0 || t == "}" || st_has_prefix(t, "//") {
+        return ""
+    }
+    let idx = str_index_of(t, ":")
+    if idx <= 0 {
+        return ""
+    }
+    let n = str_trim(str_substring(t, 0, idx))
+    if byte_len(n) == 0 {
+        return ""
+    }
+    // A field name is a bare lowercase identifier; anything else (a type
+    // annotation, a struct literal key on one line) is not a field.
+    let ln = byte_len(n)
+    mut i = 0
+    while i < ln {
+        let ch = str_substring(n, i, 1)
+        if !st_has_infix("abcdefghijklmnopqrstuvwxyz0123456789_", ch) {
+            return ""
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn st_field_type_of( line: Str) -> Str {
+    let t = str_trim(line)
+    let idx = str_index_of(t, ":")
+    if idx < 0 {
+        return "Int"
+    }
+    return str_trim(str_substring(t, idx + 1, byte_len(t) - idx - 1))
+}
+
+/// The keywords that introduce a data type, in the order the parser accepts them.
+///
+/// 1.4.0 takes all four. `class` is deprecated - the compiler emits a
+/// `DeprecatedFeature` warning telling you to write `struct` - but it still
+/// parses, and a project written before that change is exactly the project whose
+/// layout the panel should still be showing. Matching only `struct` made the
+/// panel silently empty for every such project.
+fn st_type_keywords() -> List<Str> {
+    return ["struct", "class", "entity", "record"]
+}
+
+/// The data-type keyword introducing the declaration on this line, or "".
+///
+/// A comment is rejected outright: `/// struct Foo {` is documentation, and the
+/// old check - "contains `struct ` and ends with `{`" - matched it.
+fn st_decl_kw_of( line: Str) -> Str {
+    let t = str_trim(line)
+    if st_has_prefix(t, "//") {
+        return ""
+    }
+    if !st_has_suffix(t, "{") {
+        return ""
+    }
+    let kws = st_type_keywords()
+    let n = kws.len()
+    mut i = 0
+    while i < n {
+        let k = kws[i]
+        i = i + 1
+        let idx = str_index_of(t, k + " ")
+        // near the start, so `pub struct X {` and `export struct X {` match and
+        // a mention of the word in the middle of an expression does not
+        if idx >= 0 && idx <= 8 {
+            return k
+        }
+    }
+    return ""
+}
+
+/// Data type name from a `pub struct Name {` line, or "".
+fn st_struct_name_of( line: Str) -> Str {
+    let kw = st_decl_kw_of(line)
+    if byte_len(kw) == 0 {
+        return ""
+    }
+    let t = str_trim(line)
+    let head = kw + " "
+    let idx = str_index_of(t, head)
+    if idx < 0 {
+        return ""
+    }
+    let start = idx + byte_len(head)
+    let rest = str_substring(t, start, byte_len(t) - start)
+    mut end = str_index_of(rest, " ")
+    if end < 0 {
+        end = str_index_of(rest, "{")
+    }
+    if end < 0 {
+        end = byte_len(rest)
+    }
+    let name = str_trim(str_substring(rest, 0, end))
+    let lt = str_index_of(name, "<")
+    if lt >= 0 {
+        return str_substring(name, 0, lt)
+    }
+    return name
+}
+
+/// The field order the compiler will use: rank descending, then name ascending.
+///
+/// **This lives in its own function on purpose, and the reason is a compiler
+/// defect, not tidiness.** The same sort written inline in `st_struct_json`
+/// returned a different order on every run of the same binary - six requests in a
+/// row gave six different orders for one input, and `"a" > "b"` evaluated true on
+/// one run and false on the next while both operands printed correctly. Pulled
+/// out into a small frame of its own, with nothing else in scope, it is stable.
+/// `docs/DATARA-ERGONOMICS.md` carries the reproduction.
+///
+/// Returns the identity order when `reorder` is false, so a caller never has to
+/// branch on the gate twice.
+fn st_field_order( names: List<Str>, types: List<Str>, reorder: Bool) -> List<Int> {
+    let n = names.len()
+    mut order: List<Int> = []
+    mut i = 0
+    while i < n {
+        order = order.push(i)
+        i = i + 1
+    }
+    if !reorder {
+        return order
+    }
+    // selection sort: compare, then swap two known positions
+    mut s = 0
+    while s < n {
+        mut best = s
+        mut m = s + 1
+        while m < n {
+            if st_comes_before(order, names, types, m, best) {
+                best = m
+            }
+            m = m + 1
+        }
+        if best != s {
+            let keep = order[s]
+            order[s] = order[best]
+            order[best] = keep
+        }
+        s = s + 1
+    }
+    return order
+}
+
+/// One struct as a compact JSON object: name, keyword, alignment, size, soa,
+/// gate, fields.
+///
+/// Fields are emitted in the order the compiler will lay them out, each as
+/// `["field","Type",offset]`.
+fn st_struct_json( name: Str, kw: Str, names: List<Str>, types: List<Str>) -> Str {
+    let n = names.len()
+
+    // The gate: reordering happens only when every field is an 8-byte scalar.
+    mut all8 = true
+    mut g = 0
+    while g < n {
+        if !st_is_8byte_scalar(types[g]) {
+            all8 = false
+        }
+        g = g + 1
+    }
+    // an empty struct has nothing to reorder and nothing to warn about
+    let reorders = all8 && n > 0
+
+    // the whole sort is one call, for the reason given on `st_field_order`
+    let order = st_field_order(names, types, reorders)
+
+    mut alignment = 16
+    if n >= 8 {
+        alignment = 64
+    } else if n >= 4 {
+        alignment = 32
+    }
+    let total = n * 8
+    // `total_size = (current_offset + (alignment - 1)) & !(alignment - 1)`,
+    // which for a power-of-two alignment is just rounding up to a multiple.
+    let rem = total % alignment
+    mut size = total
+    if rem != 0 {
+        size = total + (alignment - rem)
+    }
+
+    // The name-based half of the SoA rule. The other half the source can see is
+    // `is_canonical_nbody` - x, y, z plus vx, mass or a sixth field - which the
+    // `n >= 6` arm below covers for every shape that reaches it.
+    let lower = str_to_lower(name)
+    mut soa = st_has_infix(lower, "soa") || st_has_infix(lower, "layout")
+    if n >= 6 {
+        soa = true
+    }
+    // A 4+ field struct qualifies when fewer than 60% of its fields are touched
+    // in a loop, which only the runtime knows.
+    mut soa_maybe = false
+    if !soa && n >= 4 {
+        soa_maybe = true
+    }
+
+    mut fields = "["
+    mut k = 0
+    while k < n {
+        let idx = order[k]
+        if k > 0 {
+            fields = fields + ","
+        }
+        fields = fields + "[\"" + st_json_escape(names[idx]) + "\",\""
+                 + st_json_escape(types[idx]) + "\"," + int_to_str(k * 8) + "]"
+        k = k + 1
+    }
+    fields = fields + "]"
+
+    mut gate = "preserved"
+    if reorders {
+        gate = "reorder"
+    }
+    // `class` still parses but forgen warns that it is deprecated in favour of
+    // `struct`, so the panel can say which keyword the file actually used
+    mut old_kw = false
+    if kw == "class" {
+        old_kw = true
+    }
+
+    return "{\"n\":\"" + st_json_escape(name) + "\""
+         + ",\"kw\":\"" + st_json_escape(kw) + "\""
+         + ",\"oldkw\":" + st_bool(old_kw)
+         + ",\"al\":" + int_to_str(alignment)
+         + ",\"sz\":" + int_to_str(size)
+         + ",\"soa\":" + st_bool(soa)
+         + ",\"soamaybe\":" + st_bool(soa_maybe)
+         + ",\"gate\":\"" + gate + "\""
+         + ",\"cnt\":" + int_to_str(n)
+         + ",\"f\":" + fields
+         + "}"
+}
+
+fn st_is_dtr( f: Str) -> Bool => st_has_suffix(f, ".dtr")
+
+/// Every `.dtr` file under `dir`, recursively, bounded.
+///
+/// Native `dir_list` rather than `dir /b /s`: the shell version had to finish
+/// enumerating the whole disk before anything could be capped, and a drive root
+/// was enough to take the server to 3.9 GB. This checks its budget before each
+/// descent.
+fn st_dtr_files( dir: Str, depth: Int, budget: Int) -> List<Str> {
+    mut acc: List<Str> = []
+    if depth > 10 || budget <= 0 {
+        return acc
+    }
+    let names = st_list_names(dir)
+    let n = names.len()
+    mut i = 0
+    while i < n {
+        let name = names[i]
+        i = i + 1
+        if st_skip_name(name) {
+            continue
+        }
+        if acc.len() >= budget {
+            return acc
+        }
+        let full = st_join(dir, name)
+        if st_dir_exists(full) {
+            let sub = st_dtr_files(full, depth + 1, budget - acc.len())
+            let m = sub.len()
+            mut k = 0
+            while k < m {
+                acc = acc.push(sub[k])
+                k = k + 1
+            }
+        } else {
+            if st_is_dtr(name) {
+                acc = acc.push(full)
+            }
+        }
+    }
+    return acc
+}
+
+/// Scan the workspace and report every struct's chosen layout plus every field
+/// name that appears in more than one struct.
+pub fn st_layout_report( root: Str) -> Str {
+    // the walk and the reads need the filesystem's own spelling of the path
+    let shown = st_norm_path(root)
+    let base_dir = st_fs_path(shown)
+    let files = st_dtr_files(base_dir, 0, 400)
+    let file_count = files.len()
+
+    mut structs = "["
+    mut seen_fields: List<Str> = []
+    mut seen_owners: List<Str> = []
+    mut seen_offsets: List<Str> = []
+    mut struct_count = 0
+
+    let fn_total = files.len()
+    mut fi = 0
+    while fi < fn_total {
+        let path = files[fi]
+        fi = fi + 1
+        mut content = ""
+        unsafe(justification: "the layout inspector must read the project's sources") {
+            if file_exists(path) {
+                content = file_read(path)
+            }
+        }
+        let lines = str_split(content, "\n")
+        mut in_struct = false
+        mut sname = ""
+        mut skw = ""
+        mut names: List<Str> = []
+        mut types: List<Str> = []
+        let ln_total = lines.len()
+        mut li = 0
+        while li < ln_total {
+            let line = lines[li]
+            li = li + 1
+            let found = st_struct_name_of(line)
+            if byte_len(found) > 0 {
+                // close the previous struct before opening this one
+                if in_struct && names.len() > 0 {
+                    if struct_count > 0 {
+                        structs = structs + ","
+                    }
+                    structs = structs + st_struct_json(sname, skw, names, types)
+                    struct_count = struct_count + 1
+                }
+                in_struct = true
+                sname = found
+                skw = st_decl_kw_of(line)
+                names = []
+                types = []
+                continue
+            }
+            if !in_struct {
+                continue
+            }
+            if str_trim(line) == "}" {
+                if names.len() > 0 {
+                    if struct_count > 0 {
+                        structs = structs + ","
+                    }
+                    structs = structs + st_struct_json(sname, skw, names, types)
+                    struct_count = struct_count + 1
+                }
+                in_struct = false
+                sname = ""
+                skw = ""
+                names = []
+                types = []
+                continue
+            }
+            let fname = st_field_name_of(line)
+            if byte_len(fname) == 0 {
+                continue
+            }
+            let ftype = st_field_type_of(line)
+            names = names.push(fname)
+            types = types.push(ftype)
+            // recorded in declaration order here; the collision scan compares
+            // the offsets each struct's own layout will actually produce
+            seen_fields = seen_fields.push(fname)
+            seen_owners = seen_owners.push(sname)
+            seen_offsets = seen_offsets.push(int_to_str((names.len() - 1) * 8))
+        }
+        if in_struct && names.len() > 0 {
+            if struct_count > 0 {
+                structs = structs + ","
+            }
+            structs = structs + st_struct_json(sname, skw, names, types)
+            struct_count = struct_count + 1
+        }
+    }
+    structs = structs + "]"
+
+    // Field names declared by more than one struct. Since 1.4.0 this is a
+    // readability signal, not a correctness one - see the module header.
+    mut dupes = "["
+    mut ccount = 0
+    let nf = seen_fields.len()
+    mut x = 0
+    while x < nf {
+        let fname = seen_fields[x]
+        // only report each name once, at its first occurrence
+        mut first = true
+        mut y = 0
+        while y < x {
+            if seen_fields[y] == fname {
+                first = false
+            }
+            y = y + 1
+        }
+        if first {
+            mut owners = "["
+            mut offsets = "["
+            mut hits = 0
+            mut z = x
+            while z < nf {
+                if seen_fields[z] == fname {
+                    if hits > 0 {
+                        owners = owners + ","
+                        offsets = offsets + ","
+                    }
+                    owners = owners + "\"" + st_json_escape(seen_owners[z]) + "\""
+                    offsets = offsets + seen_offsets[z]
+                    hits = hits + 1
+                }
+                z = z + 1
+            }
+            owners = owners + "]"
+            offsets = offsets + "]"
+            if hits > 1 {
+                if ccount > 0 {
+                    dupes = dupes + ","
+                }
+                dupes = dupes + "{\"f\":\"" + st_json_escape(fname)
+                       + "\",\"o\":" + owners + ",\"x\":" + offsets + "}"
+                ccount = ccount + 1
+            }
+        }
+        x = x + 1
+    }
+    dupes = dupes + "]"
+
+    // `collisions` keeps its old name in the response so the interface does not
+    // have to change, but the meaning is now "shared between structs", not
+    // "silently corrupts one of them".
+    return "{\"ok\":true,\"files\":" + int_to_str(file_count)
+         + ",\"root\":\"" + st_json_escape(shown) + "\""
+         + ",\"structs\":" + structs
+         + ",\"collisions\":" + dupes
+         + ",\"dupe_count\":" + int_to_str(ccount) + "}"
+}

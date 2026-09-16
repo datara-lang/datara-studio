@@ -1,0 +1,284 @@
+//! datara-studio :: HTTP/1.1 over raw sockets
+//!
+//! Why this exists instead of `stdlib.http.server`: that server's
+//! `listen_once` binds, accepts exactly one connection, answers it and closes
+//! the listener. An IDE issues hundreds of requests, so the listener has to
+//! survive. This module keeps the socket loop and adds the little an IDE
+//! backend actually needs: the request line, the body read by `Content-Length`,
+//! and a response with a correct `Content-Length`.
+//!
+//! Deliberate limits, each one a thing that cannot be wrong:
+//!   * one request per connection (`Connection: close`), no keep-alive;
+//!   * no chunked transfer encoding;
+//!   * no TLS - this is a loopback tool.
+//!
+//! **Rewritten for forgen 1.4.0.** Three things this file used to carry are
+//! gone because the language grew past them, and each is worth naming:
+//!
+//!   * **`st_at` is deleted.** Every `List<Str>` element read used to go through
+//!     a helper, because indexing a local list returned a pointer in forgen
+//!     1.3.0. Direct indexing is correct now, and an index that is out of range
+//!     returns `""` and lets the program continue (measured: `str_split("abc",
+//!     "x")` then `parts[1]` prints an empty string, exit 0). A literal index
+//!     that cannot fit is a *compile* error, E0947. So the helper protected
+//!     nothing and `parts[0]` is both shorter and honest.
+//!   * **`str_starts_with` / `str_ends_with` / `str_contains` return `Bool`.**
+//!     They used to return `Int` and every call site compared with `== 1`. That
+//!     comparison is gone.
+//!   * **`break` and `continue` exist**, so a loop no longer has to carry its
+//!     exit condition in the `while` header.
+//!
+//! What is *not* gone is `st_strip_ansi`, and it cannot go: forgen still
+//! colourises its diagnostics when its output is a pipe, and `NO_COLOR=1` does
+//! not change that (both measured on 1.4.0). A raw ESC inside a JSON string
+//! makes the document invalid, so the escape sequences are removed before the
+//! text is escaped. See PORTING.md SEAM-8.
+
+/// True when `s` starts with `p`.
+pub fn st_has_prefix( s: Str, p: Str) -> Bool => str_starts_with(s, p)
+
+/// True when `s` ends with `p`.
+pub fn st_has_suffix( s: Str, p: Str) -> Bool => str_ends_with(s, p)
+
+/// True when `s` contains `p` anywhere.
+pub fn st_has_infix( s: Str, p: Str) -> Bool => str_contains(s, p)
+
+/// Keep only the digits of a string. Used to turn a header value into a number
+/// without trusting `str_to_int` on arbitrary text.
+pub fn st_digits_only( s: Str) -> Str {
+    mut r = ""
+    let n = byte_len(s)
+    mut i = 0
+    while i < n {
+        let ch = str_substring(s, i, 1)
+        if st_has_infix("0123456789", ch) {
+            r = r + ch
+        }
+        i = i + 1
+    }
+    return r
+}
+
+/// Byte length declared by `Content-Length`, or -1 when absent.
+pub fn st_content_length( raw: Str) -> Int {
+    let idx = str_index_of(raw, "Content-Length:")
+    if idx < 0 {
+        return -1
+    }
+    let rest = str_substring(raw, idx + 15, 32)
+    let parts = str_split(rest, "\r\n")
+    let digits = st_digits_only(parts[0])
+    if byte_len(digits) == 0 {
+        return -1
+    }
+    return str_to_int(digits)
+}
+
+/// Read until the headers and, when present, the whole body have arrived.
+///
+/// Terminates on: an empty read (peer closed), a complete request, or 64
+/// rounds. It cannot hang on a well-formed local request, because whenever the
+/// headers are incomplete more bytes really are on the way.
+pub fn st_read_request( fd: Int) -> Str {
+    mut raw = ""
+    mut rounds = 0
+    while rounds < 64 {
+        let chunk = socket_recv(fd, 65536)
+        if byte_len(chunk) == 0 {
+            break
+        }
+        raw = raw + chunk
+        rounds = rounds + 1
+        let hdr_end = str_index_of(raw, "\r\n\r\n")
+        if hdr_end >= 0 {
+            let want = st_content_length(raw)
+            let got = byte_len(raw) - hdr_end - 4
+            if want < 0 || got >= want {
+                break
+            }
+        }
+    }
+    return raw
+}
+
+pub fn st_request_line( raw: Str) -> Str {
+    let idx = str_index_of(raw, "\r\n")
+    if idx < 0 {
+        return raw
+    }
+    return str_substring(raw, 0, idx)
+}
+
+pub fn st_method_of( line: Str) -> Str {
+    let parts = str_split(str_trim(line), " ")
+    if parts.len() == 0 {
+        return ""
+    }
+    return parts[0]
+}
+
+/// Path without the query string.
+pub fn st_path_of( line: Str) -> Str {
+    let parts = str_split(str_trim(line), " ")
+    if parts.len() < 2 {
+        return ""
+    }
+    mut p = parts[1]
+    let q = str_index_of(p, "?")
+    if q >= 0 {
+        p = str_substring(p, 0, q)
+    }
+    return p
+}
+
+pub fn st_body_of( raw: Str) -> Str {
+    let idx = str_index_of(raw, "\r\n\r\n")
+    if idx < 0 {
+        return ""
+    }
+    return str_substring(raw, idx + 4, byte_len(raw) - idx - 4)
+}
+
+/// First line of a body.
+///
+/// Endpoints that need two arguments (`/api/write` takes a path and a file
+/// body, `/api/action` takes an action and a target) use "first line is the
+/// argument, the rest is the payload". That avoids JSON parsing on the server
+/// and works because no path or action name contains a newline.
+pub fn st_first_line( s: Str) -> Str {
+    let idx = str_index_of(s, "\n")
+    if idx < 0 {
+        return s
+    }
+    return str_substring(s, 0, idx)
+}
+
+pub fn st_rest_after_first_line( s: Str) -> Str {
+    let idx = str_index_of(s, "\n")
+    if idx < 0 {
+        return ""
+    }
+    return str_substring(s, idx + 1, byte_len(s) - idx - 1)
+}
+
+/// Two hex digits, for `\u00XX` escapes.
+fn st_hex2( v: Int) -> Str {
+    let digits = "0123456789abcdef"
+    let hi = v / 16
+    let lo = v % 16
+    return str_substring(digits, hi, 1) + str_substring(digits, lo, 1)
+}
+
+/// Any byte that JSON forbids raw: a control character or DEL.
+fn st_has_control( s: Str) -> Bool {
+    let n = byte_len(s)
+    mut i = 0
+    while i < n {
+        let b = str_byte_at(s, i)
+        if b < 32 || b == 127 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// Escape a string for embedding inside a JSON string literal.
+///
+/// The control-character branch is not defensive padding, it is a bug fix with a
+/// story. forgen colourises its diagnostics, so `forgen check` output contains
+/// `ESC [ 1 ; 3 1 m` - and a raw control character inside a JSON string makes the
+/// whole document invalid. The result was that `/api/check` returned *unparseable
+/// JSON exactly when the compiler reported an error*, which is the one moment the
+/// editor needed to read it. The red squiggles would never have appeared on a
+/// file with a real mistake in it.
+///
+/// The fast path matters: the tree response is a few hundred kilobytes and is
+/// almost entirely free of control characters, so the common case is one scan
+/// and no rebuilding.
+pub fn st_json_escape( s: Str) -> Str {
+    mut r = str_replace(s, "\\", "\\\\")
+    r = str_replace(r, "\"", "\\\"")
+    r = str_replace(r, "\n", "\\n")
+    r = str_replace(r, "\r", "\\r")
+    r = str_replace(r, "\t", "\\t")
+    if !st_has_control(r) {
+        return r
+    }
+    mut parts: List<Str> = []
+    let n = byte_len(r)
+    mut i = 0
+    while i < n {
+        let b = str_byte_at(r, i)
+        if b < 32 || b == 127 {
+            parts = parts.push("\\u00" + st_hex2(b))
+        } else {
+            parts = parts.push(str_substring(r, i, 1))
+        }
+        i = i + 1
+    }
+    return str_join(parts, "")
+}
+
+/// Remove ANSI escape sequences from compiler output.
+///
+/// The colours are meaningless once the text is in a browser, and they are worse
+/// than meaningless: ESC is a control character and would break the JSON even
+/// after escaping, because the browser would then render `\u001b[1;31m` as
+/// literal text in the output pane. Stripping is the honest answer - the
+/// interface has its own colours.
+///
+/// **Still required on 1.4.0, measured.** `forgen check` colourises into a pipe
+/// with no `isatty` test, and `NO_COLOR=1` does not suppress it. See SEAM-8 in
+/// PORTING.md - this function is the whole reason that seam still exists.
+pub fn st_strip_ansi( s: Str) -> Str {
+    mut parts: List<Str> = []
+    let n = byte_len(s)
+    mut i = 0
+    while i < n {
+        let b = str_byte_at(s, i)
+        if b != 27 {
+            parts = parts.push(str_substring(s, i, 1))
+            i = i + 1
+            continue
+        }
+        // ESC [ ... <final byte in 0x40..0x7E>
+        let j = i + 1
+        if j >= n || str_byte_at(s, j) != 91 {
+            i = i + 1
+            continue
+        }
+        mut k = j + 1
+        while k < n {
+            let c = str_byte_at(s, k)
+            k = k + 1
+            if c >= 64 && c <= 126 {
+                break
+            }
+        }
+        i = k
+    }
+    return str_join(parts, "")
+}
+
+/// Write a complete response and return the number of bytes sent.
+pub fn st_respond( fd: Int, status: Int, ctype: Str, body: Str) -> Int {
+    mut reason = "OK"
+    if status == 400 {
+        reason = "Bad Request"
+    }
+    if status == 404 {
+        reason = "Not Found"
+    }
+    if status == 500 {
+        reason = "Internal Server Error"
+    }
+    let head = "HTTP/1.1 " + int_to_str(status) + " " + reason + "\r\n"
+             + "Content-Type: " + ctype + "\r\n"
+             + "Content-Length: " + int_to_str(byte_len(body)) + "\r\n"
+             + "Cache-Control: no-store\r\n"
+             + "Access-Control-Allow-Origin: *\r\n"
+             + "Connection: close\r\n"
+             + "\r\n"
+    return socket_send(fd, head + body)
+}

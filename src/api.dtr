@@ -1,0 +1,662 @@
+//! datara-studio :: backend endpoints
+//!
+//! Datara Studio splits the work in two:
+//!
+//!   * this server (port 7878) owns the filesystem and the compiler. It is the
+//!     only thing that touches the user's project.
+//!   * the AI companion (`D:\ryan`, `ide_daemon.py`, port 7890) owns suggestion
+//!     and lint advice. The browser calls it directly; this server never
+//!     proxies it, so the AI can be absent without the IDE noticing anything
+//!     beyond a grey status dot.
+//!
+//! Every endpoint returns JSON. Requests are plain text bodies rather than
+//! JSON, deliberately: writing JSON is trivial, *parsing* it in Datara is not,
+//! and no endpoint here needs a structured request.
+//!
+//! **Rewritten for forgen 1.4.0.** Two seams that shaped this module are gone:
+//!
+//!   * **`status` is no longer inferred.** The first version read the compiler's
+//!     output and looked for the string `error[` to decide whether the build
+//!     passed, and said so in the response as `status_source: "inferred"`. That
+//!     was honest, and it was a workaround: forgen gave no way to get a child's
+//!     exit code together with its output (`system` returned the code and threw
+//!     the output away, `exec` did the reverse). 1.4.0 keeps that split, but
+//!     `system` now returns the real code, so the output is redirected to a file
+//!     and read back. One process launch, both answers, no string matching. The
+//!     response carries `exit` and the interface shows it.
+//!   * **The tree walk is gone from here.** `st_tree` moved to `explorer.dtr`,
+//!     where the filesystem lives, and it no longer shells out at all.
+//!
+//! What is left that *is* a workaround is `st_strip_ansi`, and it has to stay:
+//! forgen colourises its diagnostics even into a pipe and ignores `NO_COLOR`
+//! (measured on 1.4.0). See SEAM-8.
+
+use http
+use explorer
+
+/// `tc` is the toolchain line read once at boot, not per request.
+///
+/// It used to be read here, on every call, on the theory that the answer must
+/// never be stale. Measured on 1.4.0, that theory costs 245-305 ms per request:
+/// `/api/health` was the slowest endpoint in the server, slower than serving
+/// the whole 354 KB interface (2.1 ms) and slower than a filesystem scan
+/// (`/api/tree`, 5.5 ms), because each call spawned `forgen --version`
+/// (~225-270 ms) through the shell. The launcher's watchdog pings this endpoint
+/// every four seconds on up to four ports, so the single-threaded accept loop
+/// spent most of its idle time waiting on a process launch.
+///
+/// Caching at boot is not a compromise, it is the correct scope: the running
+/// server *is* a product of the toolchain it reports, and that binary cannot
+/// change while the process lives. A toolchain upgrade restarts the server.
+pub fn st_health( tc: Str) -> Str {
+    return "{\"ok\":true,\"service\":\"datara-studio\",\"version\":\"0.2.0\","
+         + "\"toolchain\":\"" + st_json_escape(tc) + "\","
+         + "\"ai\":\"http://127.0.0.1:7890\"}"
+}
+
+/// The compiler's own version line, for the status bar.
+///
+/// Called exactly once, from `main`, before the accept loop starts.
+pub fn st_toolchain() -> Str {
+    mut v = ""
+    unsafe(justification: "the IDE reports which compiler it is driving") {
+        v = exec("forgen --version")
+    }
+    let lines = str_split(st_from_oem(st_strip_ansi(v)), "\n")
+    let n = lines.len()
+    mut i = 0
+    while i < n {
+        let t = str_trim(lines[i])
+        i = i + 1
+        if byte_len(t) > 0 {
+            return t
+        }
+    }
+    return ""
+}
+
+/// MIME type by extension, so the browser can load the wasm module and the
+/// vendored React without guessing.
+pub fn st_content_type( p: Str) -> Str {
+    if st_has_suffix(p, ".html") {
+        return "text/html; charset=utf-8"
+    }
+    if st_has_suffix(p, ".js") || st_has_suffix(p, ".mjs") {
+        return "application/javascript; charset=utf-8"
+    }
+    if st_has_suffix(p, ".css") {
+        return "text/css; charset=utf-8"
+    }
+    if st_has_suffix(p, ".wasm") {
+        return "application/wasm"
+    }
+    if st_has_suffix(p, ".json") {
+        return "application/json; charset=utf-8"
+    }
+    if st_has_suffix(p, ".svg") {
+        return "image/svg+xml"
+    }
+    if st_has_suffix(p, ".png") {
+        return "image/png"
+    }
+    if st_has_suffix(p, ".woff2") {
+        return "font/woff2"
+    }
+    return "application/octet-stream"
+}
+
+/// Read a UI asset. `rel` is relative to the studio directory and is rejected
+/// outright if it contains a parent-directory segment, so a crafted URL cannot
+/// read outside the UI.
+pub fn st_read_asset( rel: Str) -> Str {
+    if st_has_infix(rel, "..") {
+        return ""
+    }
+    mut content = ""
+    unsafe(justification: "serving the interface's own assets") {
+        if file_exists(rel) {
+            content = file_read(rel)
+        }
+    }
+    return content
+}
+
+pub fn st_read( path: Str) -> Str {
+    // `shown` is what the editor understands; `p` is what the filesystem needs.
+    // For an ASCII path - which is nearly all of them - the two are identical.
+    let shown = st_norm_path(path)
+    let p = st_fs_path(shown)
+    if byte_len(p) == 0 {
+        return "{\"ok\":false,\"error\":\"not found\",\"path\":\"" + st_json_escape(shown) + "\"}"
+    }
+    mut exists = false
+    mut content = ""
+    unsafe(justification: "the IDE backend must read the file the user opened") {
+        exists = file_exists(p)
+        if exists {
+            content = file_read(p)
+        }
+    }
+    if !exists {
+        return "{\"ok\":false,\"error\":\"not found\",\"path\":\"" + st_json_escape(shown) + "\"}"
+    }
+    // `file_read` returns zero bytes for content that is not valid UTF-8, which
+    // would show an empty editor with no explanation. `file_read_bytes` reads the
+    // same file as bytes, so a file that is not text is reported as such instead
+    // of silently looking empty.
+    mut binary = false
+    if byte_len(content) == 0 {
+        mut raw: List<Int> = []
+        unsafe(justification: "the IDE backend must tell an empty file from a binary one") {
+            raw = file_read_bytes(p)
+        }
+        binary = raw.len() > 0
+    }
+    if binary {
+        return "{\"ok\":false,\"path\":\"" + st_json_escape(shown) + "\""
+             + ",\"error\":\"not a text file\"}"
+    }
+    return "{\"ok\":true,\"path\":\"" + st_json_escape(shown) + "\","
+         + "\"bytes\":" + int_to_str(byte_len(content)) + ","
+         + "\"content\":\"" + st_json_escape(content) + "\"}"
+}
+
+pub fn st_write( path: Str, content: Str) -> Str {
+    let shown = st_norm_path(path)
+    if byte_len(shown) == 0 {
+        return "{\"ok\":false,\"error\":\"empty path\"}"
+    }
+    let p = st_fs_create_path(shown)
+    if byte_len(p) == 0 {
+        return "{\"ok\":false,\"path\":\"" + st_json_escape(shown) + "\""
+             + ",\"error\":\"cannot save to that name\""
+             + ",\"detail\":\"" + st_json_escape(st_no_bytes_msg()) + "\"}"
+    }
+    unsafe(justification: "the IDE backend must save the file the user edited") {
+        file_write(p, content)
+    }
+    return "{\"ok\":true,\"path\":\"" + st_json_escape(shown) + "\","
+         + "\"bytes\":" + int_to_str(byte_len(content)) + "}"
+}
+
+/// Commands the UI is allowed to ask this server to run.
+///
+/// An HTTP endpoint that runs arbitrary commands is a backdoor, even on
+/// loopback, so the set is a whitelist rather than a blacklist.
+pub fn st_command_allowed( cmd: Str) -> Bool {
+    if cmd == "forgen" {
+        return true
+    }
+    if st_has_prefix(cmd, "forgen ") {
+        return true
+    }
+    if st_has_prefix(cmd, "git ") {
+        return true
+    }
+    if st_has_prefix(cmd, "python ") {
+        return true
+    }
+    return st_has_prefix(cmd, "bash ")
+}
+
+/// The file a command's output is captured into.
+///
+/// `%TEMP%` is available in this runtime (measured: `C:\Temp`), with a name in
+/// the studio directory as the fallback so a stripped environment still works.
+/// One fixed name, overwritten on every run: forgen 1.4.0 has no builtin that
+/// deletes a file, and shelling out to `del` would add a second process launch
+/// to every compile - which is the cost this whole change exists to avoid.
+fn st_run_capture() -> Str {
+    let t = str_trim(env_get("TEMP"))
+    if byte_len(t) == 0 {
+        return ".studio-run.log"
+    }
+    return st_join(t, "datara-studio-run.log")
+}
+
+/// Run a whitelisted command and return its output **and its real exit code**.
+///
+/// The exit code is the point. It used to be guessed from the text, and the
+/// response admitted as much; now `system` reports what the process actually
+/// returned, and the compiler's output is captured to a file so that reading it
+/// does not cost a second launch.
+///
+/// The output still has to be converted and de-coloured: cmd writes the console
+/// codepage, and forgen emits ANSI even into a pipe.
+pub fn st_run( cmd: Str) -> Str {
+    if !st_command_allowed(cmd) {
+        return "{\"ok\":false,\"error\":\"command not in the whitelist\","
+             + "\"cmd\":\"" + st_json_escape(st_display(cmd)) + "\"}"
+    }
+
+    let capture = st_run_capture()
+    mut code = -1
+    unsafe(justification: "the IDE backend runs the compiler on the user's project") {
+        code = system("(" + cmd + ") > \"" + st_back_path(capture) + "\" 2>&1")
+    }
+
+    mut output = ""
+    unsafe(justification: "the IDE backend reads back what the compiler said") {
+        if file_exists(capture) {
+            output = file_read(capture)
+        }
+    }
+    // `st_display_shell`, not `st_from_oem`: forgen writes UTF-8 and cmd writes
+    // cp866, and the capture file is byte-transparent so both arrive unmixed
+    output = st_display_shell(st_strip_ansi(output))
+
+    return "{\"ok\":true,\"exit\":" + int_to_str(code)
+         + ",\"status\":\"" + st_status_of(code) + "\""
+         + ",\"cmd\":\"" + st_json_escape(st_display(cmd)) + "\""
+         + ",\"output\":\"" + st_json_escape(output) + "\"}"
+}
+
+/// A command that ran to completion with status 0 succeeded. Anything else did
+/// not, and the interface shows the number so "failed" is never a guess.
+fn st_status_of( code: Int) -> Str {
+    if code == 0 {
+        return "ok"
+    }
+    return "failed"
+}
+
+/// Convenience commands so the UI does not have to build command strings.
+///
+/// The target is quoted: a workspace path is allowed to contain a space - the
+/// one this project is developed in, `D:\IDE datara`, still has one - and an
+/// unquoted path there silently becomes two arguments.
+///
+/// A target that leaves ASCII is resolved to the filesystem's own spelling
+/// first, because a shell reads its command line in the ANSI codepage and would
+/// otherwise look for a folder whose name is the UTF-8 bytes reinterpreted. When
+/// the path does not exist there is nothing to resolve, so the target is passed
+/// through unchanged and the command fails with the compiler's own message.
+pub fn st_run_named( action: Str, target: Str) -> Str {
+    let raw = st_fs_path(target)
+    mut t = "\"" + target + "\""
+    if byte_len(raw) > 0 {
+        t = "\"" + raw + "\""
+    }
+    if action == "check" {
+        return st_run("forgen check " + t)
+    }
+    if action == "build" {
+        return st_run("forgen build " + t)
+    }
+    if action == "run" {
+        return st_run("forgen run " + t)
+    }
+    if action == "lint" {
+        return st_run("forgen lint " + t)
+    }
+    if action == "audit" {
+        return st_run("forgen audit " + t)
+    }
+    if action == "tree" {
+        return st_run("forgen tree " + t)
+    }
+    if action == "profile" {
+        return st_run("forgen profile " + t)
+    }
+    if action == "format" {
+        return st_run("forgen format " + t)
+    }
+    if action == "test" {
+        return st_run("forgen test " + t)
+    }
+    return "{\"ok\":false,\"error\":\"unknown action\",\"action\":\"" + st_json_escape(action) + "\"}"
+}
+
+/// Compile one file - or a whole project - and hand back the compiler's output.
+///
+/// This is what makes problems appear while typing **without any AI at all**.
+/// The diagnostics in the right panel used to come from the companion's linter,
+/// so with the companion off the IDE showed nothing and looked broken - when in
+/// fact the compiler sitting right there had the answer.
+///
+/// **A directory is aimed at its project root, and that is not a detail.**
+/// Measured on 1.4.0: `forgen check` pointed at a directory holding two sibling
+/// projects merges them into one namespace and reports `E-RESOLVE-002: Duplicate
+/// function definition` for every name they share - two `helper` files, two
+/// `main` files. So the IDE aims at the directory of the project that governs
+/// the open file, which is what makes the entry point the right one, and the
+/// response says which directory was actually checked so the panel can state it
+/// rather than imply it.
+///
+/// The output is returned verbatim and parsed in JavaScript, deliberately:
+/// forgen already emits `error[CODE]: message` with a `--> file:line:col` and a
+/// caret span, which is exactly the shape an editor wants, and re-parsing it in
+/// Datara would be string surgery for no gain.
+///
+/// `within` is the workspace root, and it is optional: the body is
+/// `path\nroot`. It bounds the walk to the project, so a check of a workspace
+/// root cannot wander into an unrelated project above it.
+pub fn st_check( path: Str, within: Str) -> Str {
+    let p = str_trim(path)
+    if byte_len(p) == 0 {
+        return "{\"ok\":false,\"error\":\"no file to check\"}"
+    }
+    // the shell reads its command line in the ANSI codepage, so it is handed the
+    // raw spelling; `p` stays the readable one and is what the reply echoes
+    mut target = st_fs_path(p)
+    if byte_len(target) == 0 {
+        target = p
+    }
+    mut project = ""
+    if st_dir_exists(target) {
+        let root = st_project_root(p, within)
+        if byte_len(root) > 0 {
+            let raw_root = st_fs_path(root)
+            if byte_len(raw_root) > 0 {
+                target = raw_root
+            }
+            project = root
+        }
+    }
+    let r = st_run("forgen check \"" + target + "\"")
+    return "{\"ok\":true,\"path\":\"" + st_json_escape(st_from_ansi(target)) + "\""
+         + ",\"asked\":\"" + st_json_escape(p) + "\""
+         + ",\"project\":\"" + st_json_escape(project) + "\""
+         + ",\"result\":" + r + "}"
+}
+
+// --------------------------------------------------------------------- git
+//
+// The interface has shown a branch chip and a changed-file list since the
+// explorer was rewritten, and it was calling `/api/git` the whole time - an
+// endpoint this module did not have, so every poll came back
+// `no such endpoint` and the chip stayed empty. This is that endpoint.
+//
+// It is one process launch, not three. Process creation on this machine costs
+// 217-225 ms (measured, and it is the reason `/api/health` used to be the
+// slowest route in the server), and the UI polls this every 12 s, so running
+// `rev-parse`, `status` and `log` separately would spend most of the interval
+// waiting on the shell. They are chained with `&&` and separated by markers,
+// and the answer is split apart here.
+//
+// `--porcelain` is not a style choice: it is the one form of `git status` whose
+// output git guarantees will not change between versions, which is what makes
+// parsing it safe rather than fragile.
+
+/// The marker the git probe echoes between its sections.
+///
+/// Built from a number rather than written out three times, so the marker a
+/// section is split on and the marker the shell echoes cannot drift apart.
+fn st_git_mark( n: Int) -> Str {
+    if n == 1 {
+        return "__DS_GIT_BRANCH__"
+    }
+    if n == 2 {
+        return "__DS_GIT_STATUS__"
+    }
+    return "__DS_GIT_LOG__"
+}
+
+/// The text between two markers, trimmed.
+///
+/// An empty marker means "no bound on that side", so one helper reads the
+/// first, the middle and the last section instead of three near-copies.
+fn st_git_section( s: Str, a: Str, b: Str) -> Str {
+    mut rest = s
+    if byte_len(a) > 0 {
+        let i = str_index_of(s, a)
+        if i < 0 {
+            return ""
+        }
+        // not named `from`: it is a reserved word in Datara
+        let after = i + byte_len(a)
+        rest = str_substring(s, after, byte_len(s) - after)
+    }
+    if byte_len(b) > 0 {
+        let j = str_index_of(rest, b)
+        if j < 0 {
+            return ""
+        }
+        rest = str_substring(rest, 0, j)
+    }
+    return str_trim(rest)
+}
+
+/// `git status --porcelain` lines into a JSON array.
+///
+/// Each line is `XY path`: a two-character status, one space, then the path.
+/// The path is sliced from byte 3 rather than trimmed, because a filename is
+/// allowed to begin with a space and trimming it would silently point the
+/// interface at a different file.
+///
+/// A rename arrives as `R  old -> new`; the new name is what exists now, so it
+/// is the one reported.
+fn st_git_files_json( s: Str) -> Str {
+    let lines = str_split(s, "\n")
+    let n = lines.len()
+    mut i = 0
+    // not named `out`: it is a reserved word in Datara
+    mut acc = "["
+    mut first = true
+    while i < n {
+        let line = lines[i]
+        i = i + 1
+        if byte_len(str_trim(line)) > 0 {
+            mut flag = str_trim(str_substring(line, 0, 2))
+            if byte_len(flag) == 0 {
+                flag = "M"
+            }
+            mut path = ""
+            if byte_len(line) > 3 {
+                path = str_substring(line, 3, byte_len(line) - 3)
+            }
+            let arrow = str_index_of(path, " -> ")
+            if arrow >= 0 {
+                // not named `from`: also reserved
+                let after = arrow + 4
+                path = str_substring(path, after, byte_len(path) - after)
+            }
+            if !first {
+                acc = acc + ","
+            }
+            first = false
+            acc = acc + "{\"status\":\"" + st_json_escape(flag) + "\""
+                + ",\"path\":\"" + st_json_escape(st_display(path)) + "\"}"
+        }
+    }
+    return acc + "]"
+}
+
+/// `git log --oneline` lines into a JSON array of `{shorthand, subject}`.
+///
+/// The short hash is everything up to the first space and the subject is the
+/// rest of the line, which is exactly how `--oneline` formats a commit.
+fn st_git_log_json( s: Str) -> Str {
+    let lines = str_split(s, "\n")
+    let n = lines.len()
+    mut i = 0
+    mut acc = "["
+    mut first = true
+    while i < n {
+        let line = str_trim(lines[i])
+        i = i + 1
+        if byte_len(line) > 0 {
+            let sp = str_index_of(line, " ")
+            mut shorthand = line
+            mut subject = ""
+            if sp > 0 {
+                shorthand = str_substring(line, 0, sp)
+                let after = sp + 1
+                subject = str_substring(line, after, byte_len(line) - after)
+            }
+            if !first {
+                acc = acc + ","
+            }
+            first = false
+            acc = acc + "{\"shorthand\":\"" + st_json_escape(shorthand) + "\""
+                + ",\"subject\":\"" + st_json_escape(st_display(subject)) + "\"}"
+        }
+    }
+    return acc + "]"
+}
+
+/// The git state of a workspace: branch, changed files and recent commits.
+///
+/// A workspace that is not a repository is **not an error** - most folders are
+/// not repositories, and the interface simply has no chip to draw. So `ok` is
+/// false and `branch` is empty, and the UI treats that as "nothing to show"
+/// rather than as a failure it has to report.
+pub fn st_git( dir: Str) -> Str {
+    let asked = st_norm_path(dir)
+    if byte_len(asked) == 0 || asked == "." {
+        return "{\"ok\":false,\"error\":\"no workspace\",\"branch\":\"\"}"
+    }
+    mut d = st_fs_path(asked)
+    if byte_len(d) == 0 {
+        d = asked
+    }
+    if !st_dir_exists(d) {
+        return "{\"ok\":false,\"error\":\"no such workspace\",\"branch\":\"\"}"
+    }
+    // the path is interpolated into a command line, so a name that could close
+    // the quote is refused rather than escaped
+    if st_has_infix(d, "\"") {
+        return "{\"ok\":false,\"error\":\"cannot spell that path for the shell\",\"branch\":\"\"}"
+    }
+
+    let q = st_back_path(d)
+    let m1 = st_git_mark(1)
+    let m2 = st_git_mark(2)
+    let m3 = st_git_mark(3)
+    let cmd = "git -C \"" + q + "\" rev-parse --abbrev-ref HEAD 2>&1"
+            + " && echo " + m1
+            + " && git -C \"" + q + "\" status --porcelain 2>&1"
+            + " && echo " + m2
+            + " && git -C \"" + q + "\" log --oneline -10 2>&1"
+            + " && echo " + m3
+    let raw = st_display_shell(st_sh(cmd))
+
+    let branch = st_git_section(raw, "", m1)
+    // `&&` means a failure stops the chain, so no marker at all is the same
+    // answer as a `fatal:` line: this folder is not a repository
+    if byte_len(branch) == 0 || st_has_infix(branch, "fatal:") {
+        return "{\"ok\":false,\"error\":\"not a git repository\",\"branch\":\"\"}"
+    }
+    let status = st_git_section(raw, m1, m2)
+    let log = st_git_section(raw, m2, m3)
+
+    return "{\"ok\":true,\"branch\":\"" + st_json_escape(branch) + "\""
+         + ",\"dirty\":" + int_to_str(st_git_line_count(status))
+         + ",\"files\":" + st_git_files_json(status)
+         + ",\"log\":" + st_git_log_json(log) + "}"
+}
+
+/// The number of non-empty lines in a block of text.
+fn st_git_line_count( s: Str) -> Int {
+    let lines = str_split(s, "\n")
+    let n = lines.len()
+    mut i = 0
+    mut count = 0
+    while i < n {
+        if byte_len(str_trim(lines[i])) > 0 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ------------------------------------------------------------------ delete
+
+/// Delete a file or a folder.
+///
+/// forgen 1.4.0 has no delete builtin, so this shells out - the same seam as
+/// `st_mkdir` and `st_move`, and the reason `st_sh` still exists at all.
+///
+/// `rd /s /q` rather than `rmdir` for a folder: `rmdir` refuses a directory
+/// that still has anything in it, and "it was not empty" is not an answer a
+/// Delete menu item owes anyone.
+///
+/// Success is confirmed by **looking afterwards**, never by reading the shell's
+/// message - that message is translated and the translation is not ours to
+/// match on. `st_mkdir` follows the same rule.
+///
+/// `kind` is what the interface believes it is deleting. The filesystem is
+/// asked instead, because it is the one that knows; the parameter is kept so
+/// the request shape matches the rest of the API and so the reply can echo what
+/// the caller meant.
+pub fn st_delete( kind: Str, path: Str) -> Str {
+    let shown = st_norm_path(path)
+    if byte_len(shown) == 0 || shown == "." {
+        return "{\"ok\":false,\"error\":\"empty path\"}"
+    }
+    let target = st_fs_path(shown)
+    if byte_len(target) == 0 {
+        return "{\"ok\":false,\"path\":\"" + st_json_escape(shown) + "\""
+             + ",\"error\":\"cannot spell that name for the shell\""
+             + ",\"detail\":\"" + st_json_escape(st_no_bytes_msg()) + "\"}"
+    }
+    let is_dir = st_dir_exists(target)
+    if !is_dir && !st_file_exists(target) {
+        // already gone is the state the caller asked for, so this succeeded
+        return "{\"ok\":true,\"path\":\"" + st_json_escape(shown) + "\",\"deleted\":false}"
+    }
+
+    mut res = ""
+    if is_dir {
+        res = st_sh("(rd /s /q \"" + st_back_path(target) + "\") 2>&1")
+    } else {
+        res = st_sh("(del /f /q \"" + st_back_path(target) + "\") 2>&1")
+    }
+
+    if !st_dir_exists(target) && !st_file_exists(target) {
+        return "{\"ok\":true,\"path\":\"" + st_json_escape(shown) + "\""
+             + ",\"kind\":\"" + st_json_escape(kind) + "\",\"deleted\":true}"
+    }
+    return "{\"ok\":false,\"path\":\"" + st_json_escape(shown) + "\""
+         + ",\"error\":\"could not delete it\""
+         + ",\"detail\":\"" + st_json_escape(st_from_oem(str_trim(res))) + "\"}"
+}
+
+/// Start the AI companion, detached, if it is not already running.
+///
+/// The companion lives in a sibling project and is optional, but "optional" must
+/// not mean "the user has to open a terminal to get it". Started with no window,
+/// and detached so it outlives this request.
+///
+/// **Why it goes through `scripts/hidden.vbs`.** Two reasons, and the second one
+/// cost an afternoon. The first is the window: `start /min` still shows one. The
+/// second is that `exec` reads the child's output until the pipe closes, and a
+/// detached child that inherits the write end of that pipe keeps it open - so
+/// exec never sees EOF and the request never returns. The first version of this
+/// endpoint called `start "title" /min cmd /c "cd /d "D:\ryan" && python ..."`
+/// and hung the server permanently; the nested quotes also made cmd mis-parse
+/// the command, which is what let the child inherit the pipe in the first place.
+/// `WshShell.Run(cmd, 0, False)` creates the process with no window and no
+/// inherited standard handles, which is what both problems needed.
+///
+/// Reports what it did rather than assuming success: the caller polls /health to
+/// find out whether it actually came up.
+pub fn st_ai_start( dir: Str) -> Str {
+    let where_ = str_trim(dir)
+    if byte_len(where_) == 0 {
+        return "{\"ok\":false,\"error\":\"no companion directory given\"}"
+    }
+    if !st_dir_exists(where_) {
+        return "{\"ok\":false,\"error\":\"companion directory not found\""
+             + ",\"dir\":\"" + st_json_escape(where_) + "\"}"
+    }
+    if !st_file_exists(st_join(where_, "python/forgen_ai/ide_daemon.py")) {
+        return "{\"ok\":false,\"error\":\"ide_daemon.py not found in that directory\""
+             + ",\"dir\":\"" + st_json_escape(where_) + "\"}"
+    }
+    // Starting a second daemon is never what the caller wants, and it used to be
+    // what happened every single time - see `st_port_busy`. The daemon is
+    // detached and lives until the machine restarts, so the count only ever grew.
+    if st_port_busy(7890) {
+        return "{\"ok\":true,\"already\":true,\"dir\":\"" + st_json_escape(where_) + "\"}"
+    }
+
+    let inner = "cmd /c cd /d \"" + st_back_path(where_)
+              + "\" && python python\\forgen_ai\\ide_daemon.py --port 7890"
+    mut res = ""
+    unsafe(justification: "the IDE starts its own optional companion process") {
+        res = exec("wscript //nologo //B \"scripts\\hidden.vbs\" \"" + inner + "\"")
+    }
+    return "{\"ok\":true,\"started\":true,\"dir\":\"" + st_json_escape(where_) + "\"}"
+}

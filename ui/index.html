@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Datara Studio</title>
+<!-- The Datara mark. `__DATARA_FAVICON__` is replaced with the real artwork as a
+     data URI by scripts/build-ui.mjs, so the tab shows the app icon without
+     opening a second connection. The bytes come from assets/datara.ico. -->
+<link rel="icon" href="__DATARA_FAVICON__">
+<style>
+:root{
+  /* five surface levels: depth comes from luminance, not from borders */
+  --s0:#0B0B0E; --s1:#101014; --s2:#16161B; --s3:#1D1D23; --s4:#26262E;
+  /* Contrast is measured, not eyeballed. --ink3 carries every 11.5px uppercase
+     label in the window, and at its old value (#5C5C66) it sat at 2.87:1
+     against --s1 - under the 4.5:1 that size of text needs, which is why the
+     labels read as smudges. #7A7A86 is 4.48:1 on --s1 and 4.25:1 on --s2, and
+     the three-step ink ramp still reads as a ramp: 4.5 : 6.8 : 16.2. */
+  --ink1:#E9E9EE; --ink2:#9A9AA4; --ink3:#7A7A86;
+  /* Line numbers are decoration, so they are allowed to be quieter than the
+     labels - but 1.74:1 (#3A3A42) was not quiet, it was absent. 3.20:1. */
+  --ink4:#63636E;
+  --live:#7DD3C0;
+  --err:#D9705F; --warn:#D6A461; --ok:#7FB069;
+  --hair:rgba(255,255,255,.07); --hair2:rgba(255,255,255,.14);
+  --sans:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"Cascadia Mono","JetBrains Mono",Consolas,"SF Mono",monospace;
+  --lh:21px; --gut:58px;
+  --tree:210px; --panel:250px;
+  --r:6px; --r2:10px;
+  --focus:0 0 0 2px rgba(125,211,192,.55);
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--s1);color:var(--ink1);
+  font-family:var(--sans);font-size:13.5px;line-height:1.5;-webkit-font-smoothing:antialiased}
+#root{height:100%}
+/* scrollbars belong to the interface, not to the operating system */
+*{scrollbar-width:thin;scrollbar-color:#2E2E36 transparent}
+::-webkit-scrollbar{width:11px;height:11px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#2E2E36;border-radius:6px;
+  border:3px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:#3E3E48;background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent}
+
+/* a translucent tint, because the code layer sits under the textarea and an
+   opaque selection would hide the very text it is selecting */
+::selection{background:rgba(255,255,255,.18)}
+.code::selection{background:rgba(255,255,255,.18);color:transparent}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+input{font:inherit;color:inherit}
+.lbl{font-size:11.5px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--ink3)}
+.mono{font-family:var(--mono)}
+
+.shell{display:grid;grid-template-rows:44px 1fr 28px;height:100%}
+/* The title bar's row exists only in the desktop shell. `ui/tauri-bridge.js` sets
+   `data-shell` on <html> before the first paint, and the interface draws the bar
+   itself only when that object exists - so in a browser both the element and its
+   row are absent and the layout is exactly the three-row layout it always was. */
+html[data-shell="tauri"] .shell{grid-template-rows:34px 44px 1fr 28px}
+
+/* The window's own title bar, drawn by the interface.
+   Windows' caption is 32 px at 100% scaling; 34 keeps the drag target as easy to
+   hit as the caption it replaced without spending more of the window on chrome.
+   The bar is the drag region (`data-tauri-drag-region="deep"` in app.js), which
+   is Tauri's own mechanism: it walks up from whatever was clicked and refuses to
+   drag when it meets a button, so the three controls below stay clickable and
+   everything else moves the window. Double-clicking the bar maximises. */
+.titlebar{display:flex;align-items:center;gap:9px;padding-left:11px;
+  background:var(--s0);border-bottom:1px solid var(--hair)}
+.tbmark{width:16px;height:16px}
+.tbtitle{font-size:12.5px;color:var(--ink3);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;min-width:0;max-width:52%}
+.tbspace{flex:1}
+/* 46 px wide, because that is the width of the caption buttons this replaces -
+   "close is the top-right corner" is muscle memory and it should survive.
+   `.capbtn`, not `.wbtn`: the title screen already owns `.wbtn` for its three
+   ways in, and a second rule of the same name declared earlier in this file
+   wins on any property the later one does not also set - which is how a 46 px
+   `width` from here ended up on "Create new project" and squashed the title
+   screen into a column of single words. Caught by looking at the screenshot. */
+.capctl{display:flex;align-self:stretch;flex:none}
+.capbtn{width:46px;display:flex;align-items:center;justify-content:center;
+  color:var(--ink2)}
+.capbtn:hover{background:var(--s3);color:var(--ink1)}
+.capbtn:active{background:var(--s4)}
+/* Windows 11's own close-button red. The one place in the bar where the system
+   colour is worth more than the interface's own palette: it is the one button
+   nobody should press by accident. */
+.capbtn.danger:hover{background:#C42B1C;color:#FFFFFF}
+.capbtn svg{display:block}
+
+/* `minmax(0,1fr)`, not `1fr`, on both sides of the search.
+   A bare `1fr` means `minmax(auto,1fr)`, so a side whose content is wider than
+   its share pushes the middle column off centre instead of being squeezed - and
+   the left side carries five icon buttons, a rule, the workspace name and the git
+   chip, while the right carries one dot and the Run button. Measured in the
+   running window: the search sat about 75 px right of the middle. With the
+   minimum pinned to 0 the two sides are the same width and the search is centred
+   whatever the window does. */
+.intent{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:14px;
+  padding:0 12px;background:var(--s1);border-bottom:1px solid var(--hair);
+  user-select:none;position:relative;z-index:6}
+.intent .left{display:flex;align-items:center;gap:10px;min-width:0}
+.intent .right{display:flex;align-items:center;gap:10px;justify-self:end}
+.mark{display:flex;align-items:center;white-space:nowrap}
+.iconbtn{width:28px;height:28px;border-radius:var(--r);display:flex;align-items:center;
+  justify-content:center;color:var(--ink3)}
+.iconbtn:hover{background:var(--s3);color:var(--ink1)}
+.iconbtn:active{transform:translateY(.5px)}
+.iconbtn svg{display:block}
+.dialog{width:min(520px,92vw);background:var(--s4);border-radius:var(--r2);padding:16px;
+  height:fit-content}
+.dialog h3{margin:0 0 4px;font-size:14px;font-weight:500}
+.dialog p{margin:0 0 12px;font-size:12.5px;color:var(--ink3)}
+.dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+.dialog input{width:100%;height:34px;padding:0 11px;background:var(--s0);border:0;
+  border-radius:var(--r);font-family:var(--mono);font-size:13px;outline:none}
+.mark svg{display:block}
+.mark .sub{color:var(--ink3);font-weight:400}
+.vrule{width:1px;height:16px;background:var(--hair2)}
+/* The workspace name, with the folder mark in front of it. He asked for the mark
+   and for it to sit before the git chip, which is where it is: the workspace is
+   the outermost fact about what you are looking at, and the branch belongs to it,
+   not the other way round. */
+.ws{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:12px;
+  color:var(--ink3);white-space:nowrap;min-width:0;max-width:230px}
+.ws svg{flex:none;color:var(--ink3)}
+.ws span{overflow:hidden;text-overflow:ellipsis}
+.chip{display:flex;align-items:center;color:var(--ink3);cursor:default}
+.chip:hover{color:var(--ink2)}
+.chip svg{display:block}
+.search{width:min(460px,42vw);height:30px;border-radius:var(--r);background:var(--s2);
+  display:flex;align-items:center;justify-content:center;padding:0 10px;gap:8px;cursor:pointer}
+.searchhint{font-size:13px;color:var(--ink3)}
+.search:hover{background:var(--s3)}
+.search:hover .searchhint{color:var(--ink2)}
+.runwrap{position:relative}
+.run{display:flex;align-items:center;height:28px;border-radius:var(--r);background:var(--s3);
+  overflow:hidden;position:relative}
+.run:hover{background:var(--s4)}
+.run .main{display:flex;align-items:center;gap:8px;padding:0 12px;height:100%}
+.run .main span{font-size:13px;font-weight:500}
+.run .div{width:1px;height:28px;background:var(--hair2)}
+.run .chev{display:flex;align-items:center;padding:0 9px;height:100%}
+/* The run button used to carry a teal bar that swept along its bottom edge for
+   as long as the compiler was working. It was the only looping animation in the
+   window, it read as a highlight sliding under a control rather than as a
+   progress indicator, and the status bar already says "running" in words. */
+.run.busy{background:var(--s4)}
+.run.busy .main span{color:var(--ink2)}
+.menu{position:absolute;top:34px;right:0;width:238px;background:var(--s4);border-radius:var(--r2);
+  padding:5px;z-index:20}
+.ctxmenu{position:fixed;width:200px;background:var(--s4);border-radius:var(--r2);
+  padding:5px;z-index:40;box-shadow:0 8px 28px rgba(0,0,0,.5)}
+.gitchip{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:12px;
+  color:var(--ink2);padding:2px 8px;border-radius:var(--r);background:var(--s3)}
+.gitchip.dirty{color:var(--warn)}
+.gitchip i{font-style:normal;color:var(--warn);font-size:11px}
+.menu .row,.ctxmenu .row{display:flex;align-items:center;height:30px;padding:0 10px;gap:10px;
+  border-radius:var(--r);cursor:pointer}
+.menu .row:hover,.ctxmenu .row:hover{background:var(--s3)}
+.menu .row span,.ctxmenu .row span{flex:1;font-size:13px;color:var(--ink2)}
+.menu .row.on span,.ctxmenu .row.on span{color:var(--ink1)}
+.menu .sep,.ctxmenu .sep{height:1px;background:var(--hair);margin:5px 6px}
+.menu .k,.ctxmenu .k{font-family:var(--mono);font-size:11.5px;color:var(--ink3)}
+.aistat{display:flex;align-items:center;gap:7px;color:var(--ink3);font-size:12px;
+  padding-left:12px;border-left:1px solid var(--hair)}
+.led{width:7px;height:7px;border-radius:50%;background:#3A3A42}
+.led.on{background:var(--ok)}
+
+/* Flex rather than a three-column grid: the column widths are draggable, and a
+   grid cannot hold the two drag handles without the track count changing every
+   time a side is folded. */
+.body{display:flex;min-height:0}
+.body.reading .col.tree-col{display:none}
+.col{flex:none;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.col > *{flex:1;min-height:0}
+
+.tree{background:var(--s1);display:flex;
+  flex-direction:column;min-height:0}
+.tree .hd{padding:12px 14px 8px;display:flex;align-items:center;justify-content:space-between}
+.newbtn{display:flex;align-items:center;gap:5px;height:22px;padding:0 8px;border-radius:5px;
+  color:var(--ink3);font-size:11.5px}
+.newbtn:hover{background:var(--s3);color:var(--ink1)}
+.newbtn svg{display:block}
+
+/* the create control: one button, two kinds */
+.newwrap{position:relative}
+.newmenu{position:absolute;top:26px;right:0;width:150px;background:var(--s4);
+  border-radius:var(--r);padding:4px;z-index:20;
+  box-shadow:0 8px 22px rgba(0,0,0,.45)}
+.newmenu .row{display:flex;align-items:center;gap:9px;height:28px;padding:0 9px;
+  border-radius:4px;font-size:12.5px;color:var(--ink2);cursor:pointer}
+.newmenu .row:hover{background:var(--s3);color:var(--ink1)}
+.newmenu .row svg{color:var(--ink3);flex:none}
+
+/* the inline create row, and the name it will actually get */
+.newrow{height:26px;display:flex;align-items:center;gap:6px;color:var(--ink2)}
+.newrow svg{flex:none;color:var(--ink3)}
+.newrow input{flex:1;min-width:0;height:22px;padding:0 6px;background:var(--s0);border:0;
+  border-radius:4px;font-family:var(--mono);font-size:12.5px;outline:none;
+  box-shadow:inset 0 0 0 1px var(--live)}
+.newhint{padding:2px 0 4px 12px;font-family:var(--mono);font-size:11px;color:var(--ink3)}
+.note.bad{color:var(--err)}
+.note .det{display:block;margin-top:4px;font-style:normal;font-family:var(--mono);
+  font-size:11.5px;color:var(--ink3);word-break:break-word}
+
+/* completion popup */
+.comp{position:absolute;z-index:9;min-width:190px;max-height:220px;overflow:auto;
+  background:var(--s4);border-radius:var(--r);padding:4px;display:none}
+.comp .ci{display:flex;align-items:center;gap:10px;height:24px;padding:0 8px;
+  border-radius:4px;font-family:var(--mono);font-size:12.5px;color:var(--ink2);cursor:pointer}
+.comp .ci.on{background:var(--s3);color:var(--ink1)}
+.comp .ci .hint{margin-left:auto;font-size:10.5px;color:var(--ink3)}
+
+/* settings */
+.setrow{display:flex;align-items:center;gap:12px;height:38px;
+  border-bottom:1px solid var(--hair)}
+.setrow:last-child{border-bottom:0}
+.setrow .lab{flex:1;font-size:13px}
+.setrow .lab i{display:block;font-style:normal;font-size:11.5px;color:var(--ink3)}
+.setrow select,.setrow input[type=number]{height:28px;padding:0 8px;background:var(--s0);
+  border:0;border-radius:var(--r);font-family:var(--mono);font-size:12.5px;outline:none}
+.setrow input[type=number]{width:78px}
+/* the platform's number spinners belong to the platform, not here */
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield;appearance:textfield}
+.browser{width:min(680px,94vw);background:var(--s4);border-radius:var(--r2);
+  height:fit-content;max-height:74vh;display:flex;flex-direction:column;overflow:hidden}
+
+/* The title screen. Three named actions, each saying what it does - because
+   "Open folder" and "Create new project" are not obviously different things
+   until you have used an editor for a while, and the first launch is exactly
+   when you have not. */
+.welcome{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:6px;padding:40px;text-align:center;overflow:auto}
+.welcome .wmark{width:56px;height:56px;margin-bottom:10px}
+.welcome h2{margin:0;font-size:22px;font-weight:500}
+.welcome p{margin:4px 0 20px;color:var(--ink3);font-size:13px;max-width:440px;line-height:1.6}
+.welcome .wactions{display:flex;flex-direction:column;gap:8px;width:min(400px,100%)}
+.wbtn{display:flex;flex-direction:column;align-items:flex-start;gap:2px;
+  padding:11px 14px;border-radius:var(--r2);background:var(--s2);text-align:left;
+  transition:background .12s ease}
+.wbtn:hover{background:var(--s3)}
+.wbtn .t{font-size:13.5px;font-weight:500;color:var(--ink1)}
+.wbtn .s{font-size:12px;color:var(--ink3)}
+.wbtn.primary{background:var(--s3)}
+.wbtn.primary:hover{background:var(--s4)}
+.wbtn.primary .t{color:var(--live)}
+.welcome .wrecents{margin-top:22px;width:min(400px,100%);text-align:left}
+.wrecent{display:flex;align-items:center;gap:8px;height:28px;padding:0 8px;
+  border-radius:var(--r);cursor:pointer;color:var(--ink2)}
+.wrecent:hover{background:var(--s2);color:var(--ink1)}
+.wrecent svg{flex:none;color:var(--ink3)}
+.wrecent .mono{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.welcome .whint{display:flex;gap:16px;margin-top:24px;font-size:11.5px;color:var(--ink4)}
+.welcome .whint b{font-family:var(--mono);font-weight:400;color:var(--ink3)}
+
+/* A run or build the compiler refused. It sits between the breadcrumb and the
+   code, so the reason the program did not start is on screen at the moment it
+   does not start, instead of inside a drawer nobody opened. */
+.runerr{display:flex;align-items:center;gap:10px;padding:0 16px;height:34px;
+  background:rgba(217,112,95,.10);border-bottom:1px solid rgba(217,112,95,.28);
+  font-size:12.5px;color:var(--ink2);flex:none}
+.runerr .dot{width:6px;height:6px;border-radius:50%;background:var(--err);flex:none}
+.runerr b{font-weight:500;color:var(--ink1);white-space:nowrap}
+.runerr .msg{font-family:var(--mono);font-size:11.5px;color:var(--err);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.runerr .spacer{flex:1}
+.browser .bh{padding:14px 16px 10px}
+.browser .bh h3{margin:0 0 3px;font-size:14px;font-weight:500}
+.browser .bh p{margin:0;font-size:12px;color:var(--ink3)}
+.browser .path{display:flex;align-items:center;gap:8px;margin:0 16px 10px;
+  font-family:var(--mono);font-size:12px;color:var(--ink2)}
+.browser .path .up{width:24px;height:24px;border-radius:5px;display:flex;
+  align-items:center;justify-content:center;color:var(--ink3);flex:none}
+.browser .path .up:hover{background:var(--s3);color:var(--ink1)}
+/* an editable path, because clicking up and down cannot reach another drive */
+.browser .pinput{flex:1;min-width:0;height:28px;padding:0 9px;background:var(--s0);border:0;
+  border-radius:var(--r);font-family:var(--mono);font-size:12px;outline:none;color:var(--ink1)}
+.browser .pinput:focus{box-shadow:inset 0 0 0 1px var(--live)}
+.browser .roots{display:flex;gap:6px;flex-wrap:wrap;margin:0 16px 10px}
+.browser .root{height:22px;padding:0 9px;border-radius:5px;background:var(--s3);
+  font-family:var(--mono);font-size:11.5px;color:var(--ink2)}
+.browser .root:hover{background:var(--s4);color:var(--ink1)}
+.browser .root.on{color:var(--live)}
+.browser .newfolder{height:30px;display:flex;align-items:center;gap:9px;padding:0 10px}
+.browser .newfolder svg{flex:none;color:var(--ink3)}
+.browser .newfolder input{flex:1;min-width:0;height:24px;padding:0 7px;background:var(--s0);
+  border:0;border-radius:4px;font-family:var(--mono);font-size:12.5px;outline:none;
+  box-shadow:inset 0 0 0 1px var(--live)}
+.browser .dlist{overflow:auto;flex:1;padding:0 8px 8px;min-height:120px}
+.browser .d{height:30px;display:flex;align-items:center;gap:9px;padding:0 10px;
+  border-radius:var(--r);font-family:var(--mono);font-size:12.5px;color:var(--ink2);
+  cursor:pointer;white-space:nowrap}
+.browser .d:hover{background:var(--s3);color:var(--ink1)}
+.browser .d svg{flex:none;color:var(--ink3)}
+.browser .bf{display:flex;align-items:center;gap:8px;padding:12px 16px;
+  border-top:1px solid var(--hair)}
+.browser .bf .grow{flex:1;font-size:11.5px;color:var(--ink3)}
+.sw{width:36px;height:20px;border-radius:10px;background:var(--s3);position:relative;
+  transition:background .14s ease;flex:none}
+.sw.on{background:var(--live)}
+.sw i{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+  background:var(--ink1);transition:transform .14s ease}
+.sw.on i{transform:translateX(16px)}
+.tabs2{display:flex;gap:4px;margin-bottom:14px}
+.tabs2 button{height:28px;padding:0 12px;border-radius:var(--r);font-size:12.5px;color:var(--ink3)}
+.tabs2 button:hover{background:var(--s3)}
+.tabs2 button.on{background:var(--s3);color:var(--ink1)}
+.fieldwrap{position:relative;display:flex;align-items:center;margin:0 10px 8px}
+.fieldwrap svg{position:absolute;left:9px;pointer-events:none;color:var(--ink3)}
+.filter{flex:1;min-width:0;height:28px;padding:0 9px 0 30px;background:var(--s2);border:0;
+  border-radius:var(--r);font-family:var(--mono);font-size:12.5px;outline:none;color:var(--ink1)}
+.filter::placeholder{color:var(--ink3)}
+.filter:focus{background:var(--s3)}
+.tree .list{overflow:auto;flex:1;padding-bottom:12px}
+.tree .list.over{box-shadow:inset 0 0 0 1px rgba(125,211,192,.35);border-radius:var(--r)}
+/* Fixed-width slots, so folder names and file names land on the same axis
+   instead of each row inventing its own indentation. */
+.slot{width:16px;flex:none;display:flex;align-items:center;justify-content:center}
+.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nm .d{color:var(--warn);font-style:normal;margin-left:5px}
+.tdir{height:27px;display:flex;align-items:center;gap:4px;font-family:var(--mono);
+  font-size:13px;color:var(--ink3);cursor:pointer;user-select:none;border-radius:4px}
+.tdir:hover{background:var(--s3);color:var(--ink2)}
+.tdir.over{background:rgba(125,211,192,.14);color:var(--ink1);
+  box-shadow:inset 0 0 0 1px rgba(125,211,192,.45)}
+.tdir svg{transition:transform .12s ease;flex:none}
+.tfile{height:27px;display:flex;align-items:center;gap:4px;font-family:var(--mono);
+  font-size:13px;color:var(--ink2);cursor:pointer;white-space:nowrap;overflow:hidden;
+  border-left:2px solid transparent;border-radius:4px}
+.tfile:hover{background:var(--s3);color:var(--ink1)}
+.tfile.on{background:var(--s3);color:var(--ink1);border-left-color:var(--live)}
+.tfile.dragging{opacity:.4}
+
+/* The Datara mark, next to every .dtr file.
+   It is the project's own artwork rather than a glyph assembled from
+   primitives, because a language's file icon is a piece of identity and an
+   approximation of it is a different icon. Raster, so it arrives through CSS;
+   the bytes are injected as a data URI by scripts/build-ui.mjs, since the built
+   interface opens no second connection (see the note in that script). */
+.fico{display:inline-block;flex:none;background-repeat:no-repeat;
+  background-position:center;background-size:contain}
+/* Drawn at 13-16 px CSS, which is not the same as 13-16 device px: a 16 px box
+   is 20 device px at 125% display scaling, 24 at 150%, 32 at 200%, and the
+   browser upsamples the source to fill it. Backing this with the 16 px entry
+   therefore meant a 3x upsample on a 200% display, and this mark is on screen
+   constantly - the title bar and every .dtr row in the explorer.
+
+   Measured, focus = variance of Laplacian / variance of luma, higher is
+   crisper, the mark drawn at 16 px CSS:
+
+       scaling     16 px entry     32 px entry
+       100%            6.57            9.59
+       125%            1.51           12.46
+       150%            1.02            9.50
+       200%            0.34            8.01
+
+   The 16 px entry is the worst of all seven entries at every scaling, and it is
+   not even best at 100% - so "the only size at which this artwork is crisp" was
+   simply wrong. The 32 px entry covers 16 px CSS exactly up to 200% scaling and
+   won on the sum over the four scalings, so that is what backs this now. */
+.fico-dtr{background-image:url(__DATARA_ICON_32__)}
+/* The title screen draws it at 56 px. It used to be the 32 px entry stretched to
+   1.75x, which is exactly what "нечёткая аватарка" was. 128 px, drawn at 56, so
+   it stays crisp at 200% display scaling too. */
+.fico-app{background-image:url(__DATARA_ICON_128__);background-size:100% 100%}
+
+.center{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--s0)}
+.crumbs{display:flex;align-items:center;gap:8px;padding:9px 18px;background:var(--s1);
+  border-bottom:1px solid var(--hair);font-family:var(--mono);font-size:12px;color:var(--ink3);
+  white-space:nowrap;overflow:hidden}
+.crumbs b{color:var(--ink2);font-weight:400}
+.crumbs i{color:var(--ink4);font-style:normal}
+/* fills the container outright: its children are all absolutely positioned,
+   so a content-derived height would be zero and nothing would show */
+.edscroll{position:absolute;inset:0;overflow:auto}
+/* The gutter sits over the text on the scroller's own scroll, so it has to be
+   pinned by the editor's scroll handler. A solid back behind it is what makes
+   the left edge read as a clean corner instead of numbers drifting over code. */
+.gutterback{position:absolute;left:0;top:0;width:var(--gut);bottom:0;
+  background:var(--s0);z-index:2;border-right:1px solid var(--hair)}
+.gutter{position:absolute;left:0;top:0;width:var(--gut);padding:12px 0;text-align:right;
+  font-family:var(--mono);font-size:13px;line-height:var(--lh);color:var(--ink4);user-select:none;z-index:3}
+.gutter div{padding-right:14px}
+.gutter div.cur{color:var(--ink2)}
+.gutter div.err{color:var(--err)}
+.gutter div.warn{color:var(--warn)}
+.hl,.code,.ghost{position:absolute;top:0;left:var(--gut);margin:0;padding:12px 18px;
+  font-family:var(--mono);font-size:13.5px;line-height:var(--lh);white-space:pre;
+  tab-size:4;border:0;outline:0}
+.hl{pointer-events:none;z-index:1}
+.code{background:transparent;color:transparent;caret-color:var(--ink1);resize:none;
+  width:calc(100% - var(--gut));overflow:hidden;z-index:5}
+.ghost{pointer-events:none;z-index:4}
+.ghost span{color:#93A8C4;background:#141D29;border-radius:3px;padding:0 4px}
+/* the "Tab" chip on an inline suggestion, so a completion never reads as text
+   that is already in the file */
+.ghost .ghostkey{font-style:normal;font-size:10px;letter-spacing:.05em;
+  text-transform:uppercase;margin-left:6px;padding:1px 5px;border-radius:3px;
+  color:var(--ink3);background:rgba(255,255,255,.06);
+  border:1px solid var(--hair2);vertical-align:1px}
+.errline{background:rgba(217,112,95,.13);box-shadow:inset 2px 0 0 var(--err)}
+.warnline{background:rgba(214,164,97,.11);box-shadow:inset 2px 0 0 var(--warn)}
+.sugline{box-shadow:inset 2px 0 0 var(--ink3)}
+.k{color:#8FB3E8}.t{color:#7FC4A8}.s{color:#C9A86A}.c{color:#5A5A64;font-style:italic}
+.n{color:#C98FD4}.f{color:#DCDCE2}.p{color:#9AA0AD}
+
+.panel{background:var(--s1);display:flex;
+  flex-direction:column;min-height:0}
+/* One row, and off the edge rather than wrapped.
+   Six tabs do not fit in a 250px panel, and this used to wrap them into three
+   rows - which made the strip change height every time a tab was added, and made
+   the tabs read as a grid of buttons rather than as a strip. They stay on one row
+   now and the ones that do not fit go past the right edge.
+   The reason the old version wrapped was real, though: with a hidden scrollbar,
+   "AI" and "Generate" were unreachable and nothing said they existed. So the row
+   is still scrollable, the scrollbar is hidden, and `Panel` scrolls the selected
+   tab into view - which is the part that actually solved the problem. Settings ->
+   View lists every tab, so hiding the ones you never open is a real answer too. */
+.ptabs{display:flex;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;gap:2px;
+  padding:7px 6px;border-bottom:1px solid var(--hair);scrollbar-width:none}
+.ptabs::-webkit-scrollbar{height:0}
+.ptabs button{height:30px;padding:0 10px;border-radius:var(--r);font-size:12.5px;
+  color:var(--ink3);white-space:nowrap;display:flex;align-items:center;gap:5px;flex:none}
+.ptabs button:hover{color:var(--ink2);background:var(--s3)}
+/* The active tab used to carry a 72px teal underline - `border-bottom-color:
+   var(--live)`. Measured in the running window at 1441x935 it is 72 px wide and
+   2 px tall at y=113, and it reads as a green plate sitting under a word rather
+   than as "this is the tab you are looking at". It is a filled pill now, the
+   same way the Settings tabs already say the same thing. */
+.ptabs button.on{color:var(--ink1);background:var(--s4)}
+.ptabs button.on:hover{background:var(--s4)}
+.ptabs button.dragging{opacity:.45}
+.ptabs button.dropzone{box-shadow:inset 2px 0 0 var(--ink2)}
+.ptabs .badge{font-style:normal;font-size:10px;background:var(--s4);color:var(--ink2);
+  border-radius:8px;padding:1px 5px;line-height:1.4}
+.ptabs button.on .badge{background:var(--s0)}
+.pbody{overflow:auto;flex:1;padding:14px}
+.card{background:var(--s2);border-radius:var(--r2);padding:12px;margin-bottom:10px}
+.card .ch{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+.card .ch b{font-weight:500;font-size:13px}
+.card pre{margin:0;font-family:var(--mono);font-size:12.5px;color:var(--ink2);
+  white-space:pre-wrap;word-break:break-word;line-height:1.55}
+.ins{margin-top:9px;font-family:var(--mono);font-size:12.5px;color:#93B4DD;background:#0E141C;
+  border-radius:var(--r);padding:8px;white-space:pre-wrap;word-break:break-word}
+/* Where the generated code went. The panel used to show the code and nothing
+   else, which made it look like the result *was* the panel - so the one thing
+   the user needs to know, which file now holds it, was the one thing missing. */
+.genwhere{display:flex;flex-direction:column;gap:2px;margin-top:9px;padding:8px 10px;
+  border-radius:var(--r);background:var(--s3)}
+.genwhere .ok{font-size:11px;font-weight:500;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--ok)}
+.genwhere .mono{font-size:12px;color:var(--ink1);word-break:break-all}
+.genwhere .hint{font-size:11.5px;color:var(--ink3)}
+.tag{font-size:10.5px;font-weight:500;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3)}
+.tag.e{color:var(--err)}.tag.w{color:var(--warn)}.tag.a{color:var(--live)}
+.mini{height:28px;padding:0 12px;border-radius:var(--r);background:var(--s3);
+  font-size:12.5px;color:var(--ink1)}
+.mini:hover{background:var(--s4)}
+/* The one destructive button in the interface. It is tinted rather than filled
+   so that it stays a button next to Cancel and does not become the thing the
+   eye lands on first - the safe answer is still the default, and Enter is
+   bound to it. Only the confirm dialog uses this. */
+.mini.danger{color:var(--err);background:rgba(217,112,95,.12)}
+.mini.danger:hover{background:rgba(217,112,95,.22);color:#E88A79}
+.note{color:var(--ink3);font-size:13px;line-height:1.65}
+.note code{font-family:var(--mono);font-size:12.5px;color:#93B4DD;background:var(--s2);
+  padding:2px 5px;border-radius:4px}
+.field{width:100%;margin:9px 0;height:28px;padding:0 9px;background:var(--s0);border:0;
+  border-radius:var(--r);font-family:var(--mono);font-size:12.5px;outline:none}
+.sym{height:28px;display:flex;align-items:center;gap:9px;padding:0 9px;border-radius:var(--r);
+  font-family:var(--mono);font-size:13px;color:var(--ink2);cursor:pointer}
+.sym:hover{background:var(--s3);color:var(--ink1)}
+.sym.on{background:var(--s3);color:var(--ink1)}
+
+/* Three columns, so the git state sits in the actual middle.
+   `minmax(0,1fr) auto minmax(0,1fr)` rather than a flex row with a `flex:1`
+   filler: with flex, "the middle" is wherever the left side happens to end, and
+   the left side carries the file name and the status message while the right
+   carries four things - so it drifts. Same measurement as the search box in the
+   intent bar, same fix. */
+.status{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);
+  align-items:center;gap:14px;padding:0 14px;background:var(--s1);
+  border-top:1px solid var(--hair);font-size:12px;color:var(--ink3)}
+.status .stleft,.status .stright{display:flex;align-items:center;gap:14px;min-width:0;
+  overflow:hidden;white-space:nowrap}
+.status .stright{justify-self:end}
+.status .stmid{display:flex;align-items:center;gap:8px;white-space:nowrap}
+.status .mono{font-size:12px}
+.status .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.status .bad{color:var(--err)}.status .live{color:var(--live)}
+.status .btn{cursor:pointer}
+.status .btn:hover{color:var(--ink2)}
+/* The git state is a button, not a label: it is the summary of a tree, and the
+   tree itself is the Project panel. */
+.status .gitmid{display:flex;align-items:center;gap:6px;font-family:var(--mono);
+  font-size:12px;color:var(--ink3);cursor:pointer;padding:0 6px;border-radius:var(--r);
+  height:20px}
+.status .gitmid:hover{background:var(--s3);color:var(--ink1)}
+.status .gitmid.dirty{color:var(--warn)}
+.status .gitmid svg{flex:none}
+.status .gitmid i{font-style:normal;color:var(--warn);font-size:11px}
+
+.drawer{position:absolute;left:0;right:0;bottom:0;height:0;background:#08080A;
+  border-top:1px solid var(--hair2);overflow:hidden;transition:height .14s ease;z-index:8}
+.drawer.open{height:260px}
+.drawer .dh{display:flex;align-items:center;gap:10px;height:36px;padding:0 14px;
+  border-bottom:1px solid var(--hair);background:var(--s1)}
+.drawer .dh b{font-weight:500;font-size:13px}
+.drawer pre{margin:0;padding:12px 14px;font-family:var(--mono);font-size:13px;
+  line-height:1.55;white-space:pre-wrap;height:calc(100% - 36px);overflow:auto;color:#C9C9D2}
+.drawer .e{color:#E0948A}.drawer .g{color:#93C79A}.drawer .b{color:#8FB3E8}
+
+.overlay{position:fixed;inset:0;background:rgba(4,4,6,.55);z-index:30;
+  display:flex;justify-content:center;padding-top:13vh}
+.palette{width:min(660px,92vw);height:fit-content;background:var(--s4);border-radius:var(--r2);
+  overflow:hidden}
+.palette input{width:100%;height:46px;padding:0 16px;background:none;border:0;
+  border-bottom:1px solid var(--hair);outline:none;font-size:14px}
+.palette .pl{max-height:360px;overflow:auto;padding:5px}
+.pitem{display:flex;align-items:center;gap:12px;height:32px;padding:0 11px;
+  border-radius:var(--r);cursor:pointer}
+.pitem .nm{flex:1;font-family:var(--mono);font-size:13px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.pitem .hint{color:var(--ink3);font-size:11.5px}
+.pitem.sel{background:var(--s3)}
+.pempty{padding:18px 16px;color:var(--ink3);font-size:13px}
+
+/* ---------------------------------------------------------------- polish */
+
+/* A custom resize cursor, drawn to match the interface instead of using the
+   platform's double arrow. Two chevrons and a hairline, with a dark outline so
+   it stays visible over the light code surface as well as the dark chrome.
+   `col-resize` is kept as the fallback after the comma. */
+.resize{width:5px;cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cg fill='none' stroke='%23000' stroke-width='3.4' stroke-linecap='round' stroke-linejoin='round' opacity='.45'%3E%3Cpath d='M12 5v14'/%3E%3Cpath d='M8.6 9.4L6 12l2.6 2.6'/%3E%3Cpath d='M15.4 9.4L18 12l-2.6 2.6'/%3E%3C/g%3E%3Cg fill='none' stroke='%23E9E9EE' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 5v14'/%3E%3Cpath d='M8.6 9.4L6 12l2.6 2.6'/%3E%3Cpath d='M15.4 9.4L18 12l-2.6 2.6'/%3E%3C/g%3E%3C/svg%3E") 12 12, col-resize;
+  background:transparent;flex:none;position:relative;z-index:3;touch-action:none}
+.resize:hover,.resize:active{background:linear-gradient(90deg,transparent,rgba(125,211,192,.20),transparent)}
+/* the panel's divider sits on the other side, so the grab area is too */
+.resize.left{margin-left:-2px}
+
+/* Problem underlines, positioned on their own layer rather than by rewriting
+   the highlighted markup - slicing HTML at a span boundary is how you corrupt
+   it. The wavy edge is a repeating gradient, which costs nothing and reads as
+   an error without needing an image.
+   Positioned exactly like the ghost layer, because both are placed from
+   line/column arithmetic and must agree with the text to the pixel. */
+.squig{position:absolute;top:0;left:var(--gut);pointer-events:none;z-index:2}
+.squig i{position:absolute;height:2px;display:block;
+  background-image:repeating-linear-gradient(90deg,var(--err) 0 3px,transparent 3px 5px)}
+.squig i.w{background-image:repeating-linear-gradient(90deg,var(--warn) 0 3px,transparent 3px 5px)}
+
+/* Hover help. Blurred, so it reads as floating above the code rather than as
+   another box in the document. */
+.tip{position:absolute;top:0;left:var(--gut);display:none;z-index:6;max-width:460px;
+  background:rgba(38,38,46,.86);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border-radius:var(--r2);padding:9px 11px;pointer-events:none;
+  box-shadow:0 12px 32px rgba(0,0,0,.5)}
+.tip .trow{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+.tip .tkind{font-size:10.5px;font-weight:500;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--live)}
+.tip b{font-weight:500;font-size:13px;font-family:var(--mono)}
+.tip pre{margin:0;font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--ink2);
+  white-space:pre-wrap;word-break:break-word}
+
+/* Project tab: a bar per language, which says more at a glance than ten numbers */
+.langrow{display:flex;align-items:center;gap:9px;height:24px}
+.langrow .mono{font-size:12px;color:var(--ink2);min-width:52px}
+.langrow .bar{flex:1;height:4px;background:var(--s3);border-radius:3px;overflow:hidden}
+.langrow .bar i{display:block;height:100%;background:var(--live);opacity:.75;border-radius:3px}
+.langrow .tag{min-width:26px;text-align:right}
+.setnote{margin-top:10px;font-size:12px;line-height:1.6;color:var(--ink3)}
+
+/* Settings -> View: the panel's tabs, their order and whether they are drawn.
+   A list rather than a drag surface, because a settings screen is where you go
+   to fix something precisely, and dragging a row in a 620px dialog to move it one
+   place is worse than clicking an arrow. */
+.tablist{margin-top:12px;border-top:1px solid var(--hair)}
+.tabrow{display:flex;align-items:center;gap:8px;height:36px;border-bottom:1px solid var(--hair)}
+.tabrow .nm{flex:1;font-size:13px}
+.tabrow .mini{height:24px;padding:0 9px;font-size:11.5px;background:var(--s3)}
+.tabrow .mini:disabled{opacity:.35;cursor:default}
+.tabrow .mini:disabled:hover{background:var(--s3)}
+.tabrow .sw{width:30px;height:17px;border-radius:9px}
+.tabrow .sw i{width:13px;height:13px}
+.tabrow .sw.on i{transform:translateX(13px)}
+.dirin{width:min(260px,42vw);height:28px;padding:0 8px;background:var(--s0);border:0;
+  border-radius:var(--r);font-family:var(--mono);font-size:12px;outline:none;color:var(--ink1)}
+
+/* The AI status is one dot with a tooltip. It used to spell out "ai off" in the
+   most valuable strip of the window, which is a sentence about a feature nobody
+   asked about. */
+.aistat{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;
+  justify-content:center;background:none;border:0;cursor:pointer}
+.aistat:hover{background:var(--s3)}
+.aistat .led{width:7px;height:7px;border-radius:50%;background:#3A3A42;display:block}
+.aistat.on .led{background:var(--ok);box-shadow:0 0 0 3px rgba(127,176,105,.16)}
+.aimenu{position:absolute;top:38px;right:96px;width:190px}
+.iconbtn.off{color:#56565F}
+.mini.on{background:var(--s4);color:var(--live)}
+.browser .d.file span:last-child{color:var(--ink2)}
+.browser .d.file:hover span:last-child{color:var(--ink1)}
+
+/* Softer edges. The interface read as a wireframe because every region was a
+   1px outlined rectangle; depth now comes from luminance and a little blur, and
+    the outlines are gone. */
+.overlay{backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+.dialog,.browser,.palette,.menu,.newmenu,.tip{
+  box-shadow:0 18px 48px rgba(0,0,0,.55),0 2px 0 rgba(255,255,255,.03) inset}
+.card{box-shadow:none}
+.drawer{box-shadow:0 -14px 34px rgba(0,0,0,.4)}
+
+/* ------------------------------------------------------- keyboard and motion */
+
+/* Nearly everything here is a div or a button with the platform appearance
+   removed, so the browser's default focus ring either does not show or draws an
+   un-radiused rectangle around a 6px-cornered control. One ring, one colour,
+   and `:focus-visible` so clicking with the mouse never draws it. */
+:focus-visible{outline:none;box-shadow:var(--focus)}
+.search:focus-within,.filter:focus,.field:focus,.pinput:focus{outline:none}
+
+/* The status lights. An "off" LED was #3A3A42 on #101014 - 1.74:1, a light
+   nobody can see, which is not a status light. */
+.led,.aistat .led{background:#4E4E58}
+
+/* Motion is a preference, not something the interface gets to impose. Nothing
+   here loops any more - the run sweep is gone - so this only has to collapse
+   the single-shot transitions, which is what it always did for everything
+   except that one bar. */
+@media (prefers-reduced-motion:reduce){
+  *{animation-duration:.001ms !important;animation-iteration-count:1 !important;
+    transition-duration:.001ms !important}
+}
+
+/* The drawer shows the compiler's own words, so it keeps its own colours - but
+   it lines up on the same 4-column tab grid as the editor. */
+.drawer pre{tab-size:4}
+
+/* A long path in the status bar is more useful truncated at the front than at
+   the back: the filename is what identifies it, the drive letter is not. */
+.status .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ------------------------------------------------- a failure you can read */
+
+/* Three guards against a window with nothing in it, because there are three ways
+   to end up with one. `#bootfail` is up from the first byte of the document and
+   is removed only once the interface's own script has run to the end, so a page
+   whose scripts never executed says so. `.crash` is the same for a throw inside
+   React, which unmounts the whole tree. `.fault` carries the failures that
+   unmount nothing and are therefore invisible - a throw inside a timer, a
+   promise, an event handler - which is how a dead feature can hide for days. */
+#bootfail{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  background:var(--s1);z-index:99;padding:40px}
+#bootfail > div{max-width:460px;text-align:left}
+#bootfail h2{margin:0 0 6px;font-size:14px;font-weight:500}
+#bootfail p{margin:0 0 14px;font-size:13px;color:var(--ink3);line-height:1.65}
+#bootfail code{font-family:var(--mono);font-size:12.5px;color:#93B4DD;background:var(--s2);
+  padding:2px 5px;border-radius:4px}
+#bootfail button{height:28px;padding:0 12px;border-radius:var(--r);background:var(--s3);
+  font-size:12.5px;color:var(--ink1)}
+.crash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  background:var(--s1);z-index:98;padding:40px;overflow:auto}
+.crashbox{width:min(680px,100%)}
+.crash h2{margin:0 0 6px;font-size:15px;font-weight:500}
+.crash p{margin:0 0 14px;font-size:13px;color:var(--ink3);line-height:1.65}
+.crash pre{margin:0 0 14px;padding:11px;border-radius:var(--r);background:var(--s0);
+  font-family:var(--mono);font-size:12px;line-height:1.6;color:#E0948A;
+  white-space:pre-wrap;word-break:break-word;max-height:46vh;overflow:auto}
+.crashrow{display:flex;gap:8px}
+.faults{position:fixed;right:14px;bottom:36px;z-index:97;display:flex;flex-direction:column;
+  gap:6px;max-width:min(520px,60vw)}
+.fault{padding:7px 10px;border-radius:var(--r);background:rgba(217,112,95,.16);
+  border:1px solid rgba(217,112,95,.32);color:#E7B3A8;font-family:var(--mono);
+  font-size:11.5px;line-height:1.5;cursor:pointer;word-break:break-word}
+</style>
+</head>
+<body>
+<!-- Up from the first byte until the interface's own script finishes, and removed
+     by that script. A page whose scripts never ran is otherwise a window with
+     nothing in it, which is the least useful failure a program can have. -->
+<div id="bootfail">
+  <div>
+    <h2>The interface did not start</h2>
+    <p>The page loaded, but its own scripts did not run to the end, so there is
+       nothing to draw. Reload once. If it keeps happening the interface file is
+       probably stale or truncated - rebuild it with
+       <code>node scripts/build-ui.mjs</code>.</p>
+    <button onclick="location.reload()">reload</button>
+  </div>
+</div>
+<div id="faults" class="faults"></div>
+<div id="root"></div>
+<script src="/vendor/react.production.min.js"></script>
+<script src="/vendor/react-dom.production.min.js"></script>
+<script src="/vendor/htm.umd.js"></script>
+<script src="/vendor/textcore.js"></script>
+<script src="/ui/tauri-bridge.js"></script>
+<script src="/ui/app.js"></script>
+</body>
+</html>

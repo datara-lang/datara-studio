@@ -1,0 +1,13 @@
+[package]
+name = "datara_studio"
+version = "0.1.0"
+edition = "2026"
+entry = "src/main.dtr"
+description = "Datara Studio - a compiler-native IDE for Datara"
+
+[target]
+bin_name = "datara-studio"
+
+[profiles.release]
+opt_level = "3"
+lto = true

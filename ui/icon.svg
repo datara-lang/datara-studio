@@ -1,0 +1,9 @@
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>Datara Studio</title>
+  <desc>A node held between two brackets: a thing located inside structure.</desc>
+  <rect width="64" height="64" rx="15" fill="#0F0F12"/>
+  <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="14.25" fill="none" stroke="#2A2A32" stroke-width="1.5"/>
+  <path d="M23.5 17.5 L13.5 32 L23.5 46.5" fill="none" stroke="#E9E9EE" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M40.5 17.5 L50.5 32 L40.5 46.5" fill="none" stroke="#E9E9EE" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="32" cy="32" r="5.5" fill="#7DD3C0"/>
+</svg>
