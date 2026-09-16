@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ryan Harness</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="mark">R</span><span>Ryan Harness</span></div>
+      <span class="badge">kernel UI</span>
+      <span class="spacer"></span>
+      <button class="ghost" id="reset">Reset settings</button>
+    </header>
+    <section class="hero">
+      <p class="eyebrow">HEADLESS IDE KERNEL</p>
+      <h1>A calm base for every host.</h1>
+      <p class="lede">A small, offline-first dashboard for the kernel. No AI, no network, no account, no telemetry.</p>
+      <div class="actions"><button id="selfcheck" class="primary">Run self-check</button><span id="result" class="result">Ready</span></div>
+    </section>
+    <section class="grid">
+      <article class="card status-card"><div class="card-head"><h2>Kernel status</h2><span class="dot"></span></div><dl>
+        <div><dt>ABI</dt><dd id="abi">1</dd></div>
+        <div><dt>Version</dt><dd id="version">0.1.0</dd></div>
+        <div><dt>Network</dt><dd class="ok">disabled</dd></div>
+        <div><dt>AI subsystem</dt><dd class="ok">disabled</dd></div>
+      </dl></article>
+      <article class="card"><div class="card-head"><h2>Editor defaults</h2><span class="muted">local only</span></div>
+        <label class="field">Indent width<select data-setting="indent"><option value="2">2 spaces</option><option value="4">4 spaces</option><option value="8">8 spaces</option></select></label>
+        <label class="toggle"><input type="checkbox" data-setting="lineNumbers" checked><span class="track"></span><span>Line numbers</span></label>
+        <label class="toggle"><input type="checkbox" data-setting="wordWrap"><span class="track"></span><span>Word wrap</span></label>
+      </article>
+      <article class="card"><div class="card-head"><h2>Host adapters</h2><span class="muted">ready</span></div>
+        <div class="adapter"><span class="adapter-icon">CLI</span><span><b>Headless CLI</b><small>runs without a window</small></span><span class="ok">active</span></div>
+        <div class="adapter"><span class="adapter-icon">LSP</span><span><b>Language host</b><small>provider boundary</small></span><span class="ok">ready</span></div>
+        <div class="adapter"><span class="adapter-icon">UI</span><span><b>Visual host</b><small>this lightweight page</small></span><span class="ok">active</span></div>
+      </article>
+    </section>
+    <footer><span>Ryan Harness Core</span><span>MIT OR Apache-2.0</span><span>offline by design</span></footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
