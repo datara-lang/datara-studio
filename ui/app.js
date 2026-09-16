@@ -104,7 +104,7 @@ const Editor = {
   el: null, ta: null, hl: null, gut: null, ghost: null, squig: null, tip: null,
   lines: [], marks: {}, ranges: [], symbols: [], ghostText: "", pendingText: null,
   sel: { line: 1, col: 1 },
-  comp: null, completer: null, lh: 21, cw: 9.1, fontSize: 13.5,
+  comp: null, completer: null, highlighter: coreHighlight, lh: 21, cw: 9.1, fontSize: 13.5,
   onCursor: null, onInput: null, onLex: null, onZoom: null, onHoverAsk: null,
 
   mount(container, handlers) {
@@ -356,7 +356,7 @@ const Editor = {
     }
 
     const t0 = performance.now();
-    const { lines, tokens } = coreHighlight(text);
+    const { lines, tokens } = (this.highlighter || coreHighlight)(text);
     this.lines = lines;
     this.onLex && this.onLex(performance.now() - t0, tokens, text.length);
 
@@ -1171,9 +1171,45 @@ const PLAIN_LANG = {
   symbols: () => [],
   // An honest empty answer. Guessing here would put squiggles in a file this IDE
   // has no business having an opinion about.
+  highlight: plainHighlight,
   check: async () => [],
   complete: () => [],
 };
+
+/** Keep non-Datara files readable without feeding them to the Datara lexer. */
+function plainHighlight(text) {
+  const lines = String(text || "").split("\n");
+  return { lines: lines.map((line) => line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")), tokens: 0 };
+}
+
+function genericSymbols(src) {
+  const out = [];
+  String(src || "").split("\n").forEach((line, i) => {
+    const m = line.match(/^\s*(?:export\s+|pub\s+|async\s+|def\s+|fn\s+|function\s+|class\s+|struct\s+|interface\s+|enum\s+|trait\s+)?(function|def|fn|class|struct|interface|enum|trait)\s+([A-Za-z_$][\w$]*)/);
+    if (m) out.push({ kind: m[1], name: m[2], line: i + 1 });
+  });
+  return out;
+}
+
+function textLang(id, label, extensions, comment, words) {
+  const vocabulary = words || [];
+  return {
+    id, label, extensions, indent: "    ", comment,
+    keywords: vocabulary, types: [], builtins: [], docs: {},
+    symbols: genericSymbols, highlight: plainHighlight,
+    check: async () => [],
+    complete: (word) => vocabulary.filter((x) => x.startsWith(word)).slice(0, 9).map((label) => ({ label, insert: label, hint: "keyword" })),
+  };
+}
+
+/** Safe providers for common files. They offer comment toggling, symbols and
+ * local completions, but never pretend that forgen can diagnose another language.
+ */
+const PYTHON_LANG = textLang("python", "Python", ["py", "pyw"], "#", ["def", "class", "import", "from", "return", "if", "elif", "else", "for", "while", "async", "await", "try", "except", "with", "True", "False", "None"]);
+const JAVASCRIPT_LANG = textLang("javascript", "JavaScript / TypeScript", ["js", "jsx", "mjs", "cjs", "ts", "tsx"], "//", ["const", "let", "var", "function", "class", "return", "import", "export", "from", "if", "else", "for", "while", "async", "await", "true", "false", "null"]);
+const RUST_LANG = textLang("rust", "Rust", ["rs"], "//", ["fn", "let", "mut", "pub", "struct", "enum", "trait", "impl", "use", "mod", "match", "if", "else", "for", "while", "loop", "return", "true", "false"]);
+const C_LIKE_LANG = textLang("c-like", "C / C++ / Java / Go", ["c", "h", "cc", "cpp", "hpp", "java", "go"], "//", ["int", "void", "char", "bool", "class", "struct", "enum", "interface", "fn", "func", "return", "if", "else", "for", "while", "package", "import", "public", "private", "true", "false"]);
+const DATA_LANG = textLang("data", "Data / markup", ["json", "jsonl", "toml", "yaml", "yml", "xml", "html", "htm", "css", "scss", "md", "markdown"], "#", ["true", "false", "null", "name", "version", "import"]);
 
 /** Datara, as forgen defines it.
  *
@@ -1192,6 +1228,7 @@ const DATARA_LANG = {
   builtins: BUILTINS,
   docs: DATARA_DOCS,
   symbols: symbols,
+  highlight: coreHighlight,
   check: async (path, post) => {
     const r = await post("/api/check", path);
     if (!r || !r.ok || !r.result) return [];
@@ -1200,7 +1237,10 @@ const DATARA_LANG = {
   complete: completerFor,
 };
 
-const PROVIDERS = [DATARA_LANG, PLAIN_LANG];
+const PROVIDERS = [
+  DATARA_LANG, PYTHON_LANG, JAVASCRIPT_LANG, RUST_LANG, C_LIKE_LANG, DATA_LANG,
+  PLAIN_LANG,
+];
 
 /** Which language owns this file. */
 function providerFor(path) {
@@ -3301,6 +3341,9 @@ function App() {
     // file is not scanned with a Datara regex
     const lang = providerFor(path);
     langRef.current = lang;
+    // Datara gets the compiler lexer; every other language gets a safe escaped
+    // surface instead of Datara tokens miscolouring strings and comments.
+    Editor.highlighter = lang.highlight || plainHighlight;
     const syms = lang.symbols(r.content);
     setOutline(syms);
     outlineRef.current = syms;

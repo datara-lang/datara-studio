@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Datara Studio",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "lang.datara.studio",
   "build": {
     "frontendDist": "dist"
@@ -14,7 +14,23 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": ["nsis", "deb", "appimage"],
+    "resources": {
+      "../src": "studio/src",
+      "../ui/studio.html": "studio/ui/studio.html",
+      "../assets/datara.ico": "studio/assets/datara.ico"
+    },
+    "fileAssociations": [
+      {
+        "ext": ["dtr"],
+        "mimeType": "text/plain",
+        "role": "Editor",
+        "description": "Datara source file"
+      }
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "A lightweight IDE for Datara",
+    "longDescription": "Datara Studio is a compiler-native, offline-first IDE for Datara.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

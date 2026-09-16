@@ -59,8 +59,16 @@ pub fn st_health( tc: Str) -> Str {
 /// Called exactly once, from `main`, before the accept loop starts.
 pub fn st_toolchain() -> Str {
     mut v = ""
+    let explicit = str_trim(env_get("DATARA_FORGEN"))
+    mut command = "forgen --version"
+    if byte_len(explicit) > 0 {
+        // The desktop shell uses the same variable when forgen is not on PATH.
+        // Quote the full path so an install under "Program Files" works on
+        // Windows; POSIX paths are valid inside the same quoting rule.
+        command = "\"" + explicit + "\" --version"
+    }
     unsafe(justification: "the IDE reports which compiler it is driving") {
-        v = exec("forgen --version")
+        v = exec(command)
     }
     let lines = str_split(st_from_oem(st_strip_ansi(v)), "\n")
     let n = lines.len()
@@ -598,10 +606,18 @@ pub fn st_delete( kind: Str, path: Str) -> Str {
     }
 
     mut res = ""
-    if is_dir {
-        res = st_sh("(rd /s /q \"" + st_back_path(target) + "\") 2>&1")
+    if st_is_windows() {
+        if is_dir {
+            res = st_sh("(rd /s /q \"" + st_back_path(target) + "\") 2>&1")
+        } else {
+            res = st_sh("(del /f /q \"" + st_back_path(target) + "\") 2>&1")
+        }
     } else {
-        res = st_sh("(del /f /q \"" + st_back_path(target) + "\") 2>&1")
+        if is_dir {
+            res = st_sh("(rm -rf -- \"" + target + "\") 2>&1")
+        } else {
+            res = st_sh("(rm -f -- \"" + target + "\") 2>&1")
+        }
     }
 
     if !st_dir_exists(target) && !st_file_exists(target) {
@@ -652,11 +668,18 @@ pub fn st_ai_start( dir: Str) -> Str {
         return "{\"ok\":true,\"already\":true,\"dir\":\"" + st_json_escape(where_) + "\"}"
     }
 
-    let inner = "cmd /c cd /d \"" + st_back_path(where_)
-              + "\" && python python\\forgen_ai\\ide_daemon.py --port 7890"
     mut res = ""
-    unsafe(justification: "the IDE starts its own optional companion process") {
-        res = exec("wscript //nologo //B \"scripts\\hidden.vbs\" \"" + inner + "\"")
+    if st_is_windows() {
+        let inner = "cmd /c cd /d \"" + st_back_path(where_)
+                  + "\" && python python\\forgen_ai\\ide_daemon.py --port 7890"
+        unsafe(justification: "the IDE starts its own optional companion process") {
+            res = exec("wscript //nologo //B \"scripts\\hidden.vbs\" \"" + inner + "\"")
+        }
+    } else {
+        let inner = "cd \"" + where_ + "\" && (python3 python/forgen_ai/ide_daemon.py --port 7890 >/dev/null 2>&1 & )"
+        unsafe(justification: "the IDE starts its own optional companion process") {
+            res = exec(inner)
+        }
     }
     return "{\"ok\":true,\"started\":true,\"dir\":\"" + st_json_escape(where_) + "\"}"
 }

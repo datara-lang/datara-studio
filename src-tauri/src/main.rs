@@ -58,26 +58,21 @@ struct ServerState {
     stopped: Arc<AtomicBool>,
 }
 
-/// Locate the studio directory: next to the executable when packaged, or
-/// somewhere above it when run from the repository.
+/// Locate the studio data directory in both repository and packaged layouts.
 ///
-/// **Why this walks up instead of checking two known parents.** The release
-/// binary lives at `src-tauri/target/release/datara-studio.exe`, which is
-/// *three* levels below the project root, not two. The first version checked
-/// only `dir`, `dir/..` and `dir/../..`, so it found nothing and fell back to
-/// the working directory - which meant the shell worked when launched from
-/// `start-tauri.cmd` (that script `cd`s to the project root first, and `start`
-/// inherits it) and failed from Explorer, a shortcut or the taskbar, where the
-/// working directory is the folder the exe sits in. The symptom was the least
-/// helpful one available: a window that opens, waits, and then shows "no server
-/// answered", with the real cause two directories away.
-///
-/// Walking up a bounded number of levels covers both layouts and cannot loop.
+/// A packaged Tauri app does not run beside the repository. Its resources live
+/// below the executable in `resources/studio`, while a development binary lives
+/// below `src-tauri/target/...` and must walk up to the project root. Explorer,
+/// a desktop shortcut and a terminal therefore all take the same path.
 fn studio_dir() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            let packaged = dir.join("resources").join("studio");
+            if packaged.join("src").join("main.dtr").exists() {
+                return packaged;
+            }
             let mut candidate = dir.to_path_buf();
-            for _ in 0..6 {
+            for _ in 0..8 {
                 if candidate.join("src").join("main.dtr").exists() {
                     return candidate;
                 }
@@ -90,18 +85,31 @@ fn studio_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// `forgen` from PATH, falling back to the default install location.
+/// `forgen` from PATH, then the conventional install locations for each OS.
 ///
-/// A packaged app inherits a different environment than a shell does, and
-/// "forgen is not on PATH" is the single most likely reason the server will not
-/// start - so it is worth looking where the installer puts it.
+/// Do not assume Windows' `LOCALAPPDATA`: a Linux desktop launch has no shell
+/// profile and commonly installs a user binary in `$HOME/.local/bin`.
 fn forgen() -> Command {
+    if let Ok(explicit) = std::env::var("DATARA_FORGEN") {
+        let p = PathBuf::from(explicit);
+        if p.exists() {
+            return Command::new(p);
+        }
+    }
     if which("forgen") {
         return Command::new("forgen");
     }
-    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    if !local.is_empty() {
-        let candidate = PathBuf::from(&local).join("Programs").join("Datara").join("bin").join("forgen.exe");
+    let mut candidates = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join("Programs").join("Datara").join("bin").join("forgen.exe"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(home).join(".local").join("bin").join("forgen"));
+        candidates.push(PathBuf::from(home).join(".datara").join("bin").join("forgen"));
+    }
+    candidates.push(PathBuf::from("/usr/local/bin/forgen"));
+    candidates.push(PathBuf::from("/usr/bin/forgen"));
+    for candidate in candidates {
         if candidate.exists() {
             return Command::new(candidate);
         }
@@ -110,10 +118,20 @@ fn forgen() -> Command {
 }
 
 fn which(name: &str) -> bool {
-    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT".into());
-    for dir in std::env::split_paths(&std::env::var("PATH").unwrap_or_default()) {
-        for ext in exts.split(';').filter(|e| !e.is_empty()) {
-            if dir.join(format!("{}{}", name, ext.to_lowercase())).exists() {
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        #[cfg(windows)]
+        {
+            let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT".into());
+            for ext in exts.split(';').filter(|e| !e.is_empty()) {
+                if dir.join(format!("{}{}", name, ext.to_lowercase())).exists() {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if dir.join(name).is_file() {
                 return true;
             }
         }

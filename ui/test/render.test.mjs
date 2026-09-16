@@ -428,6 +428,22 @@ console.log("\ncompletion is local-first, so it never waits on the network");
   check("no duplicate keywords", new Set(Studio.KEYWORDS).size, Studio.KEYWORDS.length);
 }
 
+console.log("\nother languages are detected without Datara diagnostics");
+{
+  check(".dtr selects Datara", Studio.providerFor("src/main.dtr").id, "datara");
+  check(".py selects Python", Studio.providerFor("tools/build.py").id, "python");
+  check(".ts selects TypeScript", Studio.providerFor("ui/app.ts").id, "javascript");
+  check(".rs selects Rust", Studio.providerFor("src/lib.rs").id, "rust");
+  check(".json selects data", Studio.providerFor("package.json").id, "data");
+  check("unknown files stay plain", Studio.providerFor("notes.xyz").id, "plain");
+  check("Python uses hash comments", Studio.providerFor("a.py").comment, "#");
+  check("Rust uses slash comments", Studio.providerFor("a.rs").comment, "//");
+  check("non-Datara files have no compiler check", await Studio.providerFor("a.py").check("a.py", () => {
+    throw new Error("plain provider called the compiler");
+  }), []);
+  check("non-Datara highlighting escapes source", Studio.providerFor("a.py").highlight("<x>").lines, ["&lt;x&gt;"]);
+}
+
 console.log("\nevery language gets its own glyph");
 {
   // .dtr carries the project's own artwork rather than a glyph drawn from
@@ -469,12 +485,14 @@ console.log("\nthe language provider seam");
   }
 
   check("a .dtr file belongs to Datara", Studio.providerFor("src/main.dtr").id, "datara");
-  check("a .py file does not", Studio.providerFor("daemon.py").id, "plain");
-  check("a .rs file does not", Studio.providerFor("lib.rs").id, "plain");
+  check("a .py file selects Python", Studio.providerFor("daemon.py").id, "python");
+  check("a .rs file selects Rust", Studio.providerFor("lib.rs").id, "rust");
   check("a file with no extension does not", Studio.providerFor("Makefile").id, "plain");
   check("a path is judged by its basename", Studio.providerFor("D:/a/b/c.dtr").id, "datara");
   check("nothing open still resolves", Studio.providerFor("").id, "plain");
-  check("only Datara claims an extension", Studio.DATARA_LANG.extensions, ["dtr"]);
+  check("Datara claims only dtr", Studio.DATARA_LANG.extensions, ["dtr"]);
+  check("Python claims py", Studio.providerFor("x.py").extensions.includes("py"), true);
+  check("Rust claims rs", Studio.providerFor("x.rs").extensions.includes("rs"), true);
   check("the plain provider claims none", Studio.PLAIN_LANG.extensions, []);
 
   // the plain provider must offer nothing rather than something wrong

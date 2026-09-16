@@ -48,6 +48,17 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo   building the self-contained interface ...
+node scripts\build-ui.mjs
+if errorlevel 1 exit /b 1
+node scripts\build-icons.mjs
+if errorlevel 1 exit /b 1
+
+if not exist "src-tauri\dist\index.html" (
+  echo   src-tauri\dist\index.html is missing.
+  exit /b 1
+)
+
 echo   building the desktop shell ...
 REM bash -lc so the exported MSVC environment survives into cargo
 bash -lc "source scripts/msvc-env.sh >/dev/null && cargo build --release --manifest-path src-tauri/Cargo.toml"

@@ -51,10 +51,13 @@ if not exist "ui\studio.html" (
   )
 )
 
-REM the AI companion lives in the sibling project and is entirely optional
-if exist "..\..\python\forgen_ai\ide_daemon.py" (
+REM The AI companion is optional. Set FORGEN_AI_DIR when it lives outside the
+REM repository; the old hard-coded ..\..\python path broke as soon as the
+REM workspace moved from D:\ryan to D:\IDE datara.
+if "%FORGEN_AI_DIR%"=="" set "FORGEN_AI_DIR=%~dp0..\..\python"
+if exist "%FORGEN_AI_DIR%\forgen_ai\ide_daemon.py" (
   echo   starting AI companion on 127.0.0.1:%AIPORT% ...
-  call :hide "cmd /c cd /d ..\.. && python python\forgen_ai\ide_daemon.py --port %AIPORT%"
+  call :hide "cmd /c cd /d "%FORGEN_AI_DIR%\.." && python python\forgen_ai\ide_daemon.py --port %AIPORT%"
 ) else (
   echo   AI companion not found - the IDE runs without suggestions.
 )
