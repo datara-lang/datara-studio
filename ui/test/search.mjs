@@ -76,6 +76,23 @@ writeFileSync(join(ws, "stock.dtr"),
   + "    return 0\n"
   + "}\n");
 
+// Filler in other languages, none of it containing "store".
+//
+// Two files and one language make a Project panel of ~430px, which never
+// overflows the column - so the scroll-into-view check at the bottom of this
+// file had nothing to prove. A real workspace shows several languages and a
+// taller breakdown; these put the References card at ~276px into the content
+// instead of ~180px, which is enough to push it past the fold at the height the
+// check uses. They are also what makes the counts below meaningful: if any of
+// them contained "store", the 2-vs-5 split would move.
+writeFileSync(join(ws, "README.md"), "# a fixture\n\nnothing to see here.\n");
+writeFileSync(join(ws, "notes.txt"), "plain notes.\n");
+writeFileSync(join(ws, "package.json"), "{ \"name\": \"fixture\" }\n");
+mkdirSync(join(ws, "tools"), { recursive: true });
+writeFileSync(join(ws, "tools", "build.py"), "print('build')\n");
+mkdirSync(join(ws, "docs"), { recursive: true });
+writeFileSync(join(ws, "docs", "guide.md"), "# guide\n\nmore prose.\n");
+
 const wsPosix = ws.replace(/\\/g, "/");
 console.log("scratch workspace: " + wsPosix);
 
@@ -205,6 +222,91 @@ await page.keyboard.press("Home");
 for (let i = 0; i < 9; i++) await page.keyboard.press("ArrowRight");
 await page.waitForTimeout(200);
 
+// ---- the results have to be on screen, not merely computed
+//
+// Ctrl+Shift+F used to scroll nothing. The Project panel is a scrolling column
+// (`.pbody`, `overflow:auto`) and the References card is its last child - under
+// the project summary, the git state and the language breakdown - so on a real
+// workspace the shortcut moved the status bar to "13 place(s) in the workspace"
+// and left every answer below the fold. That reads exactly like a shortcut that
+// does nothing, which is the one failure mode a keyboard-only feature cannot
+// afford.
+//
+// The viewport is shrunk here to force the overflow: at the normal 940px the
+// whole column fits and the card is on screen whatever the shortcut does. 340px
+// puts the panel's visible height at ~224px against ~522px of content. The first
+// check is the guard that the second is not vacuous - if the card happened to be
+// on screen anyway, the scroll assertion would pass without the feature.
+await page.setViewportSize({ width: 1500, height: 340 });
+await page.waitForTimeout(300);
+await page.evaluate(() => { const b = document.querySelector(".pbody"); if (b) b.scrollTop = 0; });
+await page.waitForTimeout(150);
+
+const rects = () => page.evaluate(() => {
+  const b = document.querySelector(".pbody");
+  const c = document.getElementById("refcard");
+  if (!b || !c) return null;
+  const br = b.getBoundingClientRect(), cr = c.getBoundingClientRect();
+  return { bodyTop: br.top, bodyBottom: br.bottom, cardTop: cr.top, scrollTop: b.scrollTop };
+});
+
+const before = await rects();
+check("the References card starts below the fold at this height",
+  !!before && before.cardTop > before.bodyBottom,
+  before ? "card top " + before.cardTop.toFixed(1) + " vs panel bottom " + before.bodyBottom.toFixed(1) : "no card");
+
+await page.keyboard.press("Control+Shift+F");
+await page.waitForTimeout(900);
+
+const after = await rects();
+check("Ctrl+Shift+F scrolls the results into view",
+  !!after && after.scrollTop > 0
+    && after.cardTop >= after.bodyTop - 1 && after.cardTop <= after.bodyBottom + 1,
+  after ? "scrollTop " + after.scrollTop + ", card top " + after.cardTop.toFixed(1)
+    + " in [" + after.bodyTop.toFixed(1) + ", " + after.bodyBottom.toFixed(1) + "]" : "no card");
+
+// Run it, and the card has to end up at the *top* of the column.
+//
+// The card is not the result - it is the header of the result. Each hit is its
+// own card rendered after it, so a scroll that leaves the References card at the
+// bottom edge leaves every hit below the fold: the box and the count visible,
+// the lines they are counting not. That is what `block: "nearest"` did here -
+// measured, the card landed at y=143 in a panel ending at 312 and the first hit
+// at y=267, off screen. The checks below are the two halves of the fix: the card
+// goes to the top, and the first hit is then actually on screen.
+await page.keyboard.press("Enter");
+await page.waitForTimeout(1600);
+
+const landed = await rects();
+check("the results land at the top of the column, not the bottom edge",
+  !!landed && landed.cardTop >= landed.bodyTop - 1 && landed.cardTop <= landed.bodyTop + 2,
+  landed ? "card top " + landed.cardTop.toFixed(1) + " vs panel top " + landed.bodyTop.toFixed(1) : "no card");
+check("the box is still on screen after the scroll",
+  await page.evaluate(() => {
+    const b = document.querySelector(".pbody"), i = document.getElementById("psearch");
+    if (!b || !i) return false;
+    const br = b.getBoundingClientRect(), ir = i.getBoundingClientRect();
+    return ir.top >= br.top - 1 && ir.bottom <= br.bottom + 1;
+  }));
+// The hits are not inside the References card, so the count being on screen says
+// nothing about whether any result is. This checks the first hit card itself,
+// which is the thing the user was looking for.
+const firstHit = await page.evaluate(() => {
+  const b = document.querySelector(".pbody");
+  const cards = [...document.querySelectorAll(".pbody > .card")];
+  const hit = cards[cards.indexOf(document.getElementById("refcard")) + 1];
+  if (!b || !hit) return null;
+  const br = b.getBoundingClientRect(), hr = hit.getBoundingClientRect();
+  return { text: hit.innerText.replace(/\s+/g, " ").slice(0, 60), top: hr.top,
+           visible: hr.top < br.bottom && hr.bottom > br.top };
+});
+check("the first hit is on screen, not just the count",
+  !!firstHit && firstHit.visible && /let store = 7/.test(firstHit.text),
+  firstHit ? JSON.stringify(firstHit.text) + " at y " + firstHit.top.toFixed(1) : "no hit card");
+
+await page.setViewportSize({ width: 1500, height: 940 });
+await page.waitForTimeout(300);
+
 // Fold the panel first, so that the shortcut has to undo it. Asking to search
 // and getting nothing because the column is folded is the failure this guards.
 await page.locator('.intent button[title="Show or hide the right panel"]').click();
@@ -230,6 +332,38 @@ await page.waitForTimeout(1500);
 const cardText3 = await page.locator(".card", { has: page.locator("#psearch") }).innerText();
 check("Enter in the box runs the search", /place\(s\) in the workspace/.test(cardText3),
   JSON.stringify(cardText3.replace(/\s+/g, " ").slice(0, 160)));
+
+// ---- Alt+F7 has to survive a folded panel too
+//
+// It had the same hole Ctrl+Shift+F had, and it was the older of the two
+// gestures: `findRefs` searched, set the tab to Project, and displayed nothing
+// at all when the column happened to be folded - a search that had run with no
+// way to tell. It goes through `revealProjectPanel` now.
+await page.locator('.intent button[title="Show or hide the right panel"]').click();
+await page.waitForTimeout(400);
+check("the panel is folded before Alt+F7",
+  await page.locator("#psearch").count() === 0);
+
+await page.locator(".code").click();
+await page.keyboard.press("Control+Home");
+await page.keyboard.press("ArrowDown");
+await page.keyboard.press("Home");
+for (let i = 0; i < 9; i++) await page.keyboard.press("ArrowRight");
+await page.waitForTimeout(200);
+await page.keyboard.press("Alt+F7");
+await page.waitForTimeout(1600);
+
+check("Alt+F7 unfolds the panel and shows the box",
+  await page.locator("#psearch").count() === 1);
+const altBox = await page.locator("#psearch").inputValue().catch(() => "");
+check("Alt+F7 leaves the searched name in the box", altBox === "store", JSON.stringify(altBox));
+const altStatus2 = await page.locator(".status").innerText();
+check("Alt+F7 reports the hits it found", /matching store/.test(altStatus2),
+  JSON.stringify(altStatus2.replace(/\s+/g, " ").slice(0, 120)));
+const altCard = await page.locator(".card", { has: page.locator("#psearch") }).innerText();
+check("Alt+F7's hits are in the card, not just the status bar",
+  /2 place\(s\) in the workspace/.test(altCard),
+  JSON.stringify(altCard.replace(/\s+/g, " ").slice(0, 160)));
 
 // ---- no page errors from any of it
 check("no page errors", errs.length === 0, errs.slice(0, 3).join(" | "));

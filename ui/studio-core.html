@@ -635,11 +635,17 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
    to the platform because the platform default for a dark-scheme checkbox on
    Windows is the light-theme blue, which is the one colour not in this palette.
    The tick glyph itself is drawn by the browser and cannot be styled, so this is
-   the whole of the control's appearance that is ours to choose. */
-.ck{display:flex;align-items:center;gap:7px;margin-top:9px;cursor:pointer;user-select:none}
-.ck input{flex:none;width:13px;height:13px;margin:0;accent-color:var(--live);cursor:pointer}
-.ck span{font-size:12px;color:var(--ink2)}
-.ck .ckhint{font-size:11.5px;color:var(--ink3)}
+   the whole of the control's appearance that is ours to choose.
+
+   The hint is forced onto its own line rather than left to wrap. In a 264 px
+   panel the label and the hint together do not fit on one row, and wrapping put
+   "whole" and "name only" on separate lines beside a two-line explanation -
+   four ragged fragments where there are two ideas. Measured: the row is 236 px
+   of content and the two strings want about 300. */
+.ck{display:flex;flex-wrap:wrap;align-items:baseline;gap:7px;margin-top:9px;cursor:pointer;user-select:none}
+.ck input{flex:none;align-self:center;width:13px;height:13px;margin:0;accent-color:var(--live);cursor:pointer}
+.ck span{font-size:12px;color:var(--ink2);white-space:nowrap}
+.ck .ckhint{flex-basis:100%;margin-left:20px;font-size:11.5px;color:var(--ink3);white-space:normal}
 .sym{height:28px;display:flex;align-items:center;gap:9px;padding:0 9px;border-radius:var(--r);
   font-family:var(--mono);font-size:13px;color:var(--ink2);cursor:pointer}
 .sym:hover{background:var(--s3);color:var(--ink1)}
@@ -3820,6 +3826,7 @@ const Panel = memo(function Panel({ tab, setTab, order, hidden, onReorder,
                                      fmtBytes,
                                      onStartAI, aiStarting, project, git, refs, refWord, refBusy,
                                      searchQ, onSearchQ, searchFocus, refWhole, onRefWhole, onRunSearch,
+                                     refScroll,
                                      current, onOpen, projDiag, projBusy, projWhere, onCheckProject, onGotoProblem }) {
   const sev = (s) => (s === "warning" ? "w" : "e");
 
@@ -3837,6 +3844,49 @@ const Panel = memo(function Panel({ tab, setTab, order, hidden, onReorder,
     el.focus();
     el.select();
   }, [searchFocus]);
+
+  // Bring the search results into view when a search was started from a
+  // shortcut.
+  //
+  // The panel is a scrolling column (`.pbody`, `overflow:auto`) and the
+  // References card sits under the project summary, the git state and the
+  // language breakdown. Measured on this repo with a real workspace open: 1394px
+  // of content against 824px of panel, card at 1212. So after Ctrl+Shift+F the
+  // only thing on screen was the status bar reading "13 place(s) in the
+  // workspace" - which is exactly what a shortcut that does nothing looks like.
+  //
+  // Focus alone does not fix it. The browser scrolls a focused element into view
+  // minimally, which puts the box at the bottom edge of the panel, and nothing
+  // re-scrolls when the hits arrive.
+  //
+  // The target is the *card*, and it goes to the *top* of the column, because
+  // the card is not the result - it is the header of the result. Each hit is its
+  // own card, rendered after it, so anything that leaves the References card at
+  // the bottom edge leaves every hit below the fold: the box and the count are
+  // visible, the thirteen lines they are counting are not. Aligning the top puts
+  // the query, the mode, the count and as much of the list as the column holds
+  // in one screenful.
+  //
+  // `block: "start"` and not `"nearest"`. With two hits on a 340px panel the
+  // References card is shorter than the panel, so "nearest" resolves to aligning
+  // its *bottom* edge - measured, that put the card at y=143 in a panel ending at
+  // 312 and the first hit at y=267, off screen. "start" puts the card at 88 and
+  // the first hit at 256.
+  //
+  // The first bump, before the hits exist, is clamped: the card is the last
+  // child until the results render, so there is nothing below it to scroll
+  // against and it stops at the maximum scroll. That is why `runProjectSearch`
+  // bumps a second time once the hits are in.
+  //
+  // No `behavior: "smooth"`. The distance is a few hundred pixels in a 264px
+  // column, so the animation buys nothing, and it makes the result unmeasurable
+  // for the second or so it runs - the test that checks the results ended up on
+  // screen would have to sleep and hope.
+  useEffect(() => {
+    if (!refScroll) return;
+    const card = document.getElementById("refcard");
+    if (card) card.scrollIntoView({ block: "start" });
+  }, [refScroll]);
 
   const problems = () => {
     const fromCompiler = diagnostics.filter((d) => d.source === "compiler");
@@ -3950,7 +4000,7 @@ const Panel = memo(function Panel({ tab, setTab, order, hidden, onReorder,
           <span class="tag">${n}</span>
         </div>`)}
       </div>
-      <div class="card">
+      <div class="card" id="refcard">
         <div class="ch"><b>References</b>
           ${refWord ? html`<span class="tag">${refWord}</span>` : null}
           ${refWord ? html`<span class="tag ${refWhole ? "" : "w"}">${refWhole ? "whole name" : "any text"}</span>` : null}</div>
@@ -4917,6 +4967,17 @@ function App() {
   // Whole-name matching. On for "find this variable everywhere" (the Alt+F7
   // case, where a substring answer is noise); off for "find this text".
   const [refWhole, setRefWhole] = useState(true);
+  // Bumped to ask the panel to bring the search results into view. A counter,
+  // like `searchFocus`, because the gesture repeats and an effect keyed on a
+  // boolean would not re-fire.
+  //
+  // Bumped in two places on purpose. `openProjectSearch` and `findRefs` bump on
+  // the way in, so the card is on screen while it still says "searching ...".
+  // `runProjectSearch` bumps again once the hits land, because the first scroll
+  // is clamped - until the results render there is nothing below the card to
+  // scroll against - and without the second one the panel ends up showing the
+  // count and none of the lines it counts.
+  const [refScroll, setRefScroll] = useState(0);
   // layout of the three columns: widths in px, and whether each side is folded
   const [treeW, setTreeW] = useState(() => Number(localStorage.getItem("datara.studio.treeW")) || 232);
   const [panelW, setPanelW] = useState(() => Number(localStorage.getItem("datara.studio.panelW")) || 264);
@@ -5685,13 +5746,51 @@ function App() {
       setStatus("search failed: " + e.message);
     }
     setRefBusy(false);
+    // And again now that the card has grown.
+    //
+    // The bump on the way in cannot finish the job, and the reason is
+    // structural: until the hits render, the References card is the last child
+    // of the panel column, so there is nothing below it to scroll against and
+    // `scrollIntoView` stops at the maximum scroll. Measured on this repo:
+    // content 1394px against an 824px panel, card at 1212 - the scroll stops at
+    // 570 and leaves the card's top edge on the panel's bottom edge, showing the
+    // header, the box and one line of the first hit, with the other twelve below
+    // the fold and nothing to re-scroll them. With the hits in, the content is
+    // 2775px, there is room to move, and the card's top reaches the top of the
+    // panel.
+    setRefScroll((n) => n + 1);
+  }
+
+  /** Unfold the panel column and make sure the Project tab is in it.
+   *
+   *  Asking to search the project and getting nothing at all - because the panel
+   *  column is folded, or because the Project tab was hidden in Settings - is
+   *  indistinguishable from a broken shortcut. Both are reversible one-click
+   *  states, so undoing them is the whole of "show me the results". Shared by
+   *  Ctrl+Shift+F and Alt+F7, which had the same hole: Alt+F7 searched, set the
+   *  tab, and showed nothing at all when the column happened to be folded. */
+  function revealProjectPanel() {
+    setPanelFold(false);
+    setSettings((s) => {
+      if (!(s.panelHidden || []).includes("proj")) return s;
+      const n = { ...s, panelHidden: s.panelHidden.filter((k) => k !== "proj") };
+      applySettings(n);
+      return n;
+    });
+    setTab("proj");
   }
 
   /** Find every use of the word at the caret, across the workspace. */
   async function findRefs() {
     const word = Editor.wordAt(Editor.sel.line, Editor.sel.col);
     if (!word) { setStatus("put the caret on a name first"); return; }
+    revealProjectPanel();
     setSearchQ(word);
+    // Before the await, so the card is already on screen while it says
+    // "searching ..." - the wait is the part where a blank panel is most
+    // confusing. `runProjectSearch` bumps again once the hits land, because this
+    // one clamps: see the note there.
+    setRefScroll((n) => n + 1);
     await runProjectSearch(word, true);
   }
 
@@ -5703,11 +5802,9 @@ function App() {
    *  run and that you can type over is the gesture that survives that. Enter
    *  runs it. Alt+F7 is still the one that searches immediately.
    *
-   *  It does have to make the box *visible* first, though. Asking to search the
-   *  project and getting nothing at all - because the panel column is folded, or
-   *  because the Project tab was hidden in Settings - is indistinguishable from
-   *  a broken shortcut. Both are reversible one-click states, so undoing them is
-   *  the whole of "show me the results". */
+   *  It does have to make the box *visible* first, though: `revealProjectPanel`
+   *  undoes a folded column and an un-hidden Project tab, because a shortcut
+   *  that appears to do nothing is worse than no shortcut. */
   function openProjectSearch() {
     // Prefill from the caret word, but never over what is already typed in the
     // box. The shortcut is registered at window level, so it also fires while
@@ -5718,16 +5815,10 @@ function App() {
     const el = document.getElementById("psearch");
     const inBox = !!el && document.activeElement === el;
     const word = Editor.wordAt(Editor.sel.line, Editor.sel.col);
-    setPanelFold(false);
-    setSettings((s) => {
-      if (!(s.panelHidden || []).includes("proj")) return s;
-      const n = { ...s, panelHidden: s.panelHidden.filter((k) => k !== "proj") };
-      applySettings(n);
-      return n;
-    });
-    setTab("proj");
+    revealProjectPanel();
     if (word && !inBox) setSearchQ(word);
     setSearchFocus((n) => n + 1);
+    setRefScroll((n) => n + 1);
     setStatus(word && !inBox
       ? "searching the project - Enter to run, or edit the name first"
       : "searching the project - type a name or any text");
@@ -6784,6 +6875,7 @@ function App() {
             project=${project} git=${git} refs=${refs} refWord=${refWord} refBusy=${refBusy}
             searchQ=${searchQ} onSearchQ=${setSearchQ} searchFocus=${searchFocus}
             refWhole=${refWhole} onRefWhole=${setRefWhole} onRunSearch=${runProjectSearch}
+            refScroll=${refScroll}
             onStartAI=${() => startAI(false)} aiStarting=${aiStarting}
             projDiag=${projDiag} projBusy=${projBusy} projWhere=${projWhere}
             onCheckProject=${checkProject} onGotoProblem=${gotoProblem} />
