@@ -1,0 +1,174 @@
+#!/usr/bin/env node
+// Checks `scripts/find-companion.mjs` by running it.
+//
+// Why this exists. The companion's location was answered by a hard-coded
+// `../../python` in `start.sh` and again in `start.cmd`, and it was wrong in
+// both - it resolved to `D:\python`, which does not exist, from the day the
+// workspace moved. Nobody noticed, because nothing tested it and the batch copy
+// could not be run at all on a machine whose tooling cannot reach `cmd.exe`. The
+// search now lives in one Node file that both launchers call, and this is the
+// part that makes the difference real: the file is executed, against a fixture
+// tree whose answers are known.
+//
+// The fixture is a copy of the real script rather than a restatement of its
+// rules. A restatement would keep passing after the original changed.
+//
+// Run:  node scripts/verify-companion.mjs
+
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REAL = join(HERE, "find-companion.mjs");
+
+let passed = 0;
+let failed = 0;
+
+function check(name, ok, detail) {
+  if (ok) {
+    passed += 1;
+    process.stdout.write(`  ok   ${name}\n`);
+  } else {
+    failed += 1;
+    process.stdout.write(`  FAIL ${name}\n`);
+    if (detail !== undefined) process.stdout.write(`         ${detail}\n`);
+  }
+}
+
+// A companion is a directory holding `forgen_ai/ide_daemon.py` and nothing else
+// that matters. Creating the marker is the whole fixture.
+function plantCompanion(dir) {
+  mkdirSync(join(dir, "forgen_ai"), { recursive: true });
+  writeFileSync(join(dir, "forgen_ai", "ide_daemon.py"), "# fixture\n");
+}
+
+function run(script, { env = {}, cwd, args = [] } = {}) {
+  const r = spawnSync(process.execPath, [script, ...args], {
+    cwd,
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+  return { code: r.status, out: (r.stdout || "").trim(), err: r.stderr || "" };
+}
+
+// The tree is three levels deep so the sweep has a bounded grandparent to look
+// in. `$ROOT/../..` is `<tmp>/a`, so the sweep is `<tmp>/a/*/python` and never
+// reaches a real drive root - which matters, because the answer there is an
+// accident of ordering rather than a fact about this fixture.
+function makeTree() {
+  const base = mkdtempSync(join(tmpdir(), "ds-companion-"));
+  const root = join(base, "a", "b", "studio");
+  mkdirSync(join(root, "scripts"), { recursive: true });
+  cpSync(REAL, join(root, "scripts", "find-companion.mjs"));
+  return { base, root, script: join(root, "scripts", "find-companion.mjs") };
+}
+
+// `os.homedir()` reads USERPROFILE on Windows and HOME everywhere else, and an
+// unoverridden home could shadow the sweep with a real `~/.datara/python`.
+const fakeHome = (base) => ({ HOME: join(base, "home"), USERPROFILE: join(base, "home") });
+
+process.stdout.write("companion search\n");
+
+// ---- 1. the sweep, and only the sweep -------------------------------------
+{
+  const { base, script } = makeTree();
+  plantCompanion(join(base, "a", "ryan", "python"));
+  const r = run(script, { env: fakeHome(base), args: ["--json"] });
+  const j = JSON.parse(r.out || "{}");
+  check("finds a sibling project's companion when nothing else matches", r.code === 0 && j.dir === `${base.replace(/\\/g, "/")}/a/ryan/python`, `${r.code} ${r.out}`);
+  check("and says it found it by the sweep", j.foundVia === "$ROOT/../../*/python", j.foundVia);
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---- 2. nearer ancestors outrank the sweep --------------------------------
+{
+  const { base, script } = makeTree();
+  plantCompanion(join(base, "a", "ryan", "python"));
+  plantCompanion(join(base, "a", "python"));
+  const r = run(script, { env: fakeHome(base), args: ["--json"] });
+  const j = JSON.parse(r.out || "{}");
+  check("$ROOT/../../python outranks the sweep", j.foundVia === "$ROOT/../../python", j.foundVia);
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---- 3. the nearest ancestor wins ----------------------------------------
+{
+  const { base, script } = makeTree();
+  plantCompanion(join(base, "a", "python"));
+  plantCompanion(join(base, "a", "b", "python"));
+  const r = run(script, { env: fakeHome(base), args: ["--json"] });
+  const j = JSON.parse(r.out || "{}");
+  check("$ROOT/../python outranks $ROOT/../../python", j.foundVia === "$ROOT/../python", j.foundVia);
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---- 4. an explicit setting is obeyed ------------------------------------
+{
+  const { base, script } = makeTree();
+  plantCompanion(join(base, "a", "ryan", "python"));
+  const mine = join(base, "elsewhere", "python");
+  plantCompanion(mine);
+  const r = run(script, { env: { ...fakeHome(base), FORGEN_AI_DIR: mine }, args: ["--json"] });
+  const j = JSON.parse(r.out || "{}");
+  check("FORGEN_AI_DIR wins over every guess", j.foundVia === "FORGEN_AI_DIR" && j.dir === mine.replace(/\\/g, "/"), j.dir);
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---- 5. a wrong setting is skipped, not fatal ----------------------------
+{
+  const { base, script } = makeTree();
+  plantCompanion(join(base, "a", "ryan", "python"));
+  const empty = join(base, "empty");
+  mkdirSync(empty, { recursive: true });
+  const r = run(script, { env: { ...fakeHome(base), FORGEN_AI_DIR: empty }, args: ["--json"] });
+  const j = JSON.parse(r.out || "{}");
+  check("a directory without forgen_ai/ is rejected, and the search continues", r.code === 0 && j.foundVia !== "FORGEN_AI_DIR", `${r.code} ${j.foundVia}`);
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---- 6. nothing found is an empty stdout and a non-zero exit -------------
+{
+  const { base, script } = makeTree();
+  const r = run(script, { env: fakeHome(base) });
+  check("nothing found exits 1 with an empty stdout", r.code === 1 && r.out === "", `code=${r.code} out=${JSON.stringify(r.out)}`);
+  check("and explains itself on stderr, not stdout", r.err.includes("FORGEN_AI_DIR") && r.err.includes("$ROOT/"), JSON.stringify(r.err.slice(0, 80)));
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---- 7. the documented install location, with no other candidate ---------
+{
+  const { base, script } = makeTree();
+  plantCompanion(join(base, "home", ".datara", "python"));
+  const r = run(script, { env: fakeHome(base), args: ["--json"] });
+  const j = JSON.parse(r.out || "{}");
+  check("$HOME/.datara/python is found on its own", j.foundVia === "$HOME/.datara/python", j.foundVia);
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---- 8. the shape the launchers consume ---------------------------------
+{
+  const { base, script } = makeTree();
+  plantCompanion(join(base, "a", "ryan", "python"));
+  const r = run(script, { env: fakeHome(base) });
+  check("stdout is one line and nothing else", r.code === 0 && r.out.split("\n").length === 1, JSON.stringify(r.out));
+  // bash reads `D:\ryan\python` as a single filename containing a colon, and
+  // `cmd`'s `cd /d` takes forward slashes happily. Both consumers need this.
+  check("the path is spelled with forward slashes on every platform", !r.out.includes("\\"), JSON.stringify(r.out));
+  rmSync(base, { recursive: true, force: true });
+}
+
+// ---- 9. the answer does not depend on where it was called from -----------
+{
+  const { base, script } = makeTree();
+  plantCompanion(join(base, "a", "ryan", "python"));
+  const fromRoot = run(script, { env: fakeHome(base), cwd: dirname(script) });
+  const fromElsewhere = run(script, { env: fakeHome(base), cwd: base });
+  check("the same answer from two different working directories", fromRoot.out === fromElsewhere.out && fromRoot.out !== "", `${fromRoot.out} vs ${fromElsewhere.out}`);
+  rmSync(base, { recursive: true, force: true });
+}
+
+process.stdout.write(`\n${passed}/${passed + failed} checks passed\n`);
+process.exit(failed === 0 ? 0 : 1);

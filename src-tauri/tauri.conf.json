@@ -14,7 +14,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "deb", "appimage"],
+    "targets": ["nsis", "deb", "appimage", "app", "dmg"],
     "resources": {
       "../src": "studio/src",
       "../ui/studio.html": "studio/ui/studio.html",

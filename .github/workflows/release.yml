@@ -1,0 +1,180 @@
+name: release
+
+# Build the installers for every platform and attach them to the release.
+#
+# Why this exists. Release v0.3.0 carries exactly one asset,
+# `Datara.Studio_0.3.0_x64-setup.exe`. The bundle config has listed `deb` and
+# `appimage` for a while and there was still no Linux build, because a target
+# list is not a build: nothing ever ran `cargo tauri build` anywhere except one
+# Windows machine. A Linux or macOS user had nothing to download.
+#
+# Two further things were wrong and are fixed here or alongside:
+#
+#   * `bundle.targets` had no macOS entry at all, so even a macOS build would
+#     have produced no installer. It lists `app` and `dmg` now. Targets that do
+#     not apply to the current platform are skipped by the bundler with a
+#     warning - it does not fail - so one list can serve all three.
+#   * The `--bundles` flag is validated against the host platform and rejects
+#     anything else, so each job passes only its own formats. Measured:
+#     `cargo tauri build --bundles nsis,deb,appimage,app,dmg` on Windows exits
+#     with `invalid value 'deb' for '--bundles'`.
+#
+# macOS is built universal (arm64 + x86_64) rather than for the runner's own
+# architecture. A `macos-latest` runner is Apple Silicon, so a default build
+# would produce a dmg that does not open on an Intel Mac - which is exactly the
+# kind of half-a-platform release this workflow is meant to stop.
+#
+# What the installers do NOT contain: forgen. The studio is a compiler-native
+# IDE - the shell starts the Datara server, which compiles `src/main.dtr` - and
+# forgen is a separate product with no public download yet. The installers ship
+# the shell, the studio sources and the built interface, and they need forgen on
+# PATH to run. The README says so; this comment says so because a release page
+# that does not is how a bug report about "it opens a grey window" starts.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing tag to build and attach installers to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            target: ""
+            bundles: nsis
+            # One glob per line: `upload-artifact` takes a newline-separated list,
+            # and a space-separated one is read as a single path that matches
+            # nothing. The shell loop below splits on whitespace either way.
+            assets: |
+              src-tauri/target/release/bundle/nsis/*.exe
+
+          - name: Linux x64
+            os: ubuntu-22.04
+            target: ""
+            bundles: deb,appimage
+            assets: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/appimage/*.AppImage
+
+          - name: macOS universal
+            os: macos-latest
+            target: universal-apple-darwin
+            bundles: app,dmg
+            assets: |
+              src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add both macOS architectures
+        if: matrix.target == 'universal-apple-darwin'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      # Tauri v2 on Linux, from the documented dependency list. Without these the
+      # bundler fails at the point it links the webview, which reads as a Rust
+      # error rather than a missing system package.
+      - name: Install the Linux bundling dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
+            libayatana-appindicator3-dev libxdo-dev libssl-dev libfuse2 \
+            build-essential curl wget file
+
+      # The interface and the icons are build inputs: `ui/studio.html` is a
+      # bundled resource and `assets/datara.ico` is what the file association
+      # uses, and neither is in git.
+      - name: Build the interface and the icons
+        run: node scripts/build-icons.mjs && node scripts/build-ui.mjs && node scripts/build-ui.mjs --core
+
+      - name: Bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--bundles "${{ matrix.bundles }}")
+          if [ -n "${{ matrix.target }}" ]; then
+            args+=(--target "${{ matrix.target }}")
+          fi
+          cargo tauri build "${args[@]}"
+
+      # Collect the installers as an array, not by looping over the globs.
+      #
+      # `for f in $ASSETS` is wrong twice over: the outer expansion globs, so the
+      # loop variable holds the *filename*, and the next unquoted expansion then
+      # splits it - and the Windows installer is called `Datara Studio_0.3.0_...`,
+      # with a space in it. Measured here: that turned one file into two words,
+      # `Datara` and `Studio_0.3.0_x64-setup.exe`, and the step died on a path
+      # that does not exist. `while read` neither word-splits nor globs, so the
+      # pattern survives to the one place it is wanted.
+      - name: List what came out
+        shell: bash
+        env:
+          ASSETS: ${{ matrix.assets }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=()
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            files+=($pattern)
+          done <<< "$ASSETS"
+          for f in "${files[@]}"; do ls -l "$f"; done
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no installer was produced for ${{ matrix.name }}" >&2
+            exit 1
+          fi
+
+      - name: Keep the installers for this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.name }}
+          path: ${{ matrix.assets }}
+          if-no-files-found: error
+
+      # `gh` is on every runner, so the release is created or updated with the
+      # token the workflow already has rather than through another action.
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          ASSETS: ${{ matrix.assets }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Datara Studio $TAG" \
+              --notes "Installers for Windows, Linux and macOS.
+
+          The studio needs the **forgen** compiler on PATH: it is a compiler-native
+          IDE, and the shell starts the Datara server that compiles \`src/main.dtr\`.
+          See the README for the per-platform install steps."
+          fi
+          files=()
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            files+=($pattern)
+          done <<< "$ASSETS"
+          for f in "${files[@]}"; do gh release upload "$TAG" "$f" --clobber; done
+          gh release view "$TAG" --json assets --jq '.assets[].name'

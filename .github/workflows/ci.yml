@@ -1,0 +1,131 @@
+name: ci
+
+# What this covers, and what it does not.
+#
+# The interface, the text core, the highlighter, the editor and the boot test run
+# here on **all three platforms**, which is the point of the workflow: the studio
+# is not a Windows program, and until this existed nothing proved that. Stages 1-8
+# of `scripts/build.sh` run unchanged, on Windows, Linux and macOS, and so does
+# stage 9 - the launcher's own two questions.
+#
+# Stages 10 and 11 do NOT run here. They are `forgen check` and the snippet
+# compiler, and forgen is a separate product with no public download yet - so the
+# Datara server itself cannot be compiled in CI at all, on any platform. That is
+# a real hole in the coverage and it is written down rather than papered over:
+# `scripts/build.sh` stays the gate that proves the server compiles, and it only
+# runs on a machine that has forgen.
+#
+# `verify-port-probe.mjs` is here for a specific reason. `st_port_busy` was
+# Windows-only and returned false for every port on Linux and macOS, so
+# "start the companion" started another one every time - the 115-process
+# incident, still waiting on the platforms where it was never noticed. It cannot
+# be caught from a Windows machine, because that path is correct on the platform
+# it was written for. A Linux and a macOS runner are the only place the fix can
+# be shown to work.
+#
+# `verify-companion.mjs` is here for the mirror-image reason. The companion's
+# location was answered by a hard-coded `../../python` in `start.sh` and again in
+# `start.cmd`, it resolved to a directory that does not exist, and the batch copy
+# could not be run at all on a machine whose tooling cannot reach `cmd.exe` - so
+# it would have shipped unexecuted twice. The search is one Node file now, and
+# this runs it against a fixture tree whose answers are known.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  interface:
+    name: interface (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # The render and boot suites own their DOM through linkedom rather than
+      # borrowing one from whatever happens to be above the studio on disk.
+      - name: Install the test dependency
+        run: npm install --no-audit --no-fund
+
+      - name: Text core -> wasm
+        run: node scripts/build-wasm.mjs
+
+      - name: Icons, then read the .ico back
+        run: node scripts/build-icons.mjs && node scripts/verify-ico.mjs assets/datara.ico
+
+      - name: The single-file interface, both variants
+        run: node scripts/build-ui.mjs && node scripts/build-ui.mjs --core
+
+      - name: Text core tests
+        run: node crates/textcore/test/test.mjs
+
+      - name: Highlighting pipeline
+        run: node ui/test/highlight.test.mjs
+
+      - name: Interface renders
+        run: node ui/test/render.test.mjs
+
+      - name: The editor, driven as the app drives it
+        run: node ui/test/editor.test.mjs
+
+      - name: Completion
+        run: node ui/test/complete.mjs
+
+      - name: Boot the built artifact
+        run: node ui/test/boot.test.mjs
+
+      - name: The port probe answers on this platform
+        run: node scripts/verify-port-probe.mjs
+
+      - name: The companion is found from a fixture tree
+        run: node scripts/verify-companion.mjs
+
+      - name: Record what was built
+        shell: bash
+        run: |
+          ls -l ui/studio.html ui/studio-core.html assets/datara.ico
+          echo "interface: $(wc -c < ui/studio.html) bytes, one file, no subresources"
+
+  shell:
+    name: desktop shell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The shell is where the platform-specific code actually lives: the forgen
+      # search order, the PATH lookup, CREATE_NO_WINDOW on Windows and its
+      # absence elsewhere. Compiling it on all three is the cheapest way to keep
+      # the `#[cfg]` branches honest.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the Linux webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
+            libayatana-appindicator3-dev libxdo-dev libssl-dev \
+            build-essential curl wget file
+
+      - name: cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml

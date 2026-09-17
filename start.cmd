@@ -51,13 +51,41 @@ if not exist "ui\studio.html" (
   )
 )
 
-REM The AI companion is optional. Set FORGEN_AI_DIR when it lives outside the
-REM repository; the old hard-coded ..\..\python path broke as soon as the
-REM workspace moved from D:\ryan to D:\IDE datara.
-if "%FORGEN_AI_DIR%"=="" set "FORGEN_AI_DIR=%~dp0..\..\python"
+REM The AI companion is optional.
+REM
+REM Where it lives is one question with one answer, and it is asked in
+REM scripts\find-companion.mjs, which start.sh calls too. The copy that used to
+REM live here and there was wrong in both: ..\..\python was correct while the
+REM studio lived at D:\ryan\datara-studio and has resolved to D:\python, which
+REM does not exist, since the workspace moved to D:\IDE datara. A second copy in
+REM batch cannot be run on a machine whose tooling cannot reach cmd.exe, so it
+REM would have shipped unexecuted a second time; node is already required by this
+REM repository for the interface build.
+set "FORGEN_AI_DIR_ASKED=%FORGEN_AI_DIR%"
+set "FORGEN_AI_DIR="
+where node >nul 2>&1
+if errorlevel 1 (
+  echo   node is not on PATH - skipping the companion search.
+  set "FORGEN_AI_DIR=%FORGEN_AI_DIR_ASKED%"
+) else (
+  for /f "delims=" %%D in ('node scripts\find-companion.mjs 2^>nul') do set "FORGEN_AI_DIR=%%D"
+)
+
 if exist "%FORGEN_AI_DIR%\forgen_ai\ide_daemon.py" (
   echo   starting AI companion on 127.0.0.1:%AIPORT% ...
-  call :hide "cmd /c cd /d "%FORGEN_AI_DIR%\.." && python python\forgen_ai\ide_daemon.py --port %AIPORT%"
+  REM The command goes through a variable rather than through an argument, and
+  REM that is a fix rather than a style choice. `call :hide "cmd /c cd /d
+  REM "%FORGEN_AI_DIR%\.." && python ..."` reads as one quoted argument and is
+  REM not one: batch ends an argument at the second quote, so %~1 was
+  REM `cmd /c cd /d "D:\ryan\.."` and everything after it - the python
+  REM invocation - was dropped on the floor. hidden.vbs runs
+  REM WScript.Arguments(0), so this launcher never actually started the
+  REM companion; the IDE's own "start it" button did.
+  REM
+  REM -E -s for the same reason st_ai_start uses it: the daemon must not inherit
+  REM this process's Python configuration.
+  set "AICMD=cmd /c cd /d "%FORGEN_AI_DIR%\.." && python -E -s python\forgen_ai\ide_daemon.py --port %AIPORT%"
+  call :hidevar AICMD
 ) else (
   echo   AI companion not found - the IDE runs without suggestions.
 )
@@ -136,5 +164,20 @@ if errorlevel 1 (
   start /min "datara-studio" %~1
 ) else (
   wscript //nologo //B "scripts\hidden.vbs" "%~1"
+)
+exit /b 0
+
+REM The same, for a command that contains quotes of its own.
+REM
+REM `%~1` is the NAME of a variable, not the command: a command with an embedded
+REM quoted path cannot survive being passed as an argument, because batch ends
+REM the argument at the second quote. Delayed expansion reads the variable at
+REM execution time, after parsing, which is the whole point.
+:hidevar
+where wscript >nul 2>&1
+if errorlevel 1 (
+  start /min "datara-studio" !%~1!
+) else (
+  wscript //nologo //B "scripts\hidden.vbs" "!%~1!"
 )
 exit /b 0

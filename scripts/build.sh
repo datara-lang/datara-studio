@@ -18,14 +18,14 @@ cd "$(dirname "$0")/.."
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
-echo "== 1/10 Rust text core -> wasm ==============================="
+echo "== 1/11 Rust text core -> wasm ==============================="
 if ! node scripts/build-wasm.mjs; then
   echo "wasm build failed"
   exit 2
 fi
 
 echo
-echo "== 2/10 single-file interface + icons ========================"
+echo "== 2/11 single-file interface + icons ========================"
 # The icon set first, from the geometry in `scripts/mark.mjs`: the window icon,
 # the taskbar icon, the tab and the mark beside a .dtr file all come from that
 # one shape, which is the same shape `ui/icon.svg` describes. Generating them
@@ -60,35 +60,35 @@ if ! node scripts/build-ui.mjs --core; then
 fi
 
 echo
-echo "== 3/10 text core tests ======================================"
+echo "== 3/11 text core tests ======================================"
 if ! node crates/textcore/test/test.mjs; then
   echo "text core tests failed"
   exit 1
 fi
 
 echo
-echo "== 4/10 highlighting pipeline ================================"
+echo "== 4/11 highlighting pipeline ================================"
 if ! node ui/test/highlight.test.mjs; then
   echo "highlighting tests failed"
   exit 1
 fi
 
 echo
-echo "== 5/10 interface renders ===================================="
+echo "== 5/11 interface renders ===================================="
 if ! node ui/test/render.test.mjs; then
   echo "render tests failed"
   exit 1
 fi
 
 echo
-echo "== 6/10 the editor, driven as the app drives it =============="
+echo "== 6/11 the editor, driven as the app drives it =============="
 if ! node ui/test/editor.test.mjs; then
   echo "the editor does not render text"
   exit 1
 fi
 
 echo
-echo "== 7/10 completion ==========================================="
+echo "== 7/11 completion ==========================================="
 # Reads `ui/app.js` itself and exercises the scanners and the ranking against
 # the compiler's own examples. It is here, before the boot test, because it
 # needs no DOM and no browser: if the vocabulary the editor offers is wrong,
@@ -102,7 +102,7 @@ if ! node ui/test/complete.mjs; then
 fi
 
 echo
-echo "== 8/10 boot the built artifact =============================="
+echo "== 8/11 boot the built artifact =============================="
 echo "  (loads ui/studio.html in a DOM and runs it; needs: npm install, once)"
 if ! node ui/test/boot.test.mjs; then
   echo "the built interface does not boot"
@@ -110,14 +110,37 @@ if ! node ui/test/boot.test.mjs; then
 fi
 
 echo
-echo "== 9/10 Datara server ========================================"
+echo "== 9/11 the launcher's two questions ========================="
+# Both of these are about whether the IDE can be started at all, which is not
+# something the interface tests can see.
+#
+# `verify-port-probe.mjs` runs the shell text out of `src/explorer.dtr` rather
+# than restating it, because `st_port_busy` decides whether the IDE starts a
+# second AI companion, and it answered "free" for every port on Unix - macOS
+# prints `LISTEN` rather than `LISTENING` and writes the port as `127.0.0.1.7890`,
+# and `netstat` is not installed on a minimal Linux. That produced a companion
+# started once per request.
+if ! node scripts/verify-port-probe.mjs; then
+  echo "the port probe does not work"
+  exit 1
+fi
+# `verify-companion.mjs` is the same argument for where the companion is: the
+# search used to be a hard-coded `../../python` in both launchers, it resolved to
+# a directory that does not exist, and nothing tested it - so it stayed wrong.
+if ! node scripts/verify-companion.mjs; then
+  echo "the companion search does not work"
+  exit 1
+fi
+
+echo
+echo "== 10/11 Datara server ======================================="
 if ! forgen check src/main.dtr; then
   echo "server check failed"
   exit 2
 fi
 
 echo
-echo "== 10/10 every snippet is Datara ============================="
+echo "== 11/11 every snippet is Datara ============================="
 if ! node scripts/check-snippets.mjs; then
   echo "a snippet the editor offers does not compile"
   exit 3

@@ -118,7 +118,51 @@ pub fn st_sh( cmd: Str) -> Str {
 /// Matching on the state word is the honest test. `LISTENING` is the only state
 /// that means "a process is waiting for connections here", and it is the one
 /// `st_ai_start` actually cares about.
+///
+/// --- and the whole function was Windows-only, which made it worse than useless
+/// ---
+///
+/// On Linux and macOS this returned **false for every port, always**, because
+/// nothing in it holds on either platform:
+///
+///   * the state word is `LISTEN`, not `LISTENING` - the `ing` is a Windows
+///     spelling;
+///   * macOS writes the port with a dot, `127.0.0.1.7890`, so the `":7890 "`
+///     needle matches no macOS row even after the state is fixed;
+///   * and `netstat` itself is from net-tools, which is deprecated and absent
+///     from a minimal Linux install, so on plenty of machines the command is not
+///     there to run at all.
+///
+/// The consequence is the exact failure described above, running backwards:
+/// `st_ai_start` saw "nothing is listening", started another companion, and did
+/// it on every call. The 115-process, 2.64 GB incident was found on Windows and
+/// fixed there; on Linux it was still waiting, and it is not visible from a
+/// Windows machine because this path is correct on the platform it was written
+/// for.
+///
+/// So the Unix half does not parse an answer, it asks the question. Three tools
+/// in order of preference - `lsof` (default on macOS), `ss` (the current Linux
+/// tool), then `netstat` for anything older - each asked "is something listening
+/// on this port", and the success marker printed only if one of them says yes.
+/// No column layout, no state word, no dependency on net-tools being installed.
+/// `grep` is not a portability risk; it is in POSIX and on every Unix here.
 pub fn st_port_busy( port: Int) -> Bool {
+    if !st_is_windows() {
+        let p = int_to_str(port)
+        let probe = "( ( command -v lsof >/dev/null 2>&1"
+                  + " && lsof -nP -iTCP:" + p + " -sTCP:LISTEN >/dev/null 2>&1 )"
+                  + " || ( command -v ss >/dev/null 2>&1"
+                  + " && ss -ltn 2>/dev/null | grep -q \":" + p + " \" )"
+                  + " || ( command -v netstat >/dev/null 2>&1"
+                  + " && netstat -an 2>/dev/null | grep -q \"[.:]" + p + " .*LISTEN\" )"
+                  + " ) && echo " + st_ok_mark()
+        let seen = st_sh(probe)
+        if str_index_of(seen, st_ok_mark()) >= 0 {
+            return true
+        }
+        return false
+    }
+
     let out = st_sh("netstat -an")
     // Look for the port and the state on the SAME line, rather than searching
     // for the port anywhere in the output.

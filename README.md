@@ -14,20 +14,55 @@ datara-studio/
   PORTING.md          every compiler workaround and its removal plan
 ```
 
+## Install it
+
+Releases carry one installer per platform.
+
+**Windows is the only one that has ever been built and run.** The Linux and macOS
+targets are wired into `.github/workflows/release.yml`, which has not had its
+first run, and no Linux or macOS artifact exists yet - release v0.3.0 carries
+exactly one file, `Datara.Studio_0.3.0_x64-setup.exe`. Read the last two rows as
+"the build is configured", not "the build is known good".
+
+| Platform | Asset | Status |
+|---|---|---|
+| Windows x64 | `Datara Studio_<version>_x64-setup.exe` (NSIS) | built here and launched |
+| Linux x64 | `datara-studio_<version>_amd64.deb` | workflow added, never run |
+| Linux x64 | `datara-studio_<version>_amd64.AppImage` | workflow added, never run |
+| macOS, Intel **and** Apple Silicon | `Datara Studio_<version>_universal.dmg` | workflow added, never run |
+
+macOS is built universal rather than for the runner's own architecture, because a
+`macos-latest` runner is Apple Silicon and a default build would produce a disk
+image that does not open on an Intel Mac.
+
+**None of the installers contain `forgen`.** This is a compiler-native IDE: the
+shell starts the Datara server, and the server *is* `forgen run src/main.dtr`. The
+installers ship the shell, the studio's Datara sources and the built interface,
+and they need the compiler on PATH to do anything. Without it the window opens on
+the splash page and stays there. There is no public download for forgen yet, so
+installing the studio means having the toolchain already.
+
+The `.deb` and `.dmg` install the app and register `.dtr` with it. The AppImage
+needs no installation at all - `chmod +x` it and run it.
+
 ## Run it
 
-The short way, on Windows:
+From a release, the installed app is enough: launch it from the menu, or on Linux
+run the AppImage directly.
+
+From a clone, there is one launcher per platform and they do the same four
+things - build the single-file interface if it is missing, start **two** servers,
+start the optional AI companion, open the browser, and then watch the pair,
+restarting it if neither port answers:
 
 ```
-start.cmd
+start.cmd          # Windows
+./start.sh         # Linux and macOS
 ```
 
-That builds the single-file interface if it is missing, starts **two** servers
-(on 7878 and 7879), starts the optional AI companion, opens the browser, and
-watches - restarting the pair if neither port answers. Two servers is not
-redundancy for its own sake: the Datara runtime cannot time out a socket, so one
-idle connection can wedge a server permanently, and the interface falls back to
-the second port. See `PORTING.md` SEAM-6.
+Two servers is not redundancy for its own sake: the Datara runtime cannot time
+out a socket, so one idle connection can wedge a server permanently, and the
+interface falls back to the second port. See `PORTING.md` SEAM-6.
 
 The long way, which is also the way to see what the server is doing:
 
@@ -42,19 +77,37 @@ Then open <http://127.0.0.1:7878>.
 
 | Port | What | Started by |
 |---|---|---|
-| 7878 | the server the browser opens first | `start.cmd`, or `forgen run src/main.dtr` |
-| 7879 | the second server, for when 7878 is wedged | `start.cmd` |
-| 7880, 7881 | a fresh pair, when a killed server left a bound-but-silent socket on the first two | `start.cmd`, only if neither 7878 nor 7879 answers |
-| 7890 | the optional AI companion | `start.cmd`, if `../../python/forgen_ai/ide_daemon.py` exists |
+| 7878 | the server the browser opens first | either launcher, or `forgen run src/main.dtr` |
+| 7879 | the second server, for when 7878 is wedged | either launcher |
+| 7880, 7881 | a fresh pair, when a killed server left a bound-but-silent socket on the first two | `start.cmd`; `start.sh` picks from the same four before it starts anything |
+| 7890 | the optional AI companion | either launcher, if the companion is found |
 
 The interface tries all four in order and remembers which one answered, so a
 reload does not re-pay the failed attempts. Any of these can be moved:
-`DATARA_STUDIO_PORT=7879 forgen run src/main.dtr`.
+`DATARA_STUDIO_PORT=7879 forgen run src/main.dtr`, and the launchers read
+`DATARA_STUDIO_PORT_B`, `DATARA_STUDIO_PORT_C`, `DATARA_STUDIO_PORT_D` and
+`DATARA_AI_PORT` the same way.
 
-**Prerequisites.** `forgen` on PATH (`start.cmd` checks and tells you the install
-directory if it is missing), and Node.js only if `ui/studio.html` has to be
-rebuilt. Nothing else - the servers are native binaries and the interface is one
-file with no subresources.
+**Prerequisites.**
+
+| | Needed for | Notes |
+|---|---|---|
+| `forgen` | everything - it compiles the server | on PATH, or set `DATARA_FORGEN` to it. `start.sh` and the shell both search the conventional install locations (`~/.local/bin`, `/usr/local/bin`, `/usr/bin`, `%LOCALAPPDATA%\Programs\Datara\bin`) before giving up |
+| Node.js | rebuilding `ui/studio.html`, and the launchers' search for the AI companion | not needed to run a release |
+| Python 3 | the AI companion, which is optional | the IDE runs without it, with no suggestions |
+| Rust + a C++ toolset | building the desktop shell from source | see below |
+
+Nothing else: the servers are native binaries and the interface is one file with
+no subresources.
+
+**Where the AI companion is looked for.** The launchers do not guess: they call
+`scripts/find-companion.mjs`, and it prints the first directory that actually
+contains `forgen_ai/ide_daemon.py`, in this order - `FORGEN_AI_DIR`, then
+`$ROOT/../python`, `$ROOT/../../python`, `$HOME/.datara/python`, then siblings of
+the studio's parent. Set `FORGEN_AI_DIR` to the directory that *contains*
+`forgen_ai/` to skip the search. That variable is not the same thing as the
+`aiDir` setting in the IDE's Settings panel, which wants the directory containing
+`python/` - one level higher.
 
 ## The desktop build
 
@@ -63,6 +116,47 @@ interface, no filesystem access, no commands of its own - because the point of
 this IDE is that it can read the project and run the compiler, and a frozen asset
 bundle could neither. The shell starts the servers, waits for a port to answer,
 opens the window at it, and kills the children on exit.
+
+**It builds and runs on Windows, Linux and macOS.** The shell has no
+platform-specific code paths except two: where it looks for `forgen`, and
+`CREATE_NO_WINDOW` on the child processes, which is a Windows flag and is
+compiled out elsewhere. `cargo check --all-targets` and `cargo test` run on all
+three platforms in CI.
+
+**Building it.** Windows:
+
+```bash
+start-tauri.cmd                     # builds the shell if it is missing, then runs it
+```
+
+or by hand, on any platform:
+
+```bash
+node scripts/build-icons.mjs        # icons are build inputs, not checked in
+node scripts/build-ui.mjs && node scripts/build-ui.mjs --core
+cargo tauri build --manifest-path src-tauri/Cargo.toml
+```
+
+The output lands in `src-tauri/target/release/bundle/`. On Linux, install the
+Tauri system dependencies first - the bundler fails at the point it links the
+webview, which reads as a Rust error rather than a missing system package:
+
+```bash
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+  patchelf libayatana-appindicator3-dev libxdo-dev libssl-dev libfuse2
+```
+
+`--bundles` takes only the formats the **host** can produce and rejects anything
+else - measured, `cargo tauri build --bundles nsis,deb,appimage,app,dmg` on
+Windows exits with `invalid value 'deb' for '--bundles'`. The `bundle.targets`
+list in `tauri.conf.json` is not restricted that way: the bundler skips
+inapplicable targets with a warning, so one list serves all three platforms. That
+is why `tauri.conf.json` names `dmg` and `app` even on a Windows checkout.
+
+On Windows, `scripts/msvc-env.sh` must be sourced first for anything that
+produces a native binary, because MSVC's `link.exe` has to precede Git-Bash's GNU
+`link`. The JIT path (`forgen run`) needs no setup.
+
 
 The one thing the page asks the shell for is the window itself: minimise,
 maximise and close. That is a single capability file
@@ -93,21 +187,6 @@ is never drawn and `.shell` keeps its three rows. `drive.mjs` asserts both halve
 **Nothing needs to be running first.** The window starts its own servers, on the
 first two of the four ports that are free, and probes them itself.
 
-```bash
-start-tauri.cmd                     # builds the shell if it is missing, then runs it
-```
-
-or by hand:
-
-```bash
-source scripts/msvc-env.sh          # MSVC's link.exe must precede Git-Bash's
-cargo build --release --manifest-path src-tauri/Cargo.toml
-src-tauri/target/release/datara-studio.exe
-```
-
-Requires Rust (`cargo` on PATH, or `%USERPROFILE%\.cargo\bin`) and the MSVC C++
-toolset - `scripts/build-desktop.cmd` checks both and says which one is missing.
-
 **The window opens immediately**, on a bundled splash, and does not wait for the
 server. The splash polls all four ports and hands the window over the moment one
 answers, and only admits failure after nine seconds. The first version waited up
@@ -130,9 +209,8 @@ The build **fails** if `ui/icon.svg` stops containing the mark's three colours,
 because that is the one way the artwork and the drawing can silently separate -
 which is exactly what had happened.
 
-On Windows, `scripts/msvc-env.sh` must be sourced first for anything that
-produces a native binary, because MSVC's `link.exe` has to precede Git-Bash's GNU
-`link`. The JIT path (`forgen run`) needs no setup.
+`scripts/build-desktop.cmd` checks for Rust and the MSVC C++ toolset and says
+which one is missing.
 
 ## What works today
 
