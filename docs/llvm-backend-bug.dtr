@@ -1,0 +1,29 @@
+// Minimal reproduction: forgen 1.4.2's LLVM backend emits an invalid `phi`
+// when a List-typed local is reassigned inside a while loop.
+//
+//     forgen build docs/llvm-backend-bug.dtr --llvm
+//     llc.exe: error: '<cache>/llvm-backend-bug_*.ll:...: error:
+//              '%v3' defined with type 'ptr' but expected 'i64'
+//       %v25 = phi i64 [ %v3, %bb0 ], [ %v13, %bb2 ]
+//     . Falling back to native Cranelift backend.
+//
+// The build then SUCCEEDS through Cranelift, which is why this went unnoticed:
+// the only symptom is a slower binary. Remove the `acc = acc.push(...)` line
+// and the LLVM pipeline completes.
+//
+// Nothing in this file is special - it is the smallest shape that reproduces.
+
+fn f(items: List<Str>) -> Int {
+    mut acc = items
+    mut i = 0
+    while i < items.len() {
+        let cur = acc[i]
+        acc = acc.push(cur)
+        i = i + 1
+    }
+    return acc.len()
+}
+
+fn main() {
+    print(f(["a", "b"]))
+}

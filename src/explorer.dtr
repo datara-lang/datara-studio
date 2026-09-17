@@ -84,7 +84,7 @@ pub fn st_sh( cmd: Str) -> Str {
     return res
 }
 
-/// Is something already listening on a loopback port?
+/// Is something already *listening* on a loopback port?
 ///
 /// There is no client-side socket builtin - the runtime has create, bind,
 /// listen, accept, recv, send and close, and nothing that connects - so this asks
@@ -99,11 +99,61 @@ pub fn st_sh( cmd: Str) -> Str {
 /// listening on that single port. A request then went to whichever one Windows
 /// happened to pick, so the companion's answers were not reproducible between two
 /// identical keystrokes - which from the outside is "the suggestions are unclear".
+///
+/// ## Why the answer has to be "is any line LISTENING", not "is the port string here"
+///
+/// The first version searched the whole `netstat -an` output for `":7890 "`. That
+/// substring appears in **every** row for the port, not just the listening one:
+/// an established connection carries it, and so does a `TIME_WAIT` row - which
+/// Windows keeps for two minutes after the peer closes, and which therefore
+/// outlives the process that owned it by a long way.
+///
+/// The visible effect was the opposite of the intent: the companion had exited
+/// (or been stopped), a `TIME_WAIT` row was still on screen, this answered "yes,
+/// something is listening", `st_ai_start` returned `{"already":true}` and started
+/// nothing, and the IDE then reported the companion as running while every
+/// `/health` failed. Restarting the editor did not help, because the row was
+/// still there - so the companion looked like it could not be started at all.
+///
+/// Matching on the state word is the honest test. `LISTENING` is the only state
+/// that means "a process is waiting for connections here", and it is the one
+/// `st_ai_start` actually cares about.
 pub fn st_port_busy( port: Int) -> Bool {
     let out = st_sh("netstat -an")
-    // the trailing space matters: ":7890 " cannot match ":78900", and netstat
-    // pads every address field so the space is always there
-    return str_index_of(out, ":" + int_to_str(port) + " ") >= 0
+    // Look for the port and the state on the SAME line, rather than searching
+    // for the port anywhere in the output.
+    //
+    // `":7890 "` still has to be the needle - the trailing space is what stops
+    // `:7890` matching `:78900`, and netstat pads every address field so the
+    // space is always there. The second needle is the state.
+    let needle = ":" + int_to_str(port) + " "
+    mut rest = out
+    // No `if` expressions in this language, so the line is taken in two steps
+    // rather than assigned from a conditional.
+    mut line = ""
+    mut nl = 0
+    while byte_len(rest) > 0 {
+        nl = str_index_of(rest, "\n")
+        if nl < 0 {
+            line = rest
+        } else {
+            line = str_substring(rest, 0, nl)
+        }
+        if str_index_of(line, needle) >= 0 {
+            // netstat writes the state in upper case on every locale this has
+            // been run in, and `LISTENING` survives the codepage conversion
+            // because it is pure ASCII - unlike the header, which is localised.
+            if str_index_of(line, "LISTENING") >= 0 {
+                return true
+            }
+        }
+        if nl < 0 {
+            rest = ""
+        } else {
+            rest = str_substring(rest, nl + 1, byte_len(rest) - nl - 1)
+        }
+    }
+    return false
 }
 
 // --------------------------------------------------------------- cp1251 -> UTF-8

@@ -1,0 +1,609 @@
+/// Finding the native toolchain, so an LLVM build works from the IDE.
+///
+/// The problem this solves, stated exactly, because it read as a compiler bug
+/// for a long time:
+///
+///     forgen build src/main.dtr --llvm
+///     [Forgen LLVM Warning] LLVM compilation failed: LLVM Link step failed:
+///     /usr/bin/link: extra operand '/DEBUG:NONE'
+///     . Falling back to native Cranelift backend.
+///
+/// Nothing was wrong with LLVM and nothing was wrong with the flags. Git-Bash
+/// ships a GNU `link` at `/usr/bin/link.exe`, and on this machine that directory
+/// is ahead of MSVC's `link.exe` on PATH - so every link the compiler attempted
+/// went to a Unix hard-link utility that has never heard of `/DEBUG:NONE`. The
+/// compiler then fell back to Cranelift, which is a working backend, so the
+/// symptom was not a failed build: it was a *quietly different* build, with the
+/// LLVM pipeline silently skipped. That is the worst shape a bug can have.
+///
+/// `scripts/msvc-env.sh` has known this for a while, but it is a shell script
+/// you have to remember to `source`, and the IDE cannot remember things for you.
+/// So the discovery is done here, in the server, and applied to the environment
+/// the compiler runs in.
+///
+/// What is deliberately NOT done here: bundling or downloading a toolchain. If
+/// MSVC is absent the build still runs and still falls back - it says so.
+/// Installing a compiler behind the user's back is not this program's business.
+///
+/// There is no cache, and none is needed. Datara does not permit module-level
+/// `mut` (measured: `mut g: Str = ""` at the top level is E-SYNTAX-001,
+/// "Expected top-level declaration"), so state cannot be memoised here even if
+/// it were worth it - and it is not. The whole probe is a few `dir_list` and
+/// `path_exists` calls with **no process launched**, so it costs a directory
+/// read rather than the ~220 ms a shell round trip costs. The one call that
+/// could repeat harmfully is the PATH prepend, and that is guarded by inspecting
+/// PATH itself.
+///
+/// Zero emojis.
+
+use http
+use explorer
+
+/// The Visual Studio installer's own query tool.
+///
+/// A function rather than a `const`: Datara has no top-level `const` either
+/// (measured: E-SYNTAX-001 at column 1). One call per probe, and the string is
+/// a literal, so this costs nothing.
+fn tc_vswhere() -> Str {
+    return "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+}
+
+/// True when `dir` contains a `link.exe`.
+fn tc_has_link( dir: Str) -> Bool {
+    if byte_len(dir) == 0 {
+        return false
+    }
+    mut found = false
+    unsafe(justification: "probing for the native linker beside the compiler") {
+        found = path_exists(st_join(dir, "link.exe"))
+    }
+    return found
+}
+
+/// The `bin/Hostx64/x64` directory holding `link.exe` under a toolset, or "".
+///
+/// The installer lays out per-architecture bins. `Hostx64/x64` is the native
+/// 64-bit toolset and is what this project targets
+/// (`x86_64-pc-windows-msvc`). The sibling `Hostx64/x86` also contains a
+/// `link.exe` that also links - but for a 32-bit target - so the path is spelled
+/// out rather than searched for.
+fn tc_link_dir_under( toolset: Str) -> Str {
+    if byte_len(toolset) == 0 {
+        return ""
+    }
+    let bin = st_join(toolset, "bin/Hostx64/x64")
+    if tc_has_link(bin) {
+        return bin
+    }
+    return ""
+}
+
+/// Newest `bin/Hostx64/x64` under `<base>/VC/Tools/MSVC/<version>`, or "".
+///
+/// Every version directory is tried from newest to oldest rather than trusting
+/// the newest name, because a half-uninstalled toolset can leave its directory
+/// behind with the binaries stripped. Testing is one `path_exists`; assuming is
+/// a build that fails with "cannot find link.exe" and no explanation.
+fn tc_toolset_under( base: Str) -> Str {
+    if byte_len(base) == 0 {
+        return ""
+    }
+    let versions = tc_version_dirs(st_join(base, "VC/Tools/MSVC"))
+    let n = versions.len()
+    mut i = n - 1
+    while i >= 0 {
+        let dir = tc_link_dir_under(st_join(st_join(base, "VC/Tools/MSVC"), versions[i]))
+        if byte_len(dir) > 0 {
+            return dir
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+/// The version directories under `base`, newest last.
+///
+/// Ordering is the whole value of this function. A machine with two toolsets
+/// links successfully with either, and the failure mode of picking the wrong one
+/// is a binary that builds and runs and is not the one that was asked for. So
+/// versions are ordered by their numeric parts, not as text: `14.9` sorts after
+/// `14.50` lexically, which is backwards.
+fn tc_version_dirs( base: Str) -> List<Str> {
+    if byte_len(base) == 0 {
+        return []
+    }
+    mut names: List<Str> = []
+    unsafe(justification: "enumerating the installed compiler toolset versions") {
+        names = dir_list(st_norm_path(base))
+    }
+    let n = names.len()
+    mut keep: List<Str> = []
+    mut i = 0
+    while i < n {
+        // `dir_list` also returns files, and a `Redist` or `Auxiliary` directory
+        // beside the toolsets has no numeric part, so it can never be the answer.
+        if tc_is_version(names[i]) {
+            keep = keep.push(names[i])
+        }
+        i = i + 1
+    }
+    return tc_sort_versions(keep)
+}
+
+/// True when `name` looks like a toolset version: digits and dots, starting with
+/// a digit.
+///
+/// `14.50.35717` qualifies; `Redist`, `.` and `..` do not. A name that merely
+/// contains digits is rejected too - `f14` is not a toolset.
+fn tc_is_version( name: Str) -> Bool {
+    let n = byte_len(name)
+    if n == 0 {
+        return false
+    }
+    let first = str_byte_at(name, 0)
+    if first < 48 || first > 57 {
+        return false
+    }
+    mut i = 1
+    while i < n {
+        let b = str_byte_at(name, i)
+        if !(b >= 48 && b <= 57) && b != 46 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// Sort version strings ascending by numeric part, so the newest is last.
+///
+/// Selection sort rather than insertion: each pass finds the smallest remaining
+/// element and swaps it into place. It reads as one comparison plus one swap per
+/// position, which is all the per-component rule needs, and it never has to hold
+/// a shifting chain in flight - `acc` is only ever reassigned at a point where
+/// the values it still needs have already been read out. The list holds at most
+/// a handful of toolsets, so the extra comparisons cost nothing measurable.
+fn tc_sort_versions( items: List<Str>) -> List<Str> {
+    let n = items.len()
+    if n < 2 {
+        return items
+    }
+    mut acc = items
+    mut i = 0
+    while i < n - 1 {
+        let here = acc[i]
+        let best = tc_min_from(acc, i)
+        // `tc_min_from` returns an index, and a swap only happens when the
+        // smallest remaining element is not already in place.
+        if best != i {
+            let winner = acc[best]
+            acc = acc.set(i, winner)
+            acc = acc.set(best, here)
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+/// The index of the smallest version at or after `from`.
+fn tc_min_from( items: List<Str>, from: Int) -> Int {
+    let n = items.len()
+    mut best = from
+    mut i = from + 1
+    while i < n {
+        if tc_version_gt(items[best], items[i]) {
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+/// True when version `a` is strictly newer than `b`.
+///
+/// Compared component by component with a missing component treated as zero, so
+/// `14.50` and `14.50.0` compare equal rather than one being "shorter". The loop
+/// is bounded by component count, not by string length, so a malformed version
+/// cannot spin.
+fn tc_version_gt( a: Str, b: Str) -> Bool {
+    let na = tc_dots(a)
+    let nb = tc_dots(b)
+    // No `if` expression in Datara - the larger component count is chosen with
+    // a statement, then the loop walks both versions position by position.
+    mut n = na
+    if nb > na {
+        n = nb
+    }
+    mut i = 0
+    while i <= n {
+        let pa = tc_version_part(a, i)
+        let pb = tc_version_part(b, i)
+        if pa > pb {
+            return true
+        }
+        if pa < pb {
+            return false
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// How many dots `v` contains, i.e. how many components it has beyond the first.
+///
+/// Written as a byte scan rather than `str_split(v, ".").len() - 1`, which would
+/// allocate a list per comparison: this runs inside the sort's inner loop.
+fn tc_dots( v: Str) -> Int {
+    let n = byte_len(v)
+    mut count = 0
+    mut i = 0
+    while i < n {
+        if str_byte_at(v, i) == 46 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+/// The `i`th dot-separated numeric component of `v`, or 0 when there is none.
+fn tc_version_part( v: Str, i: Int) -> Int {
+    mut comp = 0
+    mut num = 0
+    let n = byte_len(v)
+    mut j = 0
+    while j < n {
+        let b = str_byte_at(v, j)
+        if b == 46 {
+            if comp == i {
+                return num
+            }
+            comp = comp + 1
+            num = 0
+        } else {
+            if b >= 48 && b <= 57 {
+                num = num * 10 + (b - 48)
+            }
+        }
+        j = j + 1
+    }
+    if comp == i {
+        return num
+    }
+    return 0
+}
+
+/// Scan one Visual Studio root for the newest usable linker.
+///
+/// Three shapes are tried because the layout differs by installer:
+///
+///   * `<root>/<Edition>/VC/Tools/MSVC/<version>`      - a normal install
+///   * `<root>/<Edition>/BuildTools/VC/Tools/MSVC/...` - Build Tools nested
+///   * `<root>/VC/Tools/MSVC/<version>`                - a relocated root that
+///     already points at the toolset's parent
+///
+/// Edition directories are named by year (`2019`, `2022`, `18`), so the numeric
+/// ordering is the chronological one and the newest installer is tried first.
+fn tc_scan_root( root: Str) -> Str {
+    if byte_len(root) == 0 {
+        return ""
+    }
+    mut names: List<Str> = []
+    unsafe(justification: "enumerating Visual Studio installations") {
+        names = dir_list(st_norm_path(root))
+    }
+    let editions = tc_sort_versions(tc_numeric_only(names))
+    let m = editions.len()
+    mut i = m - 1
+    while i >= 0 {
+        let ed = st_join(root, editions[i])
+        let nested = tc_toolset_under(ed)
+        if byte_len(nested) > 0 {
+            return nested
+        }
+        let bt = tc_toolset_under(st_join(ed, "BuildTools"))
+        if byte_len(bt) > 0 {
+            return bt
+        }
+        i = i - 1
+    }
+    // Some installs put the toolset directly under the root with no edition
+    // directory in between.
+    return tc_toolset_under(root)
+}
+
+/// Keep only the entries whose first byte is a digit, for edition-year sorting.
+fn tc_numeric_only( items: List<Str>) -> List<Str> {
+    let n = items.len()
+    mut keep: List<Str> = []
+    mut i = 0
+    while i < n {
+        let s = items[i]
+        if byte_len(s) > 0 {
+            let b = str_byte_at(s, 0)
+            if b >= 48 && b <= 57 {
+                keep = keep.push(s)
+            }
+        }
+        i = i + 1
+    }
+    return keep
+}
+
+/// Ask the Visual Studio installer where it installed the C++ tools. "" if not.
+///
+/// This is the authoritative route: it handles side-by-side installs and reports
+/// the path the installer recorded, rather than a pattern that may not hold.
+/// `st_sh` is used because there is no builtin for "ask a program a question",
+/// and it is on a slow path only - the scan below runs first when this answers
+/// nothing.
+fn tc_vswhere_root() -> Str {
+    let tool = tc_vswhere()
+    mut present = false
+    unsafe(justification: "locating the installed C++ build tools") {
+        present = path_exists(tool)
+    }
+    if !present {
+        return ""
+    }
+    // Quoted because the path contains spaces, and `-requires` is what keeps an
+    // install without a C++ workload from being reported as a usable toolchain.
+    let cmd = "\"" + tool + "\" -latest -products * -requires "
+            + "Microsoft.VisualStudio.Component.VC.Tools.x86.x64 "
+            + "-property installationPath"
+    return str_trim(st_from_oem(st_sh(cmd)))
+}
+
+/// The `bin/Hostx64/x64` directory holding `link.exe`, or "" if there is none.
+///
+/// The scan runs first and `vswhere` second, which is the opposite of the usual
+/// order and is deliberate: the scan is builtins only, while `vswhere` is a
+/// process launch. A directory read that finds `link.exe` is proof; a program
+/// that names a path is a hint that still has to be tested. When the scan finds
+/// nothing the hint is worth its cost, so it is tried then.
+pub fn tc_msvc_bin() -> Str {
+    let roots = [
+        "C:/Program Files/Microsoft Visual Studio",
+        "C:/Program Files (x86)/Microsoft Visual Studio"
+    ]
+    let n = roots.len()
+    mut i = 0
+    while i < n {
+        let dir = tc_scan_root(roots[i])
+        if byte_len(dir) > 0 {
+            return dir
+        }
+        i = i + 1
+    }
+
+    // Nothing in the standard roots: ask the installer, in case the tools live
+    // somewhere else entirely.
+    let root = tc_vswhere_root()
+    if byte_len(root) > 0 {
+        let dir = tc_toolset_under(root)
+        if byte_len(dir) > 0 {
+            return dir
+        }
+    }
+    return ""
+}
+
+/// Put the MSVC linker in front of everything else on PATH, and set LIB and
+/// INCLUDE. Returns the `bin` directory, or "" when no MSVC was found.
+///
+/// Prepending rather than replacing is the point: `forgen` itself may live in
+/// `~/.cargo/bin` or be launched by absolute path, and the compiler needs its
+/// own helpers to stay reachable. Only `link.exe` has to win.
+///
+/// `LIB` and `INCLUDE` are not optional extras, and discovering that was the
+/// second half of this bug. With only PATH set, the right `link.exe` ran and
+/// then died with:
+///
+///     LINK : fatal error LNK1181: cannot open input file
+///     "legacy_stdio_definitions.lib"
+///
+/// `link.exe` does not search for its libraries the way a compiler searches for
+/// headers; it reads `LIB`, and every library the runtime needs -
+/// `legacy_stdio_definitions.lib`, `libcmt.lib`, `libucrt.lib`, the SDK's
+/// `kernel32.lib` - lives in a directory only `LIB` names. Setting PATH alone
+/// therefore moved the failure rather than fixing it, which is worth stating
+/// because the first symptom looks like success: the link step *starts*.
+///
+/// Idempotence comes for free here, and the mechanism is worth stating because
+/// it is not the obvious one.
+///
+/// `env_set` stages a value for the *next child process*; it does not change
+/// this process's own environment, and `env_get` never reads it back. Measured:
+///
+///     env_set("ZZ_PROBE", "hello")   -> env_get("ZZ_PROBE") == ""
+///     system("echo %ZZ_PROBE%")      -> "hello"
+///
+/// So `env_get("PATH")` returns the original PATH every time, and
+/// `bin + ";" + cur` therefore always produces exactly one copy of `bin`
+/// however often it is called. Measured: three consecutive calls leave the child
+/// with **one** `Hostx64` entry. No flag is needed, and none would help - there
+/// is nowhere to keep one, and a real read-back guard could not fire.
+///
+/// `LIB` and `INCLUDE` are set the same way and for the same reason: the linker
+/// reads them from its own environment, which `env_set` supplies. Setting them
+/// from here rather than expecting the user's shell to have them is the whole
+/// difference between a link that runs and one that dies with LNK1181.
+pub fn tc_prepend_msvc() -> Str {
+    let bin = tc_msvc_bin()
+    if byte_len(bin) == 0 {
+        return ""
+    }
+    env_set("PATH", bin + ";" + env_get("PATH"))
+    tc_set_includes(bin)
+    return bin
+}
+
+/// Set `LIB` and `INCLUDE` for the toolset whose `bin` was just found.
+///
+/// The toolset root is three levels up from `bin/Hostx64/x64`, so the include
+/// and lib directories are derived rather than searched for again. The Windows
+/// SDK is a separate install with its own version directory, so it is discovered
+/// independently - the two versions do not track each other and hardcoding
+/// either breaks on the next update.
+///
+/// Paths are written with backslashes and `;` separators because `link.exe` and
+/// `cl.exe` read these variables as Windows paths; a forward-slash list would
+/// work for the compiler's own search but is not what the linker expects.
+fn tc_set_includes( bin: Str) {
+    // bin = <toolset>/bin/Hostx64/x64  ->  <toolset>
+    let root = tc_ancestor(bin, 3)
+    if byte_len(root) == 0 {
+        return
+    }
+    let msvc_inc = tc_win(st_join(root, "include"))
+    let msvc_lib = tc_win(st_join(root, "lib/x64"))
+
+    let sdk = tc_sdk_version()
+    mut inc = msvc_inc
+    mut lib = msvc_lib
+    if byte_len(sdk) > 0 {
+        let k = "C:\\Program Files (x86)\\Windows Kits\\10"
+        inc = inc + ";"
+            + k + "\\Include\\" + sdk + "\\ucrt;"
+            + k + "\\Include\\" + sdk + "\\um;"
+            + k + "\\Include\\" + sdk + "\\shared"
+        lib = lib + ";"
+            + k + "\\Lib\\" + sdk + "\\ucrt\\x64;"
+            + k + "\\Lib\\" + sdk + "\\um\\x64"
+    }
+    env_set("INCLUDE", inc)
+    env_set("LIB", lib)
+}
+
+/// The newest Windows SDK version directory, or "" when the SDK is not present.
+///
+/// Read from `Include/<version>` rather than from the SDK's own registry key,
+/// because the directory is what the compiler will actually open - the registry
+/// can name a version whose files were removed.
+fn tc_sdk_version() -> Str {
+    let base = "C:/Program Files (x86)/Windows Kits/10/Include"
+    let versions = tc_version_dirs(base)
+    let n = versions.len()
+    if n == 0 {
+        return ""
+    }
+    return versions[n - 1]
+}
+
+/// Walk `levels` directories up from `p`, using forward slashes. "" on overflow.
+fn tc_ancestor( p: Str, levels: Int) -> Str {
+    mut cur = st_slash(p)
+    let n = levels
+    mut i = 0
+    while i < n {
+        // Drop a trailing slash first, so "a/b/" and "a/b" behave the same.
+        if st_has_suffix(cur, "/") {
+            cur = str_substring(cur, 0, byte_len(cur) - 1)
+        }
+        let cut = tc_last_slash(cur)
+        if cut < 0 {
+            return ""
+        }
+        cur = str_substring(cur, 0, cut)
+        i = i + 1
+    }
+    return cur
+}
+
+/// The byte offset of the last `/` in `s`, or -1 when there is none.
+fn tc_last_slash( s: Str) -> Int {
+    let n = byte_len(s)
+    mut i = n - 1
+    while i >= 0 {
+        if str_byte_at(s, i) == 47 {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+/// The same path with `/` replaced by `\`, for the linker's own variables.
+fn tc_win( p: Str) -> Str {
+    return str_replace(p, "/", "\\")
+}
+
+/// True when a linker was found and is now first on PATH.
+///
+/// Used for the message the IDE shows, never to gate the build: the compiler
+/// decides what it can do, and a probe that overrode it would be a second
+/// opinion nobody asked for.
+pub fn tc_linker_ok() -> Bool {
+    return byte_len(tc_prepend_msvc()) > 0
+}
+
+/// The optimisation flags appended to a `forgen build`/`run` command line.
+///
+/// **Nothing by default, and that is a measured decision rather than a
+/// preference.** The request was for the fastest build, LLVM sounded like the
+/// faster backend, and it is the one this file was written to unblock. Then the
+/// two backends were timed on this machine, same source, same MSVC linker:
+///
+///     fib(30), recursive calls     Cranelift 472-490 ms   LLVM 491-503 ms
+///     40M-iteration arithmetic loop Cranelift 531-564 ms   LLVM 499-517 ms
+///     build time                    Cranelift 292-294 ms   LLVM 1055-1998 ms
+///     output size                   Cranelift 374.5 KB     LLVM 372-464 KB
+///
+/// LLVM wins the arithmetic loop by about 5%. It loses the build by 3.5x to 7x,
+/// and build time is the cost the user pays on every single Run while a 5% run
+/// gain is invisible outside a benchmark. So the default stays with the backend
+/// that is faster to *use*, and `--llvm` stays available for anyone who wants
+/// the last few percent and does not mind waiting.
+///
+/// This is also why the linker work still matters even though nothing passes
+/// `--llvm` automatically: the shadowed linker made every explicit `--llvm`
+/// request fail and fall back silently, so the choice could not be made at all.
+/// Now it can - in either direction - and `st_fell_back` reports which happened.
+///
+/// One case is still worth handling here. A caller appending `--llvm` to a
+/// target passes it in the string, and `tc_opt_in` must not double it up; and a
+/// target that names any backend already is left untouched so `--native`,
+/// `--tiny` and `--embed` keep working.
+pub fn tc_opt_in( target: Str) -> Str {
+    if !st_has_suffix(target, ".dtr") {
+        return ""
+    }
+    if st_has_infix(target, "--llvm") || st_has_infix(target, "--native") {
+        return ""
+    }
+    if st_has_infix(target, "--tiny") || st_has_infix(target, "--embed") {
+        return ""
+    }
+    // The `FORGEN_LLVM=1` environment variable is the opt-in: a person who wants
+    // the LLVM pipeline can set it once for their session and every build in the
+    // IDE uses it, without the default being changed for everyone.
+    let want = str_trim(env_get("FORGEN_LLVM"))
+    if want == "1" || want == "true" || want == "yes" {
+        if byte_len(tc_msvc_bin()) == 0 {
+            // Asking for LLVM on a machine with no linker would warn and fall
+            // back on every build, which turns a real diagnostic into wallpaper.
+            return ""
+        }
+        return " --llvm"
+    }
+    return ""
+}
+
+/// A one-line summary of the linker situation, for the status bar.
+///
+/// Two distinguishable answers, because "no LLVM" has two different causes and
+/// only one of them is a fact about the machine:
+///
+///   * a path       - LLVM builds will link with MSVC
+///   * "not installed" - no MSVC on this machine; LLVM cannot link at all
+///
+/// An absent toolchain is a fact about the machine; a shadowed linker is a fact
+/// about the environment. Saying which one it is turns "the build is slower than
+/// I expected" into a report someone can act on.
+pub fn tc_linker_report() -> Str {
+    let bin = tc_prepend_msvc()
+    if byte_len(bin) == 0 {
+        return "not installed"
+    }
+    return bin
+}
