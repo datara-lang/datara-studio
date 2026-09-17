@@ -122,10 +122,13 @@ so opening the IDE used to flash two black windows and leave them in the taskbar
 for as long as it was open. There is no flag that means "minimised and invisible";
 `/min` only minimises.
 
-`scripts/build-icons.mjs` generates the icon set from the same geometry as
-`ui/icon.svg`. It has no image-library dependency: the mark is a rounded square,
-two strokes and a dot, so it is rasterised from signed distances and encoded as
-PNG with `zlib`.
+`scripts/build-icons.mjs` generates every piece of icon artwork from the one
+geometry in `scripts/mark.mjs`, which is the same shape `ui/icon.svg` describes.
+It has no image-library dependency: the mark is a rounded square, two strokes and
+a dot, so it is rasterised from signed distances and encoded as PNG with `zlib`.
+The build **fails** if `ui/icon.svg` stops containing the mark's three colours,
+because that is the one way the artwork and the drawing can silently separate -
+which is exactly what had happened.
 
 On Windows, `scripts/msvc-env.sh` must be sourced first for anything that
 produces a native binary, because MSVC's `link.exe` has to precede Git-Bash's GNU
@@ -194,8 +197,8 @@ designed up front, which is the order the roadmap asks for: extract the kernel,
 do not design it.
 
 The right panel is ordered **offline first** - Problems, Structure, Project,
-Layout, then AI and Generate - because a person who never starts the companion
-should still get a useful panel. See `docs/DATARA-ERGONOMICS.md` for the
+Layout, then Chat, AI and Generate - because a person who never starts the
+companion should still get a useful panel. See `docs/DATARA-ERGONOMICS.md` for the
 measurements and for what is still missing.
 
 ## The AI companion
@@ -216,7 +219,110 @@ Then the IDE picks it up within five seconds.
 
 `PORTING.md` SEAM-4 explains the one change made in that project: the neural
 stack is now imported lazily, so the daemon starts and serves completions without
-`torch`. Only `/chat` needs the model.
+`torch`. **No endpoint needs it now** - chat included, which previously answered
+`neural stack unavailable` here because it was the one path that did.
+
+### Which model is running, and why the answer is on disk
+
+The companion ships two things under the word "model", and the interface used to
+report the wrong one:
+
+| | file | state |
+| --- | --- | --- |
+| `NanoCodeModel` | `data/nano_code_model.json`, 131 KB | **active.** An order-3 n-gram over verified Datara; this is what generates code, and it needs no ML runtime |
+| `NanoLM` | `data/nano_lm.pt`, 6.8 MB | **dormant.** A 1.70M-parameter transformer that measured *worse* than the n-gram on both holdouts (`NEURAL.md` §7), so nothing is wired to it |
+
+`/health` used to announce `FORGEN-12.6M-MoE`, naming a network whose checkpoint
+was deleted. It now reports what is actually loadable, per candidate, with the
+reason: `ngram-datara` active, `nanolm-transformer` `present but dormant: torch
+not installed; no-ship build (measured worse than the n-gram)`. The verdict comes
+from `python/forgen_ai/model_registry.py`, which probes the directory rather than
+reading a preset name - so installing `torch` tomorrow changes the report rather
+than contradicting it.
+
+### Chat, and why it replaced the Generate box alone
+
+`Generate` is one shot: it composes a program from verified fragments and writes it
+into the open file. That is still there. What was missing is a surface where the
+*previous turn* exists, because a follow-up question has no meaning without one -
+and the companion has had a `/chat` endpoint all along with no way to reach it
+from the IDE.
+
+The Chat tab is that surface. It is served by `python/forgen_ai/chat_engine.py` in
+order of how much each answer should be trusted:
+
+| resolved by | example | reported as |
+| --- | --- | --- |
+| the project index | «какие функции имеют эффекты» | `VERIFIED`, with `Источник: forgen context …` |
+| exact arithmetic | «сколько будет 2+2*10» | `VERIFIED`, `2+2*10 = 22.` |
+| the compositional generator | «напиши сортировку вставками» | `VERIFIED` after `forgen check`, code in the transcript |
+| the curated knowledge base | version and feature questions | `SUPPORTED` |
+| honest refusal | anything outside those | `SUPPORTED`, and it lists what does work |
+
+**Context is the feature, so it is visible and it is deletable.** The card at the
+top of the tab shows how many messages are carried, where the context came from
+(`compiler`, `manual` or `empty`), and the topic the last answer established. Three
+controls act on it:
+
+* **clear context** - deletes the transcript *and* the attached context. It is
+  final: the session records that the emptying was deliberate, so the project
+  context is not silently re-gathered on the next turn. A clear button that
+  refills itself is worse than no button, and there is an assertion for exactly
+  that in both test suites.
+* **undo** - drops the last exchange, in the panel and in the companion.
+* **use the project** - attaches the compiler-gathered context again, which is the
+  only way back once it has been cleared.
+
+Follow-up inheritance is what makes it conversational rather than a log. «а теперь
+по убыванию» carries a modifier and no subject, so the previous *subject* is
+grafted onto it - `сортировка` + `по убыванию` - and re-planned. Generated
+descending, the output is genuinely descending:
+
+```
+=== Сортировка пузырьком по убыванию ===
+Исходный:  64 34 25 12 22 11 90
+Результат: 90 64 34 25 22 12 11
+```
+
+A cold session asking the same follow-up is **refused** rather than misread as a
+request for a bubble sort, which is the boundary that keeps inheritance from
+turning into guessing.
+
+### What the Generate panel actually does
+
+Measured against the real companion, not inferred from the code. Five requests,
+each with an empty context and `verify: true`:
+
+| asked for | task it chose | confidence | fragments |
+| --- | --- | --- | --- |
+| sort a list of integers | `sort` | 0.87 | `copy_ints`, `join_ints` |
+| read a file and count its lines | `file_stats` | 1.00 | `count_lines`, `count_words` |
+| compute the sha256 of a buffer | `generic` | 0.15 | `sum_ints` |
+| add two numbers | `generic` | 0.15 | `sum_ints` |
+| parse an integer from a string and return an option | `string_ops` | 0.47 | `is_palindrome`, `b2s` |
+
+Two things are worth stating plainly, because the panel does not:
+
+* **The task is chosen by keyword match against a small set of shapes.** The
+  first, third and fifth rows are the honest failure: asked to parse an integer,
+  the companion wrote a **palindrome checker**, in Russian, as a console program
+  with `out` statements rather than a library function. It reported
+  `confidence: 0.47` and `verified: true` while doing it.
+* **`verified: true` is true and is not reassurance.** Verification means
+  `forgen check` compiled it - and it does: the generated palindrome checker
+  passes `forgen check` 100% OK. The code is valid Datara. It is just not the
+  code that was asked for, and nothing in the panel distinguishes "compiles" from
+  "answers the question".
+
+So the Generate panel is a **fragment composer with a keyword front-end**, not a
+model that understands a request. The panel now says so: the header no longer
+claims a token count the companion never sends (it read `3-gram · null tokens`
+for everyone - see `describeModel` in `ui/app.js`), and shows retrieval and
+verification as the separate capabilities they are.
+
+`confidence` is the field a caller should gate on, and nothing gated on it
+before this. A confidence below roughly 0.5 in the table above means the
+classifier did not really match; 0.15 means it fell through to `generic`.
 
 ## Architecture
 
@@ -271,12 +377,12 @@ the only component holding a capability grant.
 bash scripts/build.sh
 ```
 
-Nine stages, **346 assertions**, all green:
+Nine stages, **376 assertions**, all green:
 
 | stage | assertions | what it proves |
 |---|---|---|
 | wasm build | - | the module compiles and embeds |
-| single-file interface + icons | - | the Tauri icon set is generated from `assets/datara.ico`, and React, htm, app.js and the wasm core inline into one `ui/studio.html` with zero subresources, with the icon inlined as a data URI. **Fails the build** if the mark beside a `.dtr` file is backed by an icon under 32 px - see the icon note below |
+| single-file interface + icons | - | the Tauri icon set is generated from the one geometry in `scripts/mark.mjs`, and React, htm, app.js and the wasm core inline into one `ui/studio.html` with zero subresources, with the icon inlined as a data URI. Builds both variants - the full studio and `--core` without the companion. **Fails the build** if the mark beside a `.dtr` file is backed by an icon under 32 px, or if `ui/icon.svg` no longer matches the generated artwork - see the icon notes below |
 | Rust text core | 40 | the incremental line index matches a full rebuild after every edit |
 | highlighting pipeline | 40 | the token-to-line split is lossless on empty input, trailing newlines, unterminated strings, Cyrillic and emoji, **and every comment token starts with `//` and stops at its own line** - which is what caught the byte-offset bug |
 | interface renders | 192 | the component tree renders without throwing, every piece of chrome is present, the create name rule holds, an empty folder survives into the tree, the compiler's real coloured output parses into line, column and span, and a project check is aimed inside the workspace |
@@ -298,17 +404,116 @@ gestures**:
 ```bash
 node ui/test/shoot.mjs http://127.0.0.1:7878 shots        # real Chromium, writes PNGs
 node ui/test/drive.mjs http://127.0.0.1:7878 shots/drive  # real gestures, then reads the bytes off disk
+node ui/test/chat.mjs  http://127.0.0.1:7878              # the chat surface, against a live companion
 ```
 
-Neither is part of `build.sh`, because both need a running server and a
+None of these is part of `build.sh`, because they all need a running server and a
 Playwright install. `shoot.mjs` drives the real page in a real engine at a real
 viewport; `drive.mjs` right-clicks the tree, saves with Ctrl+S and presses Run,
 and then reads the result off the filesystem instead of trusting the screen. It
-currently makes **66** such checks, and because it walks every panel tab and
+currently makes **70** such checks, and because it walks every panel tab and
 drives every dialog, it is the only thing here that would notice a control that
 kills the window when you use it. It is also the only thing that types `fn` into
 a real browser and presses `Tab` - the structure suite can prove the table is
 right, but only a real key event proves the key is wired to it.
+
+`chat.mjs` exists because chat is the kind of feature that passes at the API
+layer and does nothing in the interface: the companion's own gate
+(`D:\ryan\tools\verify_chat.py`, 33 assertions) proves `/chat` and `/context`
+behave, and cannot prove the IDE reaches them or that the transcript renders. So
+it drives the panel - sending a question, a code request and a follow-up, then
+pressing **clear context** and asserting that the transcript *and* the readout
+both emptied and stayed empty. The companion is optional, so with it offline the
+suite asserts the honest empty state instead of going red for the wrong reason.
+
+### The LLVM backend, and the two bugs that hid behind "falling back"
+
+`forgen` ships two backends: a fast-to-compile native one (Cranelift) and an
+optimising `--llvm` one. Asking for LLVM used to appear to work and quietly did
+not. There were **two independent causes**, and both had the same symptom - a
+successful build - which is why neither was noticed.
+
+**One: the linker was shadowed.** Git-Bash ships a GNU `link.exe` at
+`/usr/bin/link.exe`, and on a machine where that directory precedes MSVC's, every
+link the compiler attempted went to a Unix hard-link utility:
+
+```
+/usr/bin/link: extra operand '/DEBUG:NONE'
+. Falling back to native Cranelift backend.
+```
+
+The fix is in `src/toolchain.dtr`, which finds MSVC and sets `PATH`, **`LIB` and
+`INCLUDE`** before the compiler runs. `LIB` and `INCLUDE` are not optional
+extras: with only `PATH` set, the right `link.exe` runs and then dies with
+`LNK1181: cannot open input file "legacy_stdio_definitions.lib"`, because
+`link.exe` finds its libraries through `LIB` and nowhere else. The Windows SDK
+version is discovered, not hardcoded, and the whole probe uses `dir_list` and
+`path_exists` - **no process is launched to find a linker**.
+
+Worth knowing: `env_set` stages a value for the next child process and
+`env_get` does *not* read it back (measured). That makes the prepend naturally
+idempotent - three calls leave exactly one entry in the child's `PATH` - and it
+means a "have I already done this?" guard would be dead code.
+
+**Two: the LLVM backend itself cannot compile list-heavy code.** Even with the
+linker correct, a real program trips an internal verifier error:
+
+```
+llc.exe: error: '<cache>/main_*.ll:11939:23: error: '%v5244' defined with type
+         'ptr' but expected 'i64'
+  %v18804 = phi i64 [ %v5244, %bb2 ], [ %v18806, %bb9 ]
+. Falling back to native Cranelift backend.
+```
+
+This is a codegen defect in forgen 1.4.2, not environment. It is isolated to
+**a `List`-typed local reassigned inside a `while` loop**, reproducible in the
+smallest form in `docs/llvm-backend-bug.dtr`:
+
+```datara
+fn f(items: List<Str>) -> Int {
+    mut acc = items
+    mut i = 0
+    while i < items.len() {
+        acc = acc.push(acc[i])   // <- removing this line lets LLVM finish
+        i = i + 1
+    }
+    return acc.len()
+}
+```
+
+Three of this project's six modules (`main`, `api`, `toolchain`) trigger it, so
+`--llvm` cannot build the studio until that is fixed upstream. It is a forgen
+bug, not a studio one, and the honest thing is to say so rather than work around
+it.
+
+**Measured, because the choice should be made on numbers.** Same source, same
+MSVC linker, this machine:
+
+| | native (Cranelift) | `--llvm` |
+|---|---|---|
+| `fib(30)`, recursive calls | 472-490 ms | 491-503 ms |
+| 40M-iteration arithmetic loop | 531-564 ms | **499-517 ms** |
+| build time | **292-294 ms** | 1055-1998 ms |
+| output size | 374.5 KB | 372-464 KB |
+
+LLVM wins a tight arithmetic loop by about **5%** and costs **3.5x-7x** the build
+time. Build time is paid on every Run; 5% is invisible outside a benchmark. So
+the default is the native backend - which is what "the fastest variant" actually
+means for someone using the IDE - and LLVM is one environment variable away:
+
+```bash
+FORGEN_LLVM=1 forgen run src/main.dtr   # every build in this session asks for --llvm
+```
+
+**The build now reports which backend it used.** Both facts are carried back from
+the server (`linker_ok`, `fell_back`) and named in the Run drawer:
+
+```
+forgen build  ·  ok  ·  exit 0  ·  took 894 ms  ·  native (LLVM ready: set FORGEN_LLVM=1)
+forgen build  ·  ok  ·  exit 0  ·  took 2103 ms ·  Cranelift (LLVM fell back - linker missing)
+```
+
+A silent fallback used to be indistinguishable from success. It no longer is.
 
 ### The icon is measured, not assumed
 
@@ -336,6 +541,127 @@ The 128 px entry the title screen uses was checked the same way, and it is
 **genuine**: it differs from a proper 256 -> 128 resample by a mean of 1.77 of
 255 per channel, against 7.62 for a 64 -> 128 upscale. It is not a fake upscale,
 which is what it looks like when magnified 4x.
+
+### There was a second mark, and the taskbar was showing it
+
+The measurements above were all correct and they were all about the wrong
+artwork. `assets/datara.ico` - the file the window icon, the taskbar, the
+browser tab and the title screen were all built from - held an **orange-and-yellow
+palm inside a yellow rounded square**. Everything inside the interface drew
+something else: two light brackets around a mint dot, which is what `ui/icon.svg`,
+the `Mark` component and the mark beside a `.dtr` file all show. Two marks were
+live in one window and the one on the taskbar was the wrong one. Amber is also
+the reserved warning colour in `docs/DESIGN-UI.md`, and the accent is mint, so
+the icon was arguing with the interface in colour as well as in shape.
+
+It had been made worse by a well-intentioned change: `build-icons.mjs` used to
+draw the mark itself, and was rewritten to read `assets/datara.ico` directly, on
+the argument that three approximations of one design are three designs. The
+argument is right. The conclusion was not, because that file was a *fourth*
+design rather than the first one.
+
+The geometry now lives in `scripts/mark.mjs`, `scripts/build-icons.mjs` writes it
+to `ui/mark.ico`, and everything else derives from those bytes. `build-ui.mjs`
+reads `ui/mark.ico` rather than `assets/`, so a stale file in `assets/` can no
+longer put a different icon in the browser tab than the one in the window.
+
+**Review icons on a light surface as well as a dark one.** The first attempt at
+the small entries dropped the dark plate at 16 and 24 px, because a 64-unit
+corner radius lands on the pixel grid there and produced dirty corners. It looked
+right on the dark review image. On the light one the icon had **vanished** - the
+brackets are `#E9E9EE`, which is invisible on white, so all that remained was the
+mint dot. `scripts/icon-sheet.mjs` now renders every entry at its real size,
+magnified 8x, on both surfaces, and that is the image to look at:
+
+```
+node scripts/icon-sheet.mjs shots/icons
+  shots/icons/sheet-light.png   and  shots/icons/sheet-dark.png
+```
+
+### Zen mode
+
+`Ctrl+Shift+Z`, or the button beside the panel toggle. Everything that is not the
+code goes - title bar, toolbar, explorer, right panel, breadcrumbs, status bar -
+and `Esc` brings it back. What survives is one 26px line: the file name, the
+cursor position, and a clickable error and warning count that leaves Zen and opens
+the Problems tab. Each of those can be turned off in **Settings → Zen**, along
+with soft wrap, a centred column width, extra breathing room and a larger face
+for reading. With the informational parts all off the bar collapses entirely, so
+this is configurable from "one quiet line" down to "literally just code".
+
+The mode is carried on `<html>` as `data-zen` rather than as a React class,
+because the rules it drives are about the shell's own grid and a grid track cannot
+be removed from inside the grid it belongs to: hiding five children with
+`display:none` leaves the reserved tracks behind, and the code ends up in a 1fr
+row with dead space above and below. Collapsing `grid-template-rows` to a single
+row is what makes the editor actually fill the window.
+
+Two things this got wrong first, both worth recording:
+
+* **The shortcut was registered in the editor mount**, which begins
+  `if (!edRef.current) return;` - so with no file open the handler was never
+  installed, the key arrived with nobody listening, and Zen looked broken rather
+  than unavailable. A shortcut that switches the *window's* layout must not depend
+  on the window's contents.
+* **The centred column insets the text surface, not the text.** A `max-width` on
+  the code alone leaves the line-number gutter at the window edge and puts the
+  caret in the wrong place, because the gutter is positioned from the surface's
+  own box.
+
+`node ui/test/zen.mjs http://127.0.0.1:7878 <a-directory-with-dtr-files>` drives
+all of it in a real browser and measures the result - 27 assertions covering the
+shortcut, the button, both exits, the grid collapse and every setting.
+
+### The core build, without the companion
+
+`node scripts/build-ui.mjs --core` writes `ui/studio-core.html`, and the server
+serves it at `/?core=1`. It is the same interface with the AI tabs taken out:
+four compiler tabs instead of seven, no plug in the bar, no "start the companion"
+in the palette, no companion section in Settings. Everything else - the compiler
+panels, the editor, the tree, the explorer, Layout, Project, git and search - is
+identical, because none of it was ever an AI feature.
+
+It is a flag rather than a second source file. `ui/app.js` reads
+`window.__DS_CORE__` in four places, and a conditional in four places can be
+audited in one sitting where two copies of a 4000-line file cannot. The build
+refuses to emit if the flag is not settled before `app.js` loads - the failure
+that would otherwise produce a file named `studio-core.html` containing the full
+studio.
+
+### The panel tab strip, and a test that lied twice
+
+Eight tabs want 404 px in a 264 px panel, so the row runs off the edge and
+scrolls. Two things were wrong with that, and neither was visible in a test until
+there was one that drove a browser.
+
+The auto-scroll that keeps the selected tab in view was not clamped, so selecting
+the **last** tab scrolled the row past its own end and pushed the **first** one
+out the **left** edge. Measured at 1440x900: `Problems` reported at x 1066 with
+the strip's own left edge at 1176, sitting over the code column, outside its
+container. And nothing indicated overflow at all - no arrows, no fade, a
+scrollbar hidden by `overflow:hidden` - so the tabs at the end were found by
+accident or not at all. Now: the scroll is clamped, two arrow buttons appear when
+the measured row overflows and disable at each end, and the long labels are
+abbreviated (`Issues`, `Symbols`), which brings 380 px down to 268 and fits the
+default panel outright.
+
+`ui/test/tabs.mjs` drives the real page and asserts **reachability** rather than
+appearance: every tab, when clicked, is brought fully into view; the row starts at
+`scrollLeft 0`; the arrows exist exactly when they are needed. Two traps in
+writing it, both kept in the comments because both cost a round:
+
+* **`getBoundingClientRect` does not know about clipping.** A child scrolled past
+  its container still reports its geometric position, so "no tab may have
+  `left < strip.left`" fails against a strip that is working perfectly. A
+  screenshot settles it - at full scroll `Project` is cut mid-word at the panel
+  edge, which *is* clipping. Assert on whether hiding is in effect, not on rects.
+* The first version asserted that every tab is visible at once, which contradicts
+  the entire design. The claim is reachability.
+
+The boot test caught one more real defect here: calling `el.scrollTo(...)`
+directly throws `is not a function` in a DOM without it, and because the throw
+lands inside React's commit the whole interface rendered as the crash screen. It
+is guarded now.
 
 `drive.mjs` also covers the desktop shell's title bar without needing the shell
 binary: it stubs what Tauri injects before any page script runs, and then asserts
@@ -478,28 +804,34 @@ only inside forgen.
 
 ## Honest limitations
 
-1. **Build status is authoritative again.** `system()` returns the process's real
+1. **`--llvm` cannot build this project yet, and the reason is upstream.** Three
+   of the six modules (`main`, `api`, `toolchain`) trip an internal LLVM
+   verifier error on any `List`-typed local reassigned inside a `while` loop; see
+   `docs/llvm-backend-bug.dtr` for the three-line reproduction. The default
+   backend is unaffected, the linker discovery is in place, and the moment forgen
+   fixes the codegen, `FORGEN_LLVM=1` starts using it with no change here.
+2. **Build status is authoritative again.** `system()` returns the process's real
    exit code on 1.4.0, so `/api/run` reports `exit` and derives `status` from the
    number rather than from the text - `status_source` is no longer `inferred`.
    SEAM-3 is retired; see `PORTING.md`. The output is still captured to a file
    rather than a pipe, because that is one process launch instead of two.
-2. **No document model on the server.** The browser holds the text and sends it
+3. **No document model on the server.** The browser holds the text and sends it
    on save; the server re-reads files. There is no revision tracking, no undo
    across sessions, no stale-result suppression yet - the kernel's `Freshness`
    and `Generation` counters are not wired in. That is the next real step.
-3. **The server holds no state and no structs.** Deliberate: it keeps every
+4. **The server holds no state and no structs.** Deliberate: it keeps every
    string raw and converts only at the JSON boundary, which is what makes the
    codepage handling tractable; see `PORTING.md` finding 1.
-4. **Single-threaded.** A slow `forgen build` blocks the IDE's own file reads
+5. **Single-threaded.** A slow `forgen build` blocks the IDE's own file reads
    for its duration. Suggestions are unaffected because the AI is a separate
    process. This is why `/api/health` must never spawn a process - it used to,
    and it made the cheapest endpoint in the server the slowest one.
-5. **There is no terminal.** `/api/run` will execute a whitelisted command
+6. **There is no terminal.** `/api/run` will execute a whitelisted command
    (`forgen`, `git`, `python`, `bash`) and return its real output and real exit
    code, but **nothing in the interface types into it** - the UI only calls
    `/api/action`, which runs a fixed `forgen` action. The `output` drawer is the
    closest thing that exists. An interactive console is unbuilt, not hidden.
-6. **The file tree is native now.** `dir_list` replaced the two shell listings,
+7. **The file tree is native now.** `dir_list` replaced the two shell listings,
    so `/api/tree` is **26 ms** on this workspace (was 487 ms). The walk is
    breadth-first with a budget, because a depth-first walk spends the whole
    budget inside the first folder it meets - on `D:/` that showed 5998 files and
@@ -507,7 +839,7 @@ only inside forgen.
    on purpose** (`shallow: true` in the response): a recursive listing of `D:/`
    grew the server to 3.9 GB and stopped it answering, which is how a workspace
    saved as `D:/` became unreadable.
-7. **Non-ASCII paths work, except for creating one.** `dir_list` returns cp1251
+8. **Non-ASCII paths work, except for creating one.** `dir_list` returns cp1251
    and the server keeps entry names raw on the inside, so a Cyrillic folder now
    lists, opens, reads and writes correctly. `st_fs_path` resolves a path from
    the browser by *finding* each segment in its parent's listing rather than
@@ -515,14 +847,14 @@ only inside forgen.
    which is also why a **new** folder or file whose name is not ASCII is refused
    with a reason instead of silently creating a misnamed one. See `PORTING.md`
    finding 1.
-8. **Syntax highlighting is a single-pass line tokenizer.** It does not
+9. **Syntax highlighting is a single-pass line tokenizer.** It does not
    understand multi-line strings or nested block comments, and it is not the
    semantic highlighting the spec asks for. Real semantic regions need the
    Datara provider, which does not exist yet.
-9. **Reading mode is a layout change, not a different mode.** The spec's Reading
+10. **Reading mode is a layout change, not a different mode.** The spec's Reading
    Mode wants call graphs, dependency views and ownership surfaces. Today it
    widens the viewport and hides the tree.
-10. **The layout inspector is a text scan, not a parser.** It reads multi-line
+11. **The layout inspector is a text scan, not a parser.** It reads multi-line
    declaration bodies only, so a single-line `pub struct X { a: Int }` is
    skipped, and generics are taken as text. It recognises all four declaration
    keywords (`struct`, `class`, `entity`, `record`), which it did not before - it
@@ -532,7 +864,7 @@ only inside forgen.
    the top. Its field sort compares bytes as integers rather than using `Str`
    `<`, because `Str` comparison is not deterministic on 1.4.0 (finding 13 in
    `ryan-harness/docs/COMPILER-NOTES.md`).
-11. **Deleting is permanent, and an ASCII-only operation.** Delete and rename
+12. **Deleting is permanent, and an ASCII-only operation.** Delete and rename
     both work in the explorer now, but delete shells out - forgen 1.4.0 has no
     file-delete builtin - so a name that is not ASCII cannot be spelled for the
     shell and is refused, with the reason, rather than silently deleting the

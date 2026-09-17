@@ -17,6 +17,10 @@ The compiler was updated to 1.4.0 and every seam was re-tested against the
 installed binary. Three of them are gone or smaller; the rest are live. The
 sections below still describe the 1.3.0 world, so read them with this table.
 
+Confirmed against 1.4.1 (the installed `forgen --version` reports 1.4.1 while
+`Cargo.toml` in the compiler's own tree said 1.4.0 - the seams below behave
+identically under both, and `forgen check src/main.dtr` is 100% clean on it).
+
 | Seam | 1.4.0 | Evidence |
 |------|-------|----------|
 | SEAM-1 element access | **retired** | `parts[0]` returns the string; an out-of-range *runtime* index returns `""` instead of reading past the end. `st_at` is deleted. |
@@ -600,6 +604,40 @@ exactly `socket_create`, `socket_bind`, `socket_listen`, `socket_accept`,
 ## Design choices, not workarounds
 
 These look like seams but are decisions. They stay.
+
+**Two interface variants from one source, not two builds.** `app.js` reads
+`window.__DS_CORE__` in four places and the palette, the panel, the bar and
+Settings each honour it. `scripts/build-ui.mjs` writes `studio.html` and
+`studio-core.html` from that one file, and the server picks between them on
+`?core=1`. The alternative - a separate source for the core build - is how the
+two get to disagree about what the editor does; a flag read in four places can be
+audited in one sitting. The build refuses to emit if the flag is not set before
+`app.js` loads, because the failure mode is a core file that silently contains
+the full studio.
+
+**The desktop shell starts the Datara server rather than bundling a page.** A
+static asset bundle could not read the project, run the compiler or watch the
+filesystem, which is the whole point. `src-tauri/src/main.rs` spawns
+`forgen run src/main.dtr` twice (two ports, because SEAM-6 makes one port a
+single point of failure), opens the window immediately on the bundled splash, and
+kills the children on exit. The webview talks to the server over loopback
+exactly as a browser does, which is why the desktop and browser builds cannot
+drift apart.
+
+**Build note, because it cost an hour:** `cargo` is installed at
+`%USERPROFILE%\.cargo\bin` but is **not** on the Bash tool's `PATH`, so
+`scripts/build-desktop.sh` fails with "cargo is required" under a Git Bash
+session while working fine in `cmd`. Prefix with
+`export PATH="$HOME/.cargo/bin:$PATH"`. The script's own guard is correct; the
+environment is what lies.
+
+**The shell had never actually compiled.** `src-tauri/target/release/datara-studio.exe`
+was 8.6 MB and dated, which read as "built and working" - but the source did not
+compile: `std::env::var("HOME")` moved `home` into the first `PathBuf::from` and
+used it again on the next line (`E0382`). The `.exe` was a stale artifact from an
+earlier revision. Fixed, and `scripts/build-desktop.sh` now runs clean. Worth
+knowing as a general lesson: **an existing binary is not evidence that the source
+builds.** Rebuild before believing it.
 
 **Line-based request bodies instead of JSON.** Writing JSON is trivial; parsing
 it in Datara is not, and no endpoint here needs a structured request. Two-argument

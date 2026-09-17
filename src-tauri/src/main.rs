@@ -104,8 +104,13 @@ fn forgen() -> Command {
         candidates.push(PathBuf::from(local).join("Programs").join("Datara").join("bin").join("forgen.exe"));
     }
     if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".local").join("bin").join("forgen"));
-        candidates.push(PathBuf::from(home).join(".datara").join("bin").join("forgen"));
+        // Two candidates from one string, so the join has to borrow it. An
+        // earlier version moved `home` into the first `PathBuf::from` and then
+        // used it again - which is E0382, and it compiled only because the
+        // stale binary it produced was never rebuilt until now.
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".local").join("bin").join("forgen"));
+        candidates.push(home.join(".datara").join("bin").join("forgen"));
     }
     candidates.push(PathBuf::from("/usr/local/bin/forgen"));
     candidates.push(PathBuf::from("/usr/bin/forgen"));
