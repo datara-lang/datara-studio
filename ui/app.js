@@ -24,10 +24,27 @@ const html = htm.bind(React.createElement);
 //
 // `ui/tauri-bridge.js` creates this object and is loaded before this file, so the
 // value is settled by the time this line runs. In a browser it is never created
-// and this is `null` - which is the entire mechanism by which the title bar
-// exists in the desktop build and does not exist in the browser build. `TitleBar`
-// is the only component that reads it.
+// and this is `null` - which is how the window controls know whether there is a
+// window to control. `CapControls` is the only component that reads it.
 const SHELL = (typeof window !== "undefined" && window.__DS_SHELL__) || null;
+
+// --------------------------------------------------------------- core build
+
+// Datara Studio, Core: the same interface with the companion taken out.
+//
+// Not a second page and not a stripped bundle. `scripts/build-ui.mjs` sets
+// `window.__DS_CORE__` when it is asked for the core variant, and everything
+// that follows from that is in this file: two tabs are not drawn, the start-the-
+// companion action is not offered, and the plug in the bar is not rendered. The
+// compiler, the editor, the tree, the explorer, Layout, Project, git and search
+// are untouched and identical, because none of them were ever AI features.
+//
+// The reason it is a flag rather than a second build of the source: the studio
+// has exactly one interface, and a fork is how the two get to disagree. A
+// conditional that is read in four places can be audited; two copies of a
+// 4000-line file cannot.
+const CORE = (typeof window !== "undefined" && window.__DS_CORE__) === true;
+const core = CORE;
 
 // ---------------------------------------------------------------- wasm core
 
@@ -106,6 +123,10 @@ const Editor = {
   sel: { line: 1, col: 1 },
   comp: null, completer: null, highlighter: coreHighlight, lh: 21, cw: 9.1, fontSize: 13.5,
   onCursor: null, onInput: null, onLex: null, onZoom: null, onHoverAsk: null,
+  // Set by `acceptComplete` for a snippet that has a body to step into, and
+  // consumed by `takeStop` on the next plain Tab. Declared here so the field
+  // exists before the first snippet is inserted.
+  pendingStop: null,
 
   mount(container, handlers) {
     this.onCursor = handlers.onCursor;
@@ -147,7 +168,10 @@ const Editor = {
       this.updateComplete();
       this.onInput && this.onInput(this.ta.value);
     });
-    this.ta.addEventListener("click", () => { this.updateCursor(); this.setComplete(null); });
+    // A click elsewhere in the buffer means the snippet is no longer what the
+    // person is working on, so the pending Tab stop is dropped. Same for the
+    // caret being moved by anything other than Tab.
+    this.ta.addEventListener("click", () => { this.updateCursor(); this.setComplete(null); this.pendingStop = null; });
     // Ctrl+click goes to the declaration, which is what every editor does and
     // what a hand reaches for before remembering there is a key for it.
     this.ta.addEventListener("click", (e) => {
@@ -326,6 +350,26 @@ const Editor = {
     // Selecting the placeholder is what makes the template usable: the next
     // character typed replaces the name rather than landing after it.
     ta.selectionEnd = it.select ? Math.min(at + it.select, from + text.length) : at;
+    // The second stop, for the shapes that have somewhere to go afterwards: the
+    // empty body. Recorded as a LINE and a COLUMN rather than a buffer offset,
+    // because the placeholder name is meant to be replaced: `name` is four
+    // characters and `probe` is five, so after the rename every offset below the
+    // name has shifted by one - including the one that was supposed to point at
+    // the body. A line-and-column stop does not move when the name changes
+    // length, which is the whole reason it is stored this way.
+    if (it.stop !== undefined) {
+      // Where the stop sits inside the snippet itself.
+      const before = text.slice(0, it.stop).split("\n");
+      const linesBefore = before.length - 1;
+      const col = before[before.length - 1].length;
+      // And where the snippet starts, in whole lines. `from` is the buffer
+      // offset the snippet was inserted at, so the number of newlines between
+      // the top of the buffer and there is the snippet's starting line.
+      const firstLine = ta.value.slice(0, from).split("\n").length;
+      this.pendingStop = { line: firstLine + linesBefore, col };
+    } else {
+      this.pendingStop = null;
+    }
     this.setComplete(null);
     this.repaint();
     this.onInput && this.onInput(ta.value);
@@ -336,6 +380,39 @@ const Editor = {
     if (!this.comp) return false;
     this.comp.sel = (this.comp.sel + d + this.comp.items.length) % this.comp.items.length;
     this.setComplete(this.comp);
+    return true;
+  },
+
+  /** The second stop of a snippet: the caret goes to the body.
+   *
+   * Returns true when it moved, so the caller can stop before inserting an
+   * indent. The offer is dropped the moment anything else happens - a keystroke
+   * that is not Tab, a click, a file switch - because a stray Tab ten lines
+   * later jumping the caret back into a `fn` would be worse than no stop at all.
+   *
+   * The stored line/column is turned back into an offset here, against the
+   * buffer as it stands now. Typing a longer name than the placeholder does not
+   * move the target, and neither does typing a shorter one. If the buffer no
+   * longer has that line at all (a file switch, or the snippet was deleted),
+   * the stop is refused and Tab falls through to ordinary indentation, which is
+   * what the key means everywhere else.
+   */
+  takeStop() {
+    const s = this.pendingStop;
+    this.pendingStop = null;
+    if (!s || !this.ta) return false;
+    const lines = this.ta.value.split("\n");
+    if (s.line < 1 || s.line > lines.length) return false;
+    let at = 0;
+    for (let i = 0; i < s.line - 1; i++) at += lines[i].length + 1;
+    // Never past the end of the target line: an empty body line is shorter than
+    // the column the snippet asked for, and the caret has to land in it either
+    // way rather than at the start of the next line.
+    at += Math.min(s.col, lines[s.line - 1].length);
+    this.ta.focus();
+    this.ta.selectionStart = at;
+    this.ta.selectionEnd = at;
+    this.repaint();
     return true;
   },
   setSymbols(syms) { this.symbols = syms || []; },
@@ -822,21 +899,41 @@ const KEYWORDS = [
  *         compiles, which a reserved word could not.
  */
 const SNIPPETS = {
-  fn:        { body: "fn name() -> Int {\n    return 0\n}", caret: 3, select: 4 },
+  // The body of a new `fn` is empty, with the caret on the blank line.
+  //
+  // It used to arrive as `return 0`. That is a placeholder that has to be
+  // deleted before the function can be written, and it is wrong for the common
+  // case: the value a function returns is the one thing you have not decided yet
+  // when you type its name. An empty body is the honest starting point.
+  //
+  // There is no `-> Int` either, and that is what `forgen` insists on rather
+  // than a stylistic choice: `fn name() -> Int { }` is E-TYPE-003, because not
+  // every code path returns a value. A body with no return clause does not
+  // compile with a declared return type - not `Int`, and not `Void` either,
+  // which is rejected the same way. The only empty body the language accepts is
+  // a function with no arrow at all, so the snippet writes one, and adding the
+  // return type is part of writing the function.
+  //
+  // `stop` is where Tab takes you *after* the name has been typed: offset 3
+  // names the function, and the second Tab lands inside the empty body. Without
+  // it, typing `fn` then a name left the caret after the name with three keys
+  // (End, Down, End) still to press before the first line of the function could
+  // be written - which is the friction "пиши код комфортно" was about.
+  fn:        { body: "fn name() {\n    \n}", caret: 3, select: 4, stop: 16 },
   struct:    { body: "struct Name {\n    name_field: Int\n}", caret: 7, select: 4 },
   class:     { body: "class Name {\n    name_field: Int\n}", caret: 6, select: 4 },
   entity:    { body: "entity Name {\n    name_field: Int\n}", caret: 7, select: 4 },
   record:    { body: "record Name {\n    name_field: Int\n}", caret: 7, select: 4 },
   component: { body: "component Name {\n    name_field: Int\n}", caret: 10, select: 4 },
-  behavior:  { body: "behavior Name {\n    name_method() -> Int {\n        return 0\n    }\n}", caret: 9, select: 4 },
+  behavior:  { body: "behavior Name {\n    name_method() -> Int {\n        \n    }\n}", caret: 9, select: 4 },
   trait:     { body: "trait Name {\n    name_method() -> Int\n}", caret: 6, select: 4 },
   enum:      { body: "enum Name {\n    NameA\n    NameB\n}", caret: 5, select: 4 },
   type:      { body: "type Name = Int", caret: 5, select: 4 },
   extern:    { body: "extern fn name() -> Int", caret: 10, select: 4 },
-  if:        { body: "if cond {\n    \n}", caret: 3, select: 4 },
-  while:     { body: "while cond {\n    \n}", caret: 6, select: 4 },
-  for:       { body: "for item in items {\n    \n}", caret: 4, select: 4 },
-  match:     { body: "match value {\n    \n}", caret: 6, select: 5 },
+  if:        { body: "if cond {\n    \n}", caret: 3, select: 4, stop: 14 },
+  while:     { body: "while cond {\n    \n}", caret: 6, select: 4, stop: 17 },
+  for:       { body: "for item in items {\n    \n}", caret: 4, select: 4, stop: 24 },
+  match:     { body: "match value {\n    \n}", caret: 6, select: 5, stop: 18 },
   // the capability scope is required around exec / file_* / socket_* / env_get,
   // and the justification string is not optional, so the caret goes between the
   // quotes rather than at the end of the line. 23, not 22: offset 22 is the
@@ -921,10 +1018,15 @@ const DATARA_DOCS = {
  */
 function completerFor(word, outline, suggestions) {
   const out = [], seen = new Set();
-  const add = (label, insert, hint, caret, select) => {
+  // `stop` is carried through explicitly. It was silently dropped when it was
+  // added, because this helper builds the item from a fixed list of fields and
+  // an unknown one simply does not survive the trip - the snippet table had the
+  // offset, the completion list did not, and the second Tab did nothing. A field
+  // that reaches `acceptComplete` has to be named here or it does not exist.
+  const add = (label, insert, hint, caret, select, stop) => {
     if (seen.has(label)) return;
     seen.add(label);
-    out.push({ label, insert, hint, caret, select });
+    out.push({ label, insert, hint, caret, select, stop });
   };
   for (const s of outline) if (s.name.startsWith(word)) add(s.name, s.name, s.kind);
   for (const k of KEYWORDS) {
@@ -933,7 +1035,7 @@ function completerFor(word, outline, suggestions) {
     // A keyword that opens a shape inserts the shape. The hint says "snippet"
     // rather than "keyword", because Tab doing something other than inserting
     // the two letters already on screen has to be visible before it is pressed.
-    if (snip) add(k, snip.body, "snippet", snip.caret, snip.select);
+    if (snip) add(k, snip.body, "snippet", snip.caret, snip.select, snip.stop);
     else add(k, k, "keyword");
   }
   for (const t of TYPES) if (t.startsWith(word)) add(t, t, "type");
@@ -1287,6 +1389,8 @@ const Ico = ({ k, size }) => {
     save: html`<g ...${st}><path d="M2.4 2.4h8l1.2 1.2v8H2.4z"></path><path d="M5 2.4v3.2h4V2.4M5 11.6V8.4h4v3.2"></path></g>`,
     search: html`<g ...${st}><circle cx="6.6" cy="6.6" r="4"></circle><path d="M9.6 9.6L12.4 12.4"></path></g>`,
     chevron: html`<g ...${st}><path d="M4.5 3L7.5 6L4.5 9"></path></g>`,
+    chevL: html`<g ...${st}><path d="M8.4 3.4L5.4 6.4L8.4 9.4"></path></g>`,
+    chevR: html`<g ...${st}><path d="M5.6 3.4L8.6 6.4L5.6 9.4"></path></g>`,
     gear: html`<g ...${st}><circle cx="7" cy="7" r="2.2"></circle><path d="M7 1.4v1.7M7 10.9v1.7M1.4 7h1.7M10.9 7h1.7M3.05 3.05l1.2 1.2M9.75 9.75l1.2 1.2M10.95 3.05l-1.2 1.2M4.25 9.75l-1.2 1.2"></path></g>`,
     plus: html`<g ...${st}><path d="M7 3v8M3 7h8"></path></g>`,
     close: html`<g ...${st}><path d="M3.6 3.6l6.8 6.8M10.4 3.6l-6.8 6.8"></path></g>`,
@@ -1310,6 +1414,11 @@ const Ico = ({ k, size }) => {
     "file-css": html`<g ...${st}><path d="M5.4 2.2L4.2 11.8M9.8 2.2L8.6 11.8M2.6 5.2h9M2.2 8.8h9"></path></g>`,
     "file-sh": html`<g ...${st}><path d="M3 4.4L5.4 7L3 9.6"></path><path d="M7.4 9.6h3.6"></path></g>`,
     "file-txt": html`<g ...${st}><path d="M2.6 4.2h8.8M2.6 7h8.8M2.6 9.8h5.4"></path></g>`,
+    // Zen: a frame with the four corners pulled outward, i.e. "the chrome
+    // recedes". Drawn as four bent corner marks rather than a plain rectangle
+    // with arrows, because at 15px arrows on a rectangle read as "fullscreen"
+    // next to the panel toggle, which is already in this bar.
+    zen: html`<g ...${st}><path d="M2.2 5V2.2H5"></path><path d="M9 2.2h2.8V5"></path><path d="M11.8 9v2.8H9"></path><path d="M5 11.8H2.2V9"></path></g>`,
   };
   return html`<svg width=${s} height=${s} viewBox="0 0 14 14" aria-hidden="true">${shapes[k] || shapes.file}</svg>`;
 };
@@ -1338,42 +1447,65 @@ const ACTIONS = [
  * not. `restore` is two offset squares - the same figure Windows uses, so the
  * button reads as "put it back" without a tooltip.
  */
+/** The three caption glyphs: minimise, maximise/restore, close.
+ *
+ * Drawn at their real size in a 10px box, with the half-pixel offsets that make
+ * a 1px stroke land on a pixel boundary instead of straddling two. That is not
+ * fussiness - it is the whole difference between a crisp line and a grey smear,
+ * and this is a 10px glyph where a smear is most of what you see.
+ *
+ * The earlier version was the same geometry but `strokeWidth: 1` on a `0 0 10 10`
+ * box rendered into a button, with the buttons inheriting `--ink2` (#9A9AA4 at
+ * rest). Against a #0B0B0E bar that is a mid-grey hairline, and Windows' own
+ * caption buttons are essentially white. Measured against the real window: the
+ * controls read as faint scratches you had to hunt for. The colour moved to the
+ * CSS (`--ink1` at rest) and the stroke is now 1.25 with `crispEdges`, which is
+ * what makes it legible without making it clunky.
+ *
+ * `shapeRendering: crispEdges` is what keeps the horizontal/vertical strokes
+ * from being anti-aliased into two half-intensity rows. It is deliberately NOT
+ * applied to the restore diagonal-free shapes only - none of these glyphs have
+ * diagonals except the close cross, which is left smooth on purpose, because
+ * crispEdges on a diagonal produces visible stair-stepping.
+ */
 const WinGlyph = ({ k }) => {
-  const s = { fill: "none", stroke: "currentColor", strokeWidth: 1, shapeRendering: "crispEdges" };
+  const line = { fill: "none", stroke: "currentColor", strokeWidth: 1.25 };
+  const crisp = { ...line, shapeRendering: "crispEdges" };
   if (k === "min") {
-    return html`<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0 5.5h10" ...${s} /></svg>`;
+    // a 1px rule on the exact pixel row the eye expects
+    return html`<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0 5h10" ...${crisp} /></svg>`;
   }
   if (k === "max") {
-    return html`<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x=".5" y=".5" width="9" height="9" ...${s} /></svg>`;
+    return html`<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="0.5" width="9" height="9" ...${crisp} /></svg>`;
   }
   if (k === "restore") {
-    return html`<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.5.5h7v7" ...${s} /><rect x=".5" y="2.5" width="7" height="7" ...${s} /></svg>`;
+    return html`<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.5 0.5h7v7" ...${crisp} /><rect x="0.5" y="2.5" width="7" height="7" ...${crisp} /></svg>`;
   }
-  return html`<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M.5.5l9 9M9.5.5l-9 9" ...${s} /></svg>`;
+  return html`<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0.5 0.5l9 9M9.5 0.5l-9 9" ...${line} /></svg>`;
 };
 
-/** The window's own title bar.
+/** The three window controls, for the right end of the intent bar.
  *
- * The native caption is a Windows bar drawn over an editor: its height, its
- * font, its colours and its menu are all the system's, and none of them are
- * this interface's. So the window is created undecorated
- * (`src-tauri/src/main.rs`) and this is what replaces it.
+ * The window is undecorated (`src-tauri/src/main.rs`), so without these there is
+ * no way to minimise, maximise or close except the taskbar and Alt+F4.
  *
- * It renders nothing at all when there is no shell, which is why the browser
- * build is unaffected: no element, and `.shell` keeps its three rows.
+ * They used to sit in a caption bar of their own above the intent bar. That is
+ * where Windows puts them and it looked right, but it cost a whole row of
+ * vertical space, and a row of chrome in an editor is expensive. They are now
+ * the last group in the intent bar, behind their own vertical rule so they do
+ * not read as another toolbar button.
  *
- * Dragging is `data-tauri-drag-region="deep"` rather than a mousedown handler
- * calling `startDragging()`. Tauri's own injected script walks up from the
- * clicked element and stops at anything clickable, so the three buttons stay
- * clickable and everything else - the mark, the title, the empty space between -
- * moves the window; and a double-click on any of it maximises. Hand-rolling that
- * would mean reimplementing the clickable-element test, and getting it wrong
- * means a button that drags the window instead of pressing.
+ * Dragging is `data-tauri-drag-region="deep"` on the bar itself rather than a
+ * mousedown handler calling `startDragging()`. Tauri's injected script walks up
+ * from the clicked element and stops at anything clickable, so these three stay
+ * clickable while the rest of the bar moves the window, and a double-click on
+ * the empty part maximises. Hand-rolling that would mean reimplementing the
+ * clickable-element test, and getting it wrong means a button that drags the
+ * window instead of pressing.
  *
- * The label is the open file, because that is the question a title bar answers
- * and the intent bar below already answers "which workspace".
+ * Renders nothing without a shell, so the browser build is unchanged.
  */
-const TitleBar = memo(function TitleBar({ shell, label }) {
+const CapControls = memo(function CapControls({ shell }) {
   const [max, setMax] = useState(false);
   useEffect(() => {
     if (!shell) return undefined;
@@ -1385,18 +1517,13 @@ const TitleBar = memo(function TitleBar({ shell, label }) {
   // rejection here stops it also arriving as an unhandled rejection, which would
   // print the same fact twice.
   const press = (p) => { if (p && p.catch) p.catch(() => {}); };
-  return html`<div class="titlebar" data-tauri-drag-region="deep">
-    <i class="fico fico-dtr tbmark" aria-hidden="true"></i>
-    <span class="tbtitle">${label || "Datara Studio"}</span>
-    <span class="tbspace"></span>
-    <div class="capctl">
-      <button class="capbtn" title="Minimise" aria-label="Minimise"
-        onClick=${() => press(shell.minimize())}><${WinGlyph} k="min" /></button>
-      <button class="capbtn" title=${max ? "Restore" : "Maximise"} aria-label=${max ? "Restore" : "Maximise"}
-        onClick=${() => press(shell.toggleMaximize())}><${WinGlyph} k=${max ? "restore" : "max"} /></button>
-      <button class="capbtn danger" title="Close" aria-label="Close"
-        onClick=${() => press(shell.close())}><${WinGlyph} k="close" /></button>
-    </div>
+  return html`<div class="capctl">
+    <button class="capbtn" title="Minimise" aria-label="Minimise"
+      onClick=${() => press(shell.minimize())}><${WinGlyph} k="min" /></button>
+    <button class="capbtn" title=${max ? "Restore" : "Maximise"} aria-label=${max ? "Restore" : "Maximise"}
+      onClick=${() => press(shell.toggleMaximize())}><${WinGlyph} k=${max ? "restore" : "max"} /></button>
+    <button class="capbtn danger" title="Close" aria-label="Close"
+      onClick=${() => press(shell.close())}><${WinGlyph} k="close" /></button>
   </div>`;
 });
 
@@ -1407,11 +1534,60 @@ const TitleBar = memo(function TitleBar({ shell, label }) {
  * most valuable strip of the window. A dot says everything the sentence did, and
  * a tooltip says the rest if you want it.
  */
+/** The one line of chrome Zen keeps.
+ *
+ * Zen is a mode whose entire promise is "just the code", so the failure mode is
+ * being too generous with what it keeps, not too strict. Every part here is off
+ * by default except the two that answer a question a writer actually asks mid-
+ * sentence - where am I, and is this file broken - and each can be turned off
+ * individually in Settings. With all of them off the bar collapses entirely
+ * (`html[data-zen="1"] .zenbar.empty`), so "just code" really is just code.
+ *
+ * It is a bar rather than an overlay in the corner on purpose: an overlay sits
+ * on top of the code, and in a mode about removing distraction, adding something
+ * that covers line 40 is the wrong trade.
+ */
+const ZenBar = memo(function ZenBar({ values, onExit, onOpenProblems,
+                                      fileName, cursor, lang, dirty, counts, running }) {
+  const parts = [];
+  if (values.zenFile) {
+    parts.push(html`<span class="z" key="f"><b>${fileName || "no file"}</b>${dirty ? html`<i class="dotd" />` : null}</span>`);
+  }
+  if (values.zenStatus) {
+    parts.push(html`<span class="z" key="c"><b>${cursor.line}</b>:${cursor.col}</span>`);
+    if (lang) parts.push(html`<span class="z" key="l">${lang}</span>`);
+    if (running) parts.push(html`<span class="z" key="r"><b>running</b></span>`);
+  }
+  // The problems ticker is the whole reason this bar exists rather than nothing.
+  // It is the one piece of the right panel that is worth interrupting for, and
+  // it is clickable: pressing it leaves Zen and opens the panel on Problems,
+  // because knowing there are three warnings is only useful if you can get to
+  // them without first working out how to get out of the mode you are in.
+  const nErr = counts ? counts.error : 0;
+  const nWarn = counts ? counts.warn : 0;
+  if (values.zenProblems && (nErr || nWarn)) {
+    parts.push(html`<span class="z act" key="p" onClick=${onOpenProblems}
+      title="Leave Zen and open Problems">
+      ${nErr ? html`<span style=${{ color: "var(--err, #D9705F)" }}>${nErr} error${nErr === 1 ? "" : "s"}</span>` : null}
+      ${nErr && nWarn ? html`<span>·</span>` : null}
+      ${nWarn ? html`<span>${nWarn} warning${nWarn === 1 ? "" : "s"}</span>` : null}
+    </span>`);
+  } else if (values.zenProblems) {
+    parts.push(html`<span class="z" key="p0">no problems</span>`);
+  }
+  parts.push(html`<span class="space" key="s"></span>`);
+  parts.push(html`<span class="z zesc" key="e" onClick=${onExit} style=${{ cursor: "pointer" }}
+    title="Leave Zen mode">Esc</span>`);
+  const empty = !(values.zenFile || values.zenStatus || values.zenProblems);
+  return html`<div class=${"zenbar" + (empty ? " empty" : "")}>${parts}</div>`;
+});
+
 const IntentBar = memo(function IntentBar({ root, wsName, coreVersion, aiOnline, aiLabel, running,
                                             onAction, onPalette, onOpenFolder, onSave, onSettings,
                                             onToggleMode, readMode, onSearch, search,
                                             setSearch, treeFold, panelFold,
-                                            onFoldTree, onFoldPanel, gitBranch, gitDirty }) {
+                                            onFoldTree, onFoldPanel, gitBranch, gitDirty,
+                                            onZen }) {
   const [menu, setMenu] = useState(false);
   const [aiMenu, setAiMenu] = useState(false);
   useEffect(() => {
@@ -1420,8 +1596,9 @@ const IntentBar = memo(function IntentBar({ root, wsName, coreVersion, aiOnline,
     window.addEventListener("click", close);
     return () => window.removeEventListener("click", close);
   }, [menu, aiMenu]);
-  return html`<div class="intent">
+  return html`<div class="intent" data-tauri-drag-region="deep">
     <div class="left">
+      <i class="fico fico-dtr ibmark" aria-hidden="true"></i>
       <button class="iconbtn" title="Settings   Ctrl+," onClick=${onSettings}><${Ico} k="gear" /></button>
       <button class=${"iconbtn" + (treeFold ? " off" : "")} title="Show or hide the explorer"
         onClick=${onFoldTree}><${Ico} k="panel" /></button>
@@ -1434,12 +1611,6 @@ const IntentBar = memo(function IntentBar({ root, wsName, coreVersion, aiOnline,
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><path d="M1.8 4.2h4l1.2 1.6h6.2v6H1.8z"></path></svg>
         <span>${wsName}</span>
       </span>
-      ${gitBranch ? html`<span class=${"gitchip" + (gitDirty ? " dirty" : "")} title=${gitDirty
-        ? gitDirty + " uncommitted change(s) - click the Project panel for the list"
-        : "clean working tree"}>
-        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><circle cx="4" cy="3.4" r="1.5"></circle><circle cx="12" cy="12.6" r="1.5"></circle><path d="M4 4.9v6.4a2 2 0 0 0 2 2h4.5"></path><path d="M12 11.1V4.6"></path></svg>
-        ${gitBranch}${gitDirty ? html`<i>${gitDirty}</i>` : null}
-      </span>` : null}
       ${coreVersion ? html`<span class="chip" title=${"wasm text core v" + coreVersion + " - lexer and document model, compiled from Rust"}>
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round">
           <path d="M8 1.6l5.4 3.1v6.6L8 14.4 2.6 11.3V4.7z"></path>
@@ -1451,6 +1622,7 @@ const IntentBar = memo(function IntentBar({ root, wsName, coreVersion, aiOnline,
       <span class="searchhint">search</span>
     </div>
     <div class="right">
+      ${CORE ? null : html`<${React.Fragment}>
       <button class=${"aistat" + (aiOnline ? " on" : "")}
         title=${aiOnline
           ? "The companion is running - suggestions and a second opinion on diagnostics"
@@ -1464,8 +1636,12 @@ const IntentBar = memo(function IntentBar({ root, wsName, coreVersion, aiOnline,
         <div class="row" onClick=${() => { setAiMenu(false); onToggleAI(); }}>
           <span>${aiOnline ? "Turn it off" : "Turn it on"}</span></div>
       </div>` : null}
+      </${React.Fragment}>`}
       <button class=${"iconbtn" + (panelFold ? " off" : "")} title="Show or hide the right panel"
         onClick=${onFoldPanel}><${Ico} k="panel" /></button>
+      <button class="iconbtn" title="Zen mode - just the code   Ctrl+Shift+Z"
+        onClick=${onZen}><${Ico} k="zen" /></button>
+      <${CapControls} shell=${SHELL} />
       <div class="runwrap">
       <div class=${"run" + (running ? " busy" : "")}>
         <button class="main" onClick=${() => onAction("run")} title="Run  Ctrl+Enter">
@@ -1796,17 +1972,94 @@ const Tree = memo(function Tree({ files, dirs, current, filter, setFilter, onOpe
 // what a tab is called and the order they come in live here rather than inside
 // either one - otherwise the Settings list and the strip could disagree about
 // what a tab is, which is the kind of drift that makes a settings screen lie.
-const PANEL_TAB_IDS = ["prob", "struct", "proj", "lay", "ai", "gen"];
+const PANEL_TAB_IDS = ["prob", "struct", "proj", "lay", "ai", "gen", "chat"];
 const PANEL_TAB_LABELS = {
   prob: "Problems", struct: "Structure", proj: "Project",
-  lay: "Layout", ai: "AI", gen: "Generate",
+  lay: "Layout", ai: "AI", gen: "Generate", chat: "Chat",
 };
+// The tabs that are AI rather than the language.
+//
+// `core` is the studio with the companion removed - not a stripped build and not
+// a second interface, the same page with these tabs absent and the plug behind
+// them taken out of the bar. It is a list rather than a flag on each tab because
+// the answer is needed in exactly two places (which tabs to draw, and whether to
+// offer to start the companion at all) and both of them want the same set.
+// Adding a third AI tab means adding it here and nowhere else.
+const AI_TABS = ["ai", "gen", "chat"];
+// Short labels for the tab strip.
+//
+// "Problems" is 72px and "Structure" 70px, so six of them want 380px in a panel
+// that is 264px wide by default - 116px of the strip was unreachable, and the
+// auto-scroll that keeps the selected tab visible was pushing the first tab out
+// the LEFT edge where nothing says it exists. Abbreviating the four long names
+// costs nothing (the full name is in the tooltip, and the Settings list already
+// says what each one is) and brings the row to 268px, which fits a default panel
+// almost exactly. A wider panel shows the abbreviations with room to spare,
+// which is the right failure: too short a label is a nicety, an unreachable tab
+// is a bug.
+const PANEL_TAB_SHORT = {
+  prob: "Issues", struct: "Symbols", proj: "Project",
+  lay: "Layout", ai: "AI", gen: "Generate", chat: "Chat",
+};
+
+/**
+ * One line describing the companion's generator, for the Generate header.
+ *
+ * This exists because the obvious version was wrong in public. The header used
+ * to read `${genModel.order}-gram · ${genModel.total_tokens} tokens`, and the
+ * companion sets `total_tokens` from the model object it holds, which is `null`
+ * for the pure-Python n-gram model - so every user of the full build saw
+ * "3-gram · null tokens" as the first thing on the panel. The honest badge is
+ * whatever the companion actually reported: a corpus size it knows, or nothing
+ * about size at all.
+ *
+ * The count arrives under two different keys depending on the verb - `GET
+ * /model` sends `trained_on`, `POST /model` sends `trained_on_files` - and the
+ * IDE only ever uses the POST, but reading both costs one `||` and means a
+ * change on either side cannot silently empty the badge again.
+ *
+ * `retriever` and `verifier` are the two capabilities the panel's own prose
+ * promises ("exemplar retrieval", "verification through forgen"), so they are
+ * shown as present or absent rather than assumed. A generator without them is
+ * still usable - it just warrants less trust, which is exactly what the reader
+ * needs to know before pressing the button.
+ */
+function describeModel(m) {
+  const bits = [];
+  if (m.order != null) bits.push(m.order + "-gram");
+  const files = m.trained_on_files != null ? m.trained_on_files : m.trained_on;
+  if (files != null) bits.push(files + " files");
+  if (m.total_tokens != null) bits.push(m.total_tokens + " tokens");
+  const caps = [];
+  if (m.retriever) caps.push("retrieval");
+  if (m.verifier) caps.push("verified");
+  const head = bits.length ? bits.join(" · ") : "model loaded";
+  return caps.length ? head + " · " + caps.join(" · ") : head;
+}
+
+/**
+ * A character count as a size a person reads at a glance.
+ *
+ * The chat context readout is the only place the interface shows "how much is
+ * being carried", and "1705" is a number nobody has an intuition for while
+ * "1.7 KB" reads instantly. Kept separate from the file-size display elsewhere
+ * because that one says "bytes" literally and is compared against a limit.
+ */
+function fmtBytes(n) {
+  if (n == null) return "0";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
 
 const Panel = memo(function Panel({ tab, setTab, order, hidden, onReorder,
                                      suggestions, diagnostics, aiOnline, aiLabel,
                                      layout, layoutBusy, onScan, onInsert, onGoto, outline,
                                      genReq, genRes, genErr, genBusy, genModel, onGenReq, onGenerate,
                                      genWhere,
+                                     chatMsgs, chatReq, chatBusy, chatErr, chatCtx, chatClearing,
+                                     onChatReq, onChatSend, onChatClear, onChatUndo, onChatProject,
+                                     fmtBytes,
                                      onStartAI, aiStarting, project, git, refs, refWord, refBusy, onFindRefs,
                                      current, onOpen, projDiag, projBusy, projWhere, onCheckProject, onGotoProblem }) {
   const sev = (s) => (s === "warning" ? "w" : "e");
@@ -2006,7 +2259,7 @@ struct below says which of the two applies.</pre>
   const genBody = () => html`<div>
     <div class="card">
       <div class="ch"><b>Generate Datara</b>
-        ${genModel ? html`<span class="tag">${genModel.order}-gram · ${genModel.total_tokens} tokens</span>` : null}</div>
+        ${genModel ? html`<span class="tag">${describeModel(genModel)}</span>` : null}</div>
       <pre>The in-context generator: a trained n-gram model over this project plus
 exemplar retrieval, structural shapes and verification through forgen. Pure
 Python, so it needs no ML runtime. The open file is sent as context.</pre>
@@ -2037,8 +2290,92 @@ Python, so it needs no ML runtime. The open file is sent as context.</pre>
     </div>` : null}
   </div>`;
 
-  const counts = { prob: diagnostics.length, struct: outline.length };
-  const TABLES = PANEL_TAB_IDS.map((k) => [k, PANEL_TAB_LABELS[k], counts[k] || 0]);
+  // The chat tab.
+  //
+  // Chat rather than the plain Generate box because the two answer different
+  // questions. Generate is a one-shot "write me a function"; a chat carries the
+  // previous turn, so "а теперь по убыванию" and "почему main не оптимизировали"
+  // have a referent at all. The companion has had a /chat endpoint all along - it
+  // simply had no surface in the IDE, and the only path it did have ran through
+  // the torch transformer, which is not installed here.
+  //
+  // The context strip is not decoration. The whole feature is that the model knows
+  // what was said before, and the only way to trust that is to see it: how many
+  // turns are being carried, where the context came from, and a button that
+  // destroys it. Without the readout, "I cleared it" is unverifiable.
+  const chatBody = () => {
+    if (!aiOnline) return html`<div class="note">
+      The companion is not running.<br /><br />
+      Chat needs it - everything the editor does on its own works without it.
+      <div style=${{ marginTop: "10px" }}>
+        <button class="mini" onClick=${onStartAI}>${aiStarting ? "starting ..." : "start it"}</button>
+      </div></div>`;
+
+    const ctx = chatCtx || {};
+    const source = ctx.context_source || "empty";
+    const turns = ctx.turns || 0;
+    // The card prints the source as it comes from the daemon (lowercase), and the
+    // tag styling upper-cases it - so the test matches case-insensitively rather
+    // than the label being restyled to suit a test.
+    const srcTag = source === "compiler" ? "a" : (source === "manual" ? "" : "w");
+    return html`<div class="chat">
+      <div class="card ctxcard">
+        <div class="ch"><b>Context</b>
+          <span class=${"tag " + srcTag}>${source}</span>
+          ${ctx.topic ? html`<span class="tag">${ctx.topic}</span>` : null}</div>
+        <pre class="muted">${turns
+          ? turns + (turns === 1 ? " message" : " messages") + " carried between turns"
+            + (ctx.context_chars ? "  ·  " + fmtBytes(ctx.context_chars) + " of project context" : "")
+          : "Nothing carried yet" + (ctx.context_chars
+              ? "  ·  " + fmtBytes(ctx.context_chars) + " of project context is still attached"
+              : "")}
+${source === "compiler"
+  ? "The context is this project, gathered from forgen - symbols, effects, dependencies."
+  : source === "manual" ? "The context was set by hand."
+  : "No context. A follow-up question will not know what came before."}</pre>
+        <div class="ctxbtns">
+          <button class="mini" disabled=${!turns && !ctx.context_chars}
+            title="Delete every message and the attached context. This is final."
+            onClick=${onChatClear}>${chatClearing ? "clearing ..." : "clear context"}</button>
+          <button class="mini" disabled=${!turns} title="Remove the last exchange"
+            onClick=${onChatUndo}>undo</button>
+          ${source === "empty" ? html`<button class="mini" title="Attach the project context again"
+            onClick=${onChatProject}>use the project</button>` : null}
+        </div>
+      </div>
+      ${chatErr ? html`<div class="card"><div class="ch"><span class="tag e">error</span></div>
+        <pre>${chatErr}</pre></div>` : null}
+      ${(chatMsgs || []).map((m, i) => html`<div class=${"msg " + m.role} key=${"m" + i}>
+        <div class="who">${m.role === "user" ? "you" : (aiLabel || "companion")}</div>
+        ${m.kind === "code" && m.code
+          ? html`<div class="mtext">${String(m.content || "").split("```")[0].trim()}</div>
+              <div class="ins">${m.code}</div>
+              <button class="mini" style=${{ marginTop: "7px" }}
+                onClick=${() => onInsert(m.code)}>insert at caret</button>`
+          : html`<div class="mtext">${m.content}</div>`}
+      </div>`)}
+      ${chatBusy ? html`<div class="note">thinking ...</div>` : null}
+      <div class="composer">
+        <textarea class="field chatfield" rows=${2} value=${chatReq}
+          placeholder=${turns ? "ask a follow-up ..." : "ask about this project, or ask for code ..."}
+          onInput=${(e) => onChatReq(e.target.value)}
+          onKeyDown=${(e) => {
+            // Enter sends; Shift+Enter is a newline. A chat box where Enter
+            // inserts a line break is not a chat box.
+            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onChatSend(); }
+          }}></textarea>
+        <button class="mini" disabled=${chatBusy || !chatReq.trim()}
+          onClick=${onChatSend}>${chatBusy ? "..." : "send"}</button>
+      </div>
+    </div>`;
+  };
+
+  const counts = { prob: diagnostics.length, struct: outline.length };  // In the core build the AI tabs are not part of the studio at all, so they are
+  // filtered out before anything else looks at the list. Doing it here rather
+  // than at the render means the reorder logic, the count badges and the empty
+  // state all agree that there are four tabs.
+  const AVAILABLE = core ? PANEL_TAB_IDS.filter((k) => !AI_TABS.includes(k)) : PANEL_TAB_IDS;
+  const TABLES = AVAILABLE.map((k) => [k, PANEL_TAB_LABELS[k], counts[k] || 0]);
   // The order and the hidden set live in settings, so the strip can be arranged
   // the way the person reading it wants. Anything in `TABLES` that the stored
   // order does not mention is appended, so a tab added to this file cannot be
@@ -2048,7 +2385,59 @@ Python, so it needs no ML runtime. The open file is sent as context.</pre>
   const rest = TABLES.map((t) => t[0]).filter((k) => !wanted.includes(k));
   const shown = wanted.concat(rest).filter((k) => !(hidden || []).includes(k));
 
+  // Is the row wider than the panel?
+  //
+  // Measured after paint rather than predicted from the label widths, because
+  // the font is the user's and the panel is draggable - any arithmetic here
+  // would be a guess about text metrics. A ResizeObserver as well as the tab
+  // list, because dragging the handle changes the answer without changing the
+  // tabs. Only ever set to true on overflow: the arrows stay once they appear
+  // until the row genuinely fits again, so they do not flicker in and out
+  // during a drag.
   const stripRef = useRef(null);
+  // Is the row wider than the panel?
+  //
+  // Measured after paint rather than predicted from the label widths, because
+  // the font is the user's and the panel is draggable - any arithmetic here
+  // would be a guess about text metrics, and the guess is the thing that was
+  // wrong before. A ResizeObserver as well as the tab list, because dragging the
+  // handle changes the answer without changing the tabs.
+  //
+  // Both start TRUE, and that initial value is not a guess: four abbreviated
+  // tabs want ~268px and the panel's smallest useful width is 200px, so on any
+  // real panel the row overflows until something measures it as fitting. Starting
+  // at false made the arrows appear one frame late, which is invisible in a
+  // browser and fatal under static rendering - where no effect runs at all, the
+  // arrows never appeared, and the affordance that the whole fix exists to
+  // provide was absent from the markup. `measureStrip` corrects it immediately
+  // after the first paint when the row does fit.
+  const [crowded, setCrowded] = useState(true);
+  const [edge, setEdge] = useState({ left: false, right: true });
+  const measureStrip = useCallback(() => {
+    const el = stripRef.current;
+    if (!el) return;
+    const over = el.scrollWidth - el.clientWidth;
+    setCrowded(over > 1);
+    setEdge({ left: el.scrollLeft > 1, right: el.scrollLeft < over - 1 });
+  }, []);
+
+  // Scroll a strip element, without assuming the API is there.
+  //
+  // `scrollTo` is not universal - linkedom does not implement it - and a `Panel`
+  // that throws while rendering takes the whole interface down with it, because
+  // the throw happens inside React's commit and the crash boundary is the only
+  // thing left to catch it. Measured: calling it directly produced "el.scrollTo
+  // is not a function" and a page that showed the crash screen instead of the
+  // IDE. Setting `scrollLeft` is the older API and is implemented everywhere the
+  // studio runs; the behaviour difference is only that it cannot be smooth.
+  const scrollStrip = (el, left) => {
+    if (!el) return;
+    if (typeof el.scrollTo === "function") {
+      try { el.scrollTo({ left, behavior: "smooth" }); return; } catch (e) {}
+    }
+    el.scrollLeft = left;
+  };
+
   // Keep the selected tab on screen. This is the whole reason an off-screen tab
   // is acceptable: with the strip scrolling past the edge, a tab you cannot see
   // is a tab you cannot reach - which is what the old wrap-into-rows version was
@@ -2058,11 +2447,39 @@ Python, so it needs no ML runtime. The open file is sent as context.</pre>
     if (!el) return;
     const on = el.querySelector("button.on");
     if (!on) return;
-    const want = on.offsetLeft - 6;
-    if (want < el.scrollLeft || want + on.offsetWidth > el.scrollLeft + el.clientWidth) {
-      el.scrollTo({ left: Math.max(0, want), behavior: "smooth" });
-    }
-  }, [tab, shown.join(",")]);
+    // Clamped at both ends. The unclamped version scrolled to `on.offsetLeft - 6`
+    // whenever the tab was outside the view, so selecting the LAST tab pushed
+    // the first one off the left edge - measured at 1440x900 the strip reads
+    // `Problems` at x 1066 with its own left edge at 1176, i.e. 110px of the row
+    // sitting outside the panel's box, past the code column, invisible and
+    // unreachable while a scrollbar height of 0px says there is nothing there.
+    const max = el.scrollWidth - el.clientWidth;
+    const want = Math.min(Math.max(0, on.offsetLeft - 6), Math.max(0, max));
+    // Not `!== el.scrollLeft`: a smooth scroll in flight reports a fractional
+    // offset, so an equality test on a moving value re-issues the scroll every
+    // frame. A one-pixel tolerance settles instead.
+    if (Math.abs(want - el.scrollLeft) > 1) scrollStrip(el, want);
+    measureStrip();
+  }, [tab, shown.join(","), measureStrip]);
+
+  // The row can start fitting again without the tabs changing - when the handle
+  // is dragged, or the window resized.
+  useEffect(() => {
+    const el = stripRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => measureStrip());
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [measureStrip]);
+
+  const nudge = (dir) => {
+    const el = stripRef.current;
+    if (!el) return;
+    scrollStrip(el, Math.max(0, el.scrollLeft + dir * Math.max(96, el.clientWidth * 0.7)));
+    // the scroll event fires before the smooth scroll finishes, so re-measure
+    // once it settles as well
+    setTimeout(measureStrip, 260);
+  };
 
   const dragFrom = useRef(null);
   const [overTab, setOverTab] = useState(null);
@@ -2081,25 +2498,34 @@ Python, so it needs no ML runtime. The open file is sent as context.</pre>
     if (tab === "proj") return proj();
     if (tab === "ai") return aiBody();
     if (tab === "gen") return genBody();
+    if (tab === "chat") return chatBody();
     return layoutBody();
   };
 
   return html`<div class="panel">
-    <div class="ptabs" ref=${stripRef}>
-      ${shown.map((k) => {
-        const [, label, n] = byId.get(k);
-        return html`<button key=${k}
-          class=${(tab === k ? "on" : "") + (dragFrom.current === k ? " dragging" : "")
-            + (overTab === k && dragFrom.current && dragFrom.current !== k ? " dropzone" : "")}
-          draggable=${true}
-          title="Drag to reorder. Hide tabs in Settings, View."
-          onClick=${() => setTab(k)}
-          onDragStart=${(e) => { dragFrom.current = k; e.dataTransfer.effectAllowed = "move"; }}
-          onDragOver=${(e) => { e.preventDefault(); if (overTab !== k) setOverTab(k); }}
-          onDragEnd=${() => { dragFrom.current = null; setOverTab(null); }}
-          onDrop=${(e) => { e.preventDefault(); reorder(dragFrom.current, k); dragFrom.current = null; setOverTab(null); }}
-          >${label}${n ? html`<i class="badge">${n}</i>` : null}</button>`;
-      })}
+    <div class=${"phead" + (crowded ? " crowded" : "")}>
+      <div class="ptabs" ref=${stripRef} onScroll=${measureStrip}>
+        ${shown.map((k) => {
+          const [, label, n] = byId.get(k);
+          return html`<button key=${k}
+            class=${(tab === k ? "on" : "") + (dragFrom.current === k ? " dragging" : "")
+              + (overTab === k && dragFrom.current && dragFrom.current !== k ? " dropzone" : "")}
+            draggable=${true}
+            title=${label + " - drag to reorder, hide tabs in Settings, View."}
+            onClick=${() => setTab(k)}
+            onDragStart=${(e) => { dragFrom.current = k; e.dataTransfer.effectAllowed = "move"; }}
+            onDragOver=${(e) => { e.preventDefault(); if (overTab !== k) setOverTab(k); }}
+            onDragEnd=${() => { dragFrom.current = null; setOverTab(null); }}
+            onDrop=${(e) => { e.preventDefault(); reorder(dragFrom.current, k); dragFrom.current = null; setOverTab(null); }}
+            >${PANEL_TAB_SHORT[k] || label}${n ? html`<i class="badge">${n}</i>` : null}</button>`;
+        })}
+      </div>
+      ${crowded ? html`<div class="pscroll">
+        <button class="tabnav" title="Earlier tabs" disabled=${!edge.left}
+          onClick=${() => nudge(-1)}><${Ico} k="chevL" size=${12} /></button>
+        <button class="tabnav" title="Later tabs" disabled=${!edge.right}
+          onClick=${() => nudge(1)}><${Ico} k="chevR" size=${12} /></button>
+      </div>` : null}
     </div>
     <div class="pbody">${body()}</div>
   </div>`;
@@ -2247,8 +2673,12 @@ const DEFAULTS = {
   autosaveDelay: 900,
   fontSize: 13.5,
   tabSize: 4,
-  // on by default, but the whole interface works with it off - see the Panel
-  aiEnabled: true,
+  // on by default, but the whole interface works with it off - see the Panel.
+  // In the core build there is no companion to turn on, so the default is off and
+  // the switch that would turn it on is not drawn: `aiEnabled` still exists, so
+  // the two builds store the same shape of settings and a settings object can be
+  // carried between them without a migration.
+  aiEnabled: !CORE,
   // Where the companion's own project lives - the directory holding
   // `python/forgen_ai/ide_daemon.py`. This was a string literal inside
   // `startAI`, which meant the IDE carried a hardcoded absolute path to a
@@ -2267,8 +2697,24 @@ const DEFAULTS = {
   // the edge - which is what he asked for, and it is only workable if the two
   // things that make an off-screen tab acceptable exist: the selected tab is
   // always scrolled into view, and a tab you never open can be removed.
-  panelOrder: ["prob", "struct", "proj", "lay", "ai", "gen"],
+  panelOrder: CORE ? ["prob", "struct", "proj", "lay"] : ["prob", "struct", "proj", "lay", "chat", "ai", "gen"],
   panelHidden: [],
+  // ---- zen
+  //
+  // Zen is a mode, not a theme: everything that is not the code goes, and the
+  // few things worth keeping are opt-in one at a time. It is stored like the
+  // rest so it survives a reload, but the *mode* is off on boot - a setting that
+  // hides the entire chrome is not something to restore silently, because the
+  // first thing a person does when they cannot find the interface is assume it
+  // is broken. The preferences below are what Zen restores; the mode itself
+  // starts off.
+  zenStatus: true,        // the one line at the bottom: position, language, dirty
+  zenProblems: true,      // "3 problems" ticker, clickable back into the panel
+  zenFile: true,          // the current file name, top left
+  zenWrap: false,         // soft wrap, independent of the editor setting
+  zenWidth: 0,            // 0 = full width; otherwise the column is centred at this px
+  zenFontDelta: 1,        // extra px on top of the editor size - Zen is for reading
+  zenSurround: true,      // a little breathing room at the top and bottom of the code
 };
 
 const Settings = ({ values, onChange, onClose, root, onRoot, aiOnline, onStartAI, aiStarting }) => {
@@ -2307,7 +2753,7 @@ const Settings = ({ values, onChange, onClose, root, onRoot, aiOnline, onStartAI
       <h3>Settings</h3>
       <p>Saved on this machine and applied immediately.</p>
       <div class="tabs2">
-        ${[["editor", "Editor"], ["view", "View"], ["files", "Files"], ["ai", "Companion"], ["ws", "Workspace"]]
+        ${[["editor", "Editor"], ["view", "View"], ["zen", "Zen"], ["files", "Files"], ["ai", "Companion"], ["ws", "Workspace"]]
           .map(([k, l]) => html`<button key=${k} class=${tab === k ? "on" : ""}
             onClick=${() => setTab(k)}>${l}</button>`)}
       </div>
@@ -2358,7 +2804,27 @@ const Settings = ({ values, onChange, onClose, root, onRoot, aiOnline, onStartAI
         this file, so they work with the companion switched off. Only the AI and
         Generate tabs need it.</div>
       </div>` : null}
-      ${tab === "ai" ? html`<div>
+      ${tab === "zen" ? html`<div>
+        <div class="setnote" style=${{ marginTop: 0 }}>Zen mode hides the title bar,
+        the toolbar, the explorer, the right panel and the status bar, and leaves
+        the code. Press <b>Ctrl+Shift+Z</b> - or the button beside the panel
+        toggle - to enter, <b>Esc</b> to leave. What follows is what stays.</div>
+        ${row("File name", "the open file, top left of the one line Zen keeps", sw("zenFile"))}
+        ${row("Position", "line and column, the language, and a running marker", sw("zenStatus"))}
+        ${row("Problems", "an error and warning count that opens the panel when clicked. Zen says nothing when a file is clean unless you turn this off, because a count of zero is still a sentence.", sw("zenProblems"))}
+        ${row("Soft wrap", "wrap long lines while Zen is on, whatever the editor setting is", sw("zenWrap"))}
+        ${row("Breathing room", "leave a margin above and below the code", sw("zenSurround"))}
+        ${row("Extra size", "added to the editor's font size, for reading",
+          html`<input type="number" min="0" max="6" step="0.5" value=${values.zenFontDelta}
+            onChange=${(e) => onChange({ zenFontDelta: Number(e.target.value) })} />`)}
+        ${row("Column width", "0 fills the window; anything else centres the code at that width",
+          html`<input type="number" min="0" max="2400" step="20" value=${values.zenWidth}
+            onChange=${(e) => onChange({ zenWidth: Number(e.target.value) })} />`)}
+        <div class="setnote">A centred column is set by insetting the text
+        surface, not by narrowing the editor: a max-width on the text alone would
+        leave the line numbers outside it and put the caret in the wrong place.</div>
+      </div>` : null}
+      ${tab === "ai" && !CORE ? html`<div>
         ${row("Companion", "suggestions, ghost text and a second opinion on diagnostics", sw("aiEnabled"))}
         ${row("Status", aiOnline ? "running on 127.0.0.1:7890" : "not running",
           html`<button class="mini" onClick=${onStartAI}>${aiStarting ? "starting ..." : "start it"}</button>`)}
@@ -2380,6 +2846,21 @@ const Settings = ({ values, onChange, onClose, root, onRoot, aiOnline, onStartAI
 function applySettings(v) {
   try { localStorage.setItem("datara.studio.settings", JSON.stringify(v)); } catch (e) {}
   if (Editor.el) Editor.setType(v.fontSize, v.wrap);
+}
+
+/** Recompute the editor's type and wrap, honouring Zen.
+ *
+ * Zen overrides two editor settings on purpose, and only while it is on: soft
+ * wrap (a centred narrow column is pointless if long lines still run off it) and
+ * a slightly larger face (Zen is used for reading as much as writing). Both are
+ * stored, so they survive leaving and re-entering, and neither touches the
+ * values the normal editor uses - turning Zen off restores the editor exactly as
+ * it was, which is what makes the mode safe to press by accident.
+ */
+function applyEditorType(values, zen) {
+  const size = values.fontSize + (zen ? (values.zenFontDelta || 0) : 0);
+  const wrap = zen ? values.zenWrap : values.wrap;
+  if (Editor.el) Editor.setType(size, wrap);
 }
 
 /** The built-in explorer. It lists directories through the Datara server, which
@@ -2536,6 +3017,14 @@ function App() {
     } catch (e) { return "prob"; }
   });
   const [mode, setMode] = useState("programming");
+  // Zen is deliberately NOT persisted, unlike the `zen*` preferences above.
+  // Restoring it would mean opening the IDE to a window with no interface and no
+  // obvious way back - the preferences are what come back, the mode is a thing
+  // you turn on. It is a separate state from `mode` ("programming"/"reading")
+  // because they answer different questions: reading mode says *what* the
+  // editor is for, zen says *how much of the window is the editor*.
+  const [zen, setZen] = useState(false);
+  const [zenHint, setZenHint] = useState(false);
   const [aiOnline, setAiOnline] = useState(false);
   const [aiLabel, setAiLabel] = useState("ai off");
   const [suggestions, setSuggestions] = useState([]);
@@ -2608,6 +3097,26 @@ function App() {
   // placed yet, which is a different thing from "generation failed".
   const [genWhere, setGenWhere] = useState("");
   const [genModel, setGenModel] = useState(null);
+  // ---- chat
+  //
+  // The transcript lives here and is mirrored into localStorage, because the
+  // companion's session is keyed by id and the IDE is the thing that owns the
+  // conversation. A reload therefore resumes rather than starting over - and a
+  // clear button that only emptied the React state while the daemon kept its own
+  // copy would be the same lie as the autosave bug earlier in this file.
+  const [chatMsgs, setChatMsgs] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("datara.studio.chat") || "[]"); }
+    catch (e) { return []; }
+  });
+  const [chatReq, setChatReq] = useState("");
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatErr, setChatErr] = useState("");
+  const [chatCtx, setChatCtx] = useState(null);
+  const [chatClearing, setChatClearing] = useState(false);
+  // A stable id per workspace, so two folders do not share one conversation.
+  const chatSessionRef = useRef(null);
+  const chatMsgsRef = useRef(chatMsgs);
+  chatMsgsRef.current = chatMsgs;
   const [git, setGit] = useState({ branch: null, dirty: 0, files: [], log: [] });
   const [renaming, setRenaming] = useState(null); // { kind, path }
 
@@ -2654,12 +3163,34 @@ function App() {
   const aiStartingRef = useRef(false);
   const suggestionsRef = useRef([]);
   const saveTimer = useRef(null);
+  // A counter, bumped on every keystroke, that exists only to give the autosave
+  // effect something to depend on.
+  //
+  // `dirty` is a boolean, so it goes false->true on the first keystroke of an
+  // edit and then stays true for every keystroke after it. An effect that
+  // depends on it therefore runs *once* per edit and never again, which made the
+  // delay a countdown from the first character typed rather than from the last:
+  // type for longer than 900 ms without pausing and the timer fired mid-word,
+  // and the write that "shortly after you stop typing" promises was never
+  // scheduled at all. Depending on the counter makes each keystroke re-arm the
+  // timer, which is what a debounce is, and it is also why autosave now actually
+  // keeps up - the stale write was what left `dirty` set and produced the
+  // "Discard unsaved changes?" prompt when opening the next file.
+  const [editRev, setEditRev] = useState(0);
   const ghostRef = useRef("");
   const aiTimer = useRef(null);
   const currentRef = useRef(null);
   currentRef.current = current;
   const rootRef = useRef(".");
   rootRef.current = root;
+  // Zen is read from the editor key handler, which is installed once and
+  // therefore cannot close over a render value - the same reason every other
+  // long-lived handler in this file reads a ref. `zen` is also mirrored onto
+  // <html> as `data-zen`, which is what the CSS keys off; the attribute is the
+  // interface between the mode and the stylesheet, so it is set in one effect
+  // and never toggled from CSS alone.
+  const zenRef = useRef(false);
+  zenRef.current = zen;
 
   /** Compiler problems and companion problems, in one list.
    *
@@ -2680,14 +3211,80 @@ function App() {
     return comp.concat(ai.filter((d) => !seen.has(d.line)));
   }, [compDiag, aiDiag]);
 
+  /** How many problems, by severity, for the places that only need the number.
+   *
+   * The Problems tab wants the list; the Zen bar and the status line want a
+   * count, and counting in the render would mean walking the array on every
+   * keystroke. `source === "compiler"` is deliberately not filtered out here -
+   * a companion suggestion is still something the reader may want to know about
+   * while writing, and the Problems list already dedupes them against the
+   * compiler's own findings.
+   */
+  const diagCounts = useMemo(() => {
+    let error = 0, warn = 0;
+    for (const d of diagnostics) {
+      if (d.severity === "warning") warn++;
+      else error++;
+    }
+    return { error, warn };
+  }, [diagnostics]);
+
   // A tab hidden while it was the open one would leave the panel blank with no
   // tab lit, which reads as a broken panel rather than as a hidden tab.
+  //
+  // The stored `panelOrder` is a *preference*, not the whole list: anyone who
+  // used the studio before a tab existed has an order that does not mention it,
+  // and treating that order as authoritative sent them back to the first tab the
+  // moment they opened the new one. The panel's own render already reconciles
+  // ("anything in TABLES the stored order does not mention is appended"), so this
+  // guard has to reconcile the same way or the two disagree about what exists.
   useEffect(() => {
-    const order = settings.panelOrder && settings.panelOrder.length
-      ? settings.panelOrder : ["prob", "struct", "proj", "lay", "ai", "gen"];
-    const vis = order.filter((k) => !(settings.panelHidden || []).includes(k));
+    const stored = (settings.panelOrder && settings.panelOrder.length
+      ? settings.panelOrder : []).filter((k) => PANEL_TAB_IDS.includes(k));
+    const rest = PANEL_TAB_IDS.filter((k) => !stored.includes(k));
+    const all = stored.concat(rest);
+    const vis = all.filter((k) => !(settings.panelHidden || []).includes(k));
     if (vis.length && !vis.includes(tab)) setTab(vis[0]);
   }, [settings.panelOrder, settings.panelHidden, tab]);
+
+  // ---- zen
+  //
+  // The mode lives on <html> as `data-zen`, not on a class in React, because the
+  // rules it drives are about the shell's own grid - and a grid track cannot be
+  // removed by a rule inside the grid's subtree. Setting it in an effect (rather
+  // than during render) keeps a re-render from touching the DOM at all when Zen
+  // has not changed.
+  useEffect(() => {
+    const el = document.documentElement;
+    if (zen) el.setAttribute("data-zen", "1"); else el.removeAttribute("data-zen");
+    // the wrap and size Zen overrides are applied and un-applied with the mode
+    applyEditorType(settingsRef.current, zen);
+    // Zen hides the surface's neighbours, so the editor has to re-measure: the
+    // line-number gutter and the ghost layer are positioned from the surface's
+    // own box, and that box just changed size.
+    if (Editor.el) requestAnimationFrame(() => Editor.repaint());
+  }, [zen]);
+
+  // A short hint on entry, then it fades. Zen removes the button that turned it
+  // on, so for a moment there is nothing on screen that says how to leave - and
+  // "how do I get out of this" is the only thing a person thinks in that moment.
+  useEffect(() => {
+    if (!zen) { setZenHint(false); return undefined; }
+    setZenHint(true);
+    const t = setTimeout(() => setZenHint(false), 2200);
+    return () => clearTimeout(t);
+  }, [zen]);
+
+  const toggleZen = useCallback(() => {
+    setZen((v) => {
+      const next = !v;
+      // Leaving Zen from the keyboard leaves the caret in the editor; entering it
+      // should too, so typing works immediately without a click.
+      if (next) requestAnimationFrame(() => { if (Editor.ta) Editor.ta.focus(); });
+      return next;
+    });
+  }, []);
+  const leaveZen = useCallback(() => setZen(false), []);
 
   // ---- boot
   useEffect(() => {
@@ -2725,12 +3322,61 @@ function App() {
       // the server to launch it is the difference between "optional" and "you
       // have to open a terminal", and it is silent when it is already running.
       if (settings.aiEnabled) setTimeout(() => startAI(true), 1200);
-      fetch("http://127.0.0.1:7890/model", { method: "POST" })
+      // The core build has no companion, so it does not ask one for its model -
+      // a request to a port nothing is listening on is a console error for no
+      // reason, and the Generate panel that would have used the answer is not
+      // part of this build.
+      if (!CORE) fetch("http://127.0.0.1:7890/model", { method: "POST" })
         .then((r) => r.json()).then((m) => { if (m && m.success) setGenModel(m); })
         .catch(() => {});
+      // The chat's context readout is the only visible evidence that the
+      // companion is carrying anything, so it is fetched rather than assumed.
+      // Silent on failure: the companion is optional and a refused connection is
+      // the normal state when it has not been started.
+      if (!CORE) refreshChatCtx();
       setStatus("ready");
     })();
   }, []);
+
+  // ---- Zen's own keys
+  //
+  // These are installed here, at window level, rather than inside the editor
+  // mount below - and that is the whole point of the block. The editor effect
+  // starts with `if (!edRef.current) return;`, so anything registered inside it
+  // exists only while a file is open. Zen registered there did nothing at all on
+  // a cold start with no file: the key arrived, the handler was not there to
+  // hear it, and the mode looked broken rather than unavailable. A shortcut that
+  // switches the *window's* layout must not depend on the window's contents.
+  //
+  // Escape is deliberately handled here too, not left to the editor, because in
+  // Zen the editor is frequently not focused - the chrome that held the focus
+  // has been removed - and a mode you cannot leave from the keyboard is a trap.
+  // The editor's own Escape (closing the completion list) still runs first when
+  // the editor has focus, because its handler sees the event before this one and
+  // this one then finds `defaultPrevented` set.
+  useEffect(() => {
+    const win = (e) => {
+      if (e.defaultPrevented) return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (!e.shiftKey) return;
+      if (e.key.toLowerCase() !== "z") return;
+      e.preventDefault();
+      toggleZen();
+    };
+    const esc = (e) => {
+      if (e.defaultPrevented || e.key !== "Escape") return;
+      if (!zenRef.current) return;
+      if (Editor.comp) return;            // the completion list closes first
+      e.preventDefault();
+      leaveZen();
+    };
+    window.addEventListener("keydown", win);
+    window.addEventListener("keydown", esc);
+    return () => {
+      window.removeEventListener("keydown", win);
+      window.removeEventListener("keydown", esc);
+    };
+  }, [toggleZen, leaveZen]);
 
   // ---- editor mount
   //
@@ -2769,6 +3415,19 @@ function App() {
     Editor.onKey = (e) => {
       const s = settingsRef.current;
       const unit = langRef.current.indent;
+
+      // A pending snippet stop is checked before everything else on Tab.
+      //
+      // It has to be, because after the snippet is accepted the completion list
+      // is still eligible: typing the function name re-opens it, and Tab would
+      // then be read as "accept this completion" and re-insert the template
+      // around the name just typed - which is how `fn probe    () -> Int` came
+      // out of a normal `fn` + name + Tab. A pending stop means the person is
+      // inside a template they just expanded, so nothing else can claim Tab.
+      if (e.key === "Tab" && !e.shiftKey && Editor.pendingStop) {
+        e.preventDefault();
+        if (Editor.takeStop()) return;
+      }
 
       if (Editor.comp) {
         if (e.key === "ArrowDown") { e.preventDefault(); Editor.moveComplete(1); return; }
@@ -2812,6 +3471,9 @@ function App() {
 
       if (e.key === "F12") { e.preventDefault(); gotoDefinition(); return; }
       if (e.altKey && e.key === "F7") { e.preventDefault(); findRefs(); return; }
+      // Escape leaves Zen; see the window-level handler above for why it is not
+      // only here. The completion list has first claim when it is open.
+      if (e.key === "Escape" && zenRef.current && !Editor.comp) { e.preventDefault(); leaveZen(); return; }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); save(); return; }
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); act("run"); return; }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "b") {
@@ -2852,12 +3514,19 @@ function App() {
   }, [surface]);
 
   // ---- autosave: write shortly after typing stops
+  //
+  // `editRev` is in the dependency list on purpose - see the note where it is
+  // declared. Without it this effect ran once per edit and the timer was armed
+  // from the first keystroke, so a steady typist outran the deadline and the
+  // buffer stayed dirty. It also re-arms on `current`, because switching files
+  // while dirty has to schedule a write for the file being left, not the one
+  // just opened.
   useEffect(() => {
     if (!dirty || !current || !settings.autosave) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => { save(); }, settings.autosaveDelay);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [dirty, current, settings.autosave, settings.autosaveDelay]);
+  }, [dirty, editRev, current, settings.autosave, settings.autosaveDelay]);
 
   // ---- the tree keeps itself current, so files created outside appear
   //
@@ -3317,15 +3986,27 @@ function App() {
   async function openFile(path, force) {
     // Same dialog, same reason: this is a question about losing work, and it
     // used to be the platform's dialog rather than this program's.
-    if (!force && dirty) {
-      const yes = await askUser({
-        title: "Discard unsaved changes?",
-        body: (current ? current.split(/[\\/]/).pop() : "The open file")
-          + " has changes that were not written.",
-        ok: "Discard",
-        danger: true,
-      });
-      if (!yes) return;
+    //
+    // With autosave on there is nothing to lose, so there is nothing to ask.
+    // The buffer is flushed to disk first and the file then opens, which is what
+    // "everything is saved live" is supposed to mean - and it is why this prompt
+    // used to appear at all: a write that the user believed had happened had
+    // not, because the autosave timer never re-armed. Asking now would be
+    // asking about work that is already safe.
+    if (!force && dirtyRef.current) {
+      if (settingsRef.current.autosave) {
+        if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; }
+        await save();
+      } else {
+        const yes = await askUser({
+          title: "Discard unsaved changes?",
+          body: (current ? current.split(/[\\/]/).pop() : "The open file")
+            + " has changes that were not written.",
+          ok: "Discard",
+          danger: true,
+        });
+        if (!yes) return;
+      }
     }
     const r = await post("/api/read", path);
     if (!r.ok) { setStatus("cannot open " + path); return; }
@@ -3617,12 +4298,40 @@ function App() {
       setRunError({ action: a, count: ds.length, text: headline(r.output) || "the compiler reported an error" });
     }
 
+    // Which backend actually produced this binary.
+    //
+    // The compiler falls back from LLVM to Cranelift *without failing*, so a
+    // build that quietly skipped the optimiser is indistinguishable from one
+    // that used it - unless the fact is carried back and named. The server now
+    // reports both `linker_ok` (was a native `link.exe` found) and `fell_back`
+    // (did the compiler warn that it dropped to Cranelift), so the drawer can
+    // state the backend instead of implying it.
+    //
+    // Only shown for the actions that actually reach codegen. `check`, `lint`
+    // and `audit` never do, and a backend badge beside a syntax check would be
+    // a lie about what happened.
+    //
+    // The default is the native backend, not LLVM, and the label says so rather
+    // than hiding it: measured here, LLVM wins a tight arithmetic loop by ~5%
+    // but costs 3.5x-7x the build time, so the fast-to-use backend is the
+    // default and `FORGEN_LLVM=1` asks for the other one.
+    let backend = "";
+    if (a === "run" || a === "build") {
+      if (r.fell_back) {
+        backend = "  ·  Cranelift (LLVM fell back - linker missing)";
+      } else if (r.linker_ok) {
+        backend = "  ·  native (LLVM ready: set FORGEN_LLVM=1)";
+      } else {
+        backend = "  ·  native (no MSVC linker)";
+      }
+    }
+
     setDrawer({ open: true,
       title: "forgen " + a + "  ·  " + r.status
         + (r.exit != null ? "  ·  exit " + r.exit : "")
-        + "  ·  took " + took,
+        + "  ·  took " + took + backend,
       text: r.output, cls: failed ? "e" : "g" });
-    setStatus("forgen " + a + " \u2192 " + r.status + "  ·  exit " + r.exit + "  ·  took " + took);
+    setStatus("forgen " + a + " \u2192 " + r.status + "  ·  exit " + r.exit + "  ·  took " + took + backend);
     setRunning(false);
   }
 
@@ -3688,6 +4397,120 @@ function App() {
     setGenBusy(false);
   }
 
+  // ---- chat
+  //
+  // One session id per workspace root. The daemon keys sessions by this string,
+  // so opening a second folder must not continue the first folder's
+  // conversation - that would be "the AI lost its mind", not "the AI has
+  // context", and the difference is a hash.
+  function chatSession() {
+    if (chatSessionRef.current) return chatSessionRef.current;
+    const seed = (settingsRef.current.aiDir || "") + "|" + (root || "");
+    let h = 0;
+    for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) | 0;
+    chatSessionRef.current = "ide-" + Math.abs(h).toString(36);
+    return chatSessionRef.current;
+  }
+
+  function persistChat(list) {
+    try {
+      // Keep the tail only: this is a reload cache, not an archive, and an
+      // unbounded localStorage entry is a bug that shows up as a slow boot.
+      localStorage.setItem("datara.studio.chat", JSON.stringify(list.slice(-40)));
+    } catch (e) {}
+  }
+
+  /** The companion's view of the context, which is the thing the buttons act on. */
+  async function refreshChatCtx() {
+    try {
+      const r = await fetch("http://127.0.0.1:7890/context", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session: chatSession(), action: "status" }),
+      });
+      const j = await r.json();
+      if (!j.error) setChatCtx(j);
+    } catch (e) {}
+  }
+
+  async function runChat() {
+    const msg = chatReq.trim();
+    if (!msg || chatBusy) return;
+    const next = [...chatMsgsRef.current, { role: "user", content: msg }];
+    setChatMsgs(next); persistChat(next);
+    setChatReq(""); setChatBusy(true); setChatErr("");
+    try {
+      const r = await fetch("http://127.0.0.1:7890/chat", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: msg,
+          session: chatSession(),
+          // The open file is the context the code generator appends to. Sending
+          // it is what makes "допиши функцию ниже" do something different from
+          // "write me a function".
+          file_path: currentRef.current || "",
+          context: Editor.getText().slice(0, 4000),
+        }),
+      });
+      const j = await r.json();
+      if (j.error) {
+        setChatErr(j.error + (j.detail ? ": " + j.detail : ""));
+      } else {
+        const reply = { role: "assistant", content: j.text, kind: j.kind,
+                        code: j.code || "", verified: j.verified };
+        const withReply = [...next, reply];
+        setChatMsgs(withReply); persistChat(withReply);
+        if (j.context) setChatCtx(j.context);
+        if (j.kind === "refusal") setStatus("the companion did not have an answer for that");
+      }
+    } catch (e) {
+      setChatErr("companion unreachable: " + e.message);
+    }
+    setChatBusy(false);
+  }
+
+  /** Delete the conversation and the context, in both places, at once. */
+  async function clearChat() {
+    if (chatClearing) return;
+    setChatClearing(true);
+    try {
+      await fetch("http://127.0.0.1:7890/context", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session: chatSession(), action: "clear" }),
+      });
+    } catch (e) {}
+    setChatMsgs([]); persistChat([]);
+    setChatReq(""); setChatErr("");
+    await refreshChatCtx();
+    setChatClearing(false);
+    setStatus("the companion's context was cleared");
+  }
+
+  async function undooChat() {
+    try {
+      await fetch("http://127.0.0.1:7890/context", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session: chatSession(), action: "undo" }),
+      });
+    } catch (e) {}
+    // Drop the last exchange locally too, so the panel and the daemon agree.
+    let list = chatMsgsRef.current;
+    if (list.length && list[list.length - 1].role === "assistant") list = list.slice(0, -1);
+    if (list.length && list[list.length - 1].role === "user") list = list.slice(0, -1);
+    setChatMsgs(list); persistChat(list);
+    await refreshChatCtx();
+  }
+
+  async function useProjectContext() {
+    try {
+      await fetch("http://127.0.0.1:7890/context", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session: chatSession(), action: "project" }),
+      });
+    } catch (e) {}
+    await refreshChatCtx();
+    setStatus("the project context is attached again");
+  }
+
   async function scanLayout(r) {
     setLayoutBusy(true);
     try { setLayout(await post("/api/layout", r || ".")); }
@@ -3704,8 +4527,17 @@ function App() {
       const r = await fetch("http://127.0.0.1:7890/health", { signal: ctl.signal });
       clearTimeout(t);
       const j = await r.json();
+      const first = !aiOnlineRef.current;
       setAiOnline(true);
-      setAiLabel(String(j.engine || "companion").split(" ")[0].toLowerCase());
+      // The label names the backend that is actually loaded, which /health now
+      // reports from disk. Falling back to the service name keeps a status dot
+      // working against an older companion that does not send the field.
+      setAiLabel(String(j.model_kind || j.engine || "companion").split(" ")[0].toLowerCase());
+      // Coming online after a cold boot means the context readout was fetched
+      // while nothing was listening, so it is refreshed exactly once - not on
+      // every poll, which would be a request every five seconds for a number
+      // that only changes when the chat is used.
+      if (first) refreshChatCtx();
     } catch (e) { setAiOnline(false); setAiLabel("off"); }
   }
 
@@ -3783,8 +4615,11 @@ function App() {
       { name: "Structure", hint: "panel", run: () => setTab("struct") },
       { name: "Project", hint: "panel", run: () => setTab("proj") },
       { name: "Scan struct layout", hint: "panel", run: () => { setTab("lay"); scanLayout("."); } },
-      { name: "Start the companion", hint: "optional", run: () => startAI(false) },
+      // Not offered in the core build: there is no companion to start, and a
+      // palette entry that does nothing is worse than one that is absent.
+      ...(CORE ? [] : [{ name: "Start the companion", hint: "optional", run: () => startAI(false) }]),
       { name: "Toggle reading mode", hint: "command", run: () => setMode(mode === "programming" ? "reading" : "programming") },
+      { name: zen ? "Leave Zen mode" : "Zen mode, just the code", hint: "Ctrl+Shift+Z", run: () => toggleZen() },
       { name: "Reset zoom", hint: "Ctrl+0", run: () => setSettings((s) => { const n = { ...s, fontSize: 13.5 }; applySettings(n); return n; }) },
     ];
     return cmds.concat(files.map((f) => ({ name: f, hint: "file", run: () => openFile(f) })));
@@ -3850,8 +4685,6 @@ function App() {
   const readMode = mode === "reading";
 
   return html`<div class="shell">
-    <${TitleBar} shell=${SHELL} label=${current ? current.split(/[\\/]/).pop() : ""} />
-
     <${IntentBar} root=${root} wsName=${wsNameOf(files, root)} coreVersion=${coreVersion}
       aiOnline=${aiOnline} aiLabel=${aiLabel} running=${running} readMode=${readMode}
       search=${search} setSearch=${setSearch} onSearch=${runSearch}
@@ -3862,9 +4695,13 @@ function App() {
       onSettings=${() => setSettingsOpen(true)}
       onOpenFolder=${() => { setBrowserMode("folder"); setBrowserOpen(true); }}
       onToggleMode=${() => setMode(readMode ? "programming" : "reading")}
+      onZen=${toggleZen}
       gitBranch=${git.branch} gitDirty=${git.dirty} />
 
-    <div class=${"body" + (readMode ? " reading" : "")}>
+    <div class=${"body" + (readMode ? " reading" : "")
+      + (zen && settings.zenWidth > 0 ? " zen-narrow" : "")
+      + (zen && settings.zenSurround ? " zen-surround" : "")}
+      style=${zen && settings.zenWidth > 0 ? { "--zen-w": settings.zenWidth + "px" } : null}>
       ${treeFold ? null : html`<${React.Fragment}>
         <div class="col tree-col" style=${{ width: treeW + "px" }}>          <${Tree} files=${files} dirs=${dirs} current=${current} filter=${filter} setFilter=${setFilter}
             onOpen=${openFile} dirty=${dirty} root=${root} error=${treeError} note=${treeNote}
@@ -3898,7 +4735,7 @@ function App() {
             <button class="mini" onClick=${() => setRunError(null)}>dismiss</button>
           </div>` : null}
         ${root || current
-          ? html`<div style=${{ position: "relative", flex: 1, minHeight: 0 }} ref=${surfaceRef}></div>`
+          ? html`<div class="surface" style=${{ position: "relative", flex: 1, minHeight: 0 }} ref=${surfaceRef}></div>`
           : html`<div class="welcome">
               <div class="wmark fico fico-app"></div>
               <h2>Datara Studio</h2>
@@ -3952,6 +4789,11 @@ function App() {
             genReq=${genReq} genRes=${genRes} genErr=${genErr} genBusy=${genBusy}
             genModel=${genModel} onGenReq=${setGenReq} onGenerate=${runGenerate}
             genWhere=${genWhere}
+            chatMsgs=${chatMsgs} chatReq=${chatReq} chatBusy=${chatBusy} chatErr=${chatErr}
+            chatCtx=${chatCtx} chatClearing=${chatClearing}
+            onChatReq=${setChatReq} onChatSend=${runChat} onChatClear=${clearChat}
+            onChatUndo=${undooChat} onChatProject=${useProjectContext}
+            fmtBytes=${fmtBytes}
             onInsert=${(t) => Editor.insert(t)} onGoto=${(n, c) => Editor.gotoLine(n, c)}
             outline=${outline} current=${current} onOpen=${openFile}
             project=${project} git=${git} refs=${refs} refWord=${refWord} refBusy=${refBusy}
@@ -3960,7 +4802,14 @@ function App() {
             onCheckProject=${checkProject} onGotoProblem=${gotoProblem} />
         </div>
       <//>`}
+      <${ZenBar} values=${settings} onExit=${leaveZen}
+        onOpenProblems=${() => { setZen(false); setPanelFold(false); setTab("prob"); }}
+        fileName=${current ? current.split(/[\\/]/).pop() : ""}
+        cursor=${cursor} lang=${langRef.current ? langRef.current.name : ""}
+        dirty=${dirty} counts=${diagCounts} running=${running} />
     </div>
+
+    <div class=${"zenhint" + (zenHint ? " show" : "")}>Esc to leave Zen</div>
 
     <div class="status">
       <div class="stleft">
@@ -4127,7 +4976,7 @@ if (typeof document !== "undefined" && document.getElementById("root")) {
 // Exposed for the render test.
 if (typeof window !== "undefined") {
   window.__Studio = {
-    App, Editor, Palette, Tree, TreeNode, Panel, IntentBar, Mark, Browser, NewRow, Settings,
+    App, Editor, Palette, Tree, TreeNode, Panel, IntentBar, CapControls, Mark, Browser, NewRow, Settings,
     coreHighlight, symbols, buildTree, resolveName, parseForgenDiagnostics, hoverInfo,
     stripAnsi, checkTarget, checkBody, checkNote, dirOf,
     fileIcon, completerFor, KEYWORDS, SNIPPETS, TYPES, BUILTINS, DATARA_DOCS, FILE_KINDS,

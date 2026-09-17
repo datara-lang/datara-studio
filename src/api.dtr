@@ -33,6 +33,7 @@
 
 use http
 use explorer
+use toolchain
 
 /// `tc` is the toolchain line read once at boot, not per request.
 ///
@@ -48,9 +49,20 @@ use explorer
 /// Caching at boot is not a compromise, it is the correct scope: the running
 /// server *is* a product of the toolchain it reports, and that binary cannot
 /// change while the process lives. A toolchain upgrade restarts the server.
+///
+/// `linker` is reported for the same reason and at the same scope. It is the
+/// directory holding the native `link.exe` that `--llvm` builds will use, or
+/// "not installed" on a machine without MSVC. Without it the interface can only
+/// say that a build succeeded, not whether it succeeded through the LLVM
+/// pipeline or fell back to Cranelift - and a silent fallback is the exact
+/// failure this whole discovery exists to end. Prepending on the health path
+/// also means the linker is in place before the first build arrives.
 pub fn st_health( tc: Str) -> Str {
-    return "{\"ok\":true,\"service\":\"datara-studio\",\"version\":\"0.2.0\","
+    let linker = tc_linker_report()
+    return "{\"ok\":true,\"service\":\"datara-studio\",\"version\":\"0.3.0\","
          + "\"toolchain\":\"" + st_json_escape(tc) + "\","
+         + "\"linker\":\"" + st_json_escape(linker) + "\","
+         + "\"llvm\":" + st_bool(byte_len(linker) > 0 && linker != "not installed") + ","
          + "\"ai\":\"http://127.0.0.1:7890\"}"
 }
 
@@ -237,6 +249,19 @@ pub fn st_run( cmd: Str) -> Str {
              + "\"cmd\":\"" + st_json_escape(st_display(cmd)) + "\"}"
     }
 
+    // The native linker has to be found before the compiler is launched, and it
+    // has to be found here rather than in the shell that started this server.
+    // Git-Bash's `/usr/bin/link.exe` is a Unix hard-link utility and on this
+    // machine it sits ahead of MSVC's `link.exe` on PATH, so `forgen build
+    // --llvm` linked with the wrong program, failed, and *fell back to
+    // Cranelift* - a working backend, which is why the symptom was a quietly
+    // slower build rather than an error. Prepending is idempotent, so the cost
+    // after the first call is one directory scan.
+    //
+    // "" when there is no MSVC at all, which is a supported machine: the
+    // compiler's own Cranelift backend needs no linker.
+    let linker = tc_prepend_msvc()
+
     let capture = st_run_capture()
     mut code = -1
     unsafe(justification: "the IDE backend runs the compiler on the user's project") {
@@ -256,7 +281,26 @@ pub fn st_run( cmd: Str) -> Str {
     return "{\"ok\":true,\"exit\":" + int_to_str(code)
          + ",\"status\":\"" + st_status_of(code) + "\""
          + ",\"cmd\":\"" + st_json_escape(st_display(cmd)) + "\""
+         + ",\"linker\":\"" + st_json_escape(linker) + "\""
+         + ",\"linker_ok\":" + st_bool(byte_len(linker) > 0)
+         + ",\"fell_back\":" + st_bool(st_fell_back(output))
          + ",\"output\":\"" + st_json_escape(output) + "\"}"
+}
+
+/// Did the compiler quietly drop to Cranelift because an LLVM request failed?
+///
+/// This is the whole reason the linker discovery exists, and it is reported
+/// rather than swallowed. `forgen` prints the warning and then *succeeds*, so
+/// without this an LLVM build that silently became a Cranelift build looks
+/// identical to one that worked - which is exactly the state the IDE was in
+/// before, and the reason the problem went unnoticed for so long.
+///
+/// Matched on the compiler's own wording. If a future forgen rephrases it this
+/// returns false and the interface simply stops mentioning it, which is the
+/// safe direction: a missed warning is a cosmetic loss, a false one would be
+/// noise on every successful build.
+pub fn st_fell_back( output: Str) -> Bool {
+    return st_has_infix(output, "Falling back to native Cranelift")
 }
 
 /// A command that ran to completion with status 0 succeeded. Anything else did
@@ -289,10 +333,10 @@ pub fn st_run_named( action: Str, target: Str) -> Str {
         return st_run("forgen check " + t)
     }
     if action == "build" {
-        return st_run("forgen build " + t)
+        return st_run("forgen build " + t + tc_opt_in(target))
     }
     if action == "run" {
-        return st_run("forgen run " + t)
+        return st_run("forgen run " + t + tc_opt_in(target))
     }
     if action == "lint" {
         return st_run("forgen lint " + t)
@@ -400,10 +444,22 @@ fn st_git_mark( n: Int) -> Str {
     return "__DS_GIT_LOG__"
 }
 
-/// The text between two markers, trimmed.
+/// The text between two markers, with blank lines removed from the edges.
 ///
 /// An empty marker means "no bound on that side", so one helper reads the
 /// first, the middle and the last section instead of three near-copies.
+///
+/// This used to end with `str_trim`, and that was a bug with a very specific
+/// signature: `str_trim` strips spaces as well as newlines, so it ate the
+/// leading space of the **first** line of the block. `git status --porcelain`
+/// writes ` M PORTING.md` - a space, the `M`, a space, then the path - and
+/// `st_git_files_json` slices the path from byte 3. With the leading space gone
+/// the line is `M PORTING.md`, byte 3 is inside the filename, and the first
+/// entry in the panel read `ORTING.md`. Only the first line was affected,
+/// because `str_trim` touches only the two ends of the block, which is why the
+/// rest of the list looked right and the bug survived review.
+///
+/// So: drop whole blank lines, never a single leading space.
 fn st_git_section( s: Str, a: Str, b: Str) -> Str {
     mut rest = s
     if byte_len(a) > 0 {
@@ -422,7 +478,60 @@ fn st_git_section( s: Str, a: Str, b: Str) -> Str {
         }
         rest = str_substring(rest, 0, j)
     }
-    return str_trim(rest)
+    return st_git_drop_blank_edges(rest)
+}
+
+/// Remove blank lines from the start and end of a block, keeping every other
+/// byte exactly as it arrived.
+///
+/// A line is blank when it is empty or is nothing but `\r`. A line that is
+/// `" M path"` is **not** blank and is kept verbatim, leading space included -
+/// that single space is the difference between a working file list and one
+/// whose first entry is missing a letter.
+fn st_git_drop_blank_edges( s: Str) -> Str {
+    if byte_len(s) == 0 {
+        return ""
+    }
+    let lines = str_split(s, "\n")
+    let n = lines.len()
+    mut lo = 0
+    while lo < n && st_git_is_blank_line(lines[lo]) {
+        lo = lo + 1
+    }
+    mut hi = n
+    while hi > lo && st_git_is_blank_line(lines[hi - 1]) {
+        hi = hi - 1
+    }
+    if hi <= lo {
+        return ""
+    }
+    mut acc = ""
+    mut i = lo
+    mut first = true
+    while i < hi {
+        if !first {
+            acc = acc + "\n"
+        }
+        acc = acc + lines[i]
+        first = false
+        i = i + 1
+    }
+    return acc
+}
+
+/// Is this line empty, or only a carriage return?
+fn st_git_is_blank_line( line: Str) -> Bool {
+    let t = str_substring(line, 0, byte_len(line))
+    mut i = 0
+    let n = byte_len(t)
+    while i < n {
+        let c = str_substring(t, i, 1)
+        if c != " " && c != "\t" && c != "\r" {
+            return false
+        }
+        i = i + 1
+    }
+    return true
 }
 
 /// `git status --porcelain` lines into a JSON array.

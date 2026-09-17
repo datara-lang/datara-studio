@@ -26,10 +26,11 @@
   --hair:rgba(255,255,255,.07); --hair2:rgba(255,255,255,.14);
   --sans:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   --mono:"Cascadia Mono","JetBrains Mono",Consolas,"SF Mono",monospace;
-  --lh:21px; --gut:58px;
+  --lh:21px; --gut:40px;
   --tree:210px; --panel:250px;
   --r:6px; --r2:10px;
-  --focus:0 0 0 2px rgba(125,211,192,.55);
+  /* There is no `--focus` token. It held the mint focus ring that is now gone
+     entirely; see the keyboard section below for why. */
 }
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;overflow:hidden;background:var(--s1);color:var(--ink1);
@@ -54,36 +55,45 @@ input{font:inherit;color:inherit}
 .mono{font-family:var(--mono)}
 
 .shell{display:grid;grid-template-rows:44px 1fr 28px;height:100%}
-/* The title bar's row exists only in the desktop shell. `ui/tauri-bridge.js` sets
-   `data-shell` on <html> before the first paint, and the interface draws the bar
-   itself only when that object exists - so in a browser both the element and its
-   row are absent and the layout is exactly the three-row layout it always was. */
-html[data-shell="tauri"] .shell{grid-template-rows:34px 44px 1fr 28px}
-
-/* The window's own title bar, drawn by the interface.
-   Windows' caption is 32 px at 100% scaling; 34 keeps the drag target as easy to
-   hit as the caption it replaced without spending more of the window on chrome.
-   The bar is the drag region (`data-tauri-drag-region="deep"` in app.js), which
-   is Tauri's own mechanism: it walks up from whatever was clicked and refuses to
-   drag when it meets a button, so the three controls below stay clickable and
-   everything else moves the window. Double-clicking the bar maximises. */
+/* There is no title-bar row in any build.
+   The window is undecorated and the interface used to draw its own 34 px
+   caption bar above the intent bar. That is where a Windows app puts its
+   caption, so it looked correct in isolation - but it cost a whole row of
+   vertical space in an editor, and the three window controls it carried fit
+   comfortably at the right end of the intent bar instead. `data-shell` still
+   marks the desktop build; it no longer changes the row count. */
 .titlebar{display:flex;align-items:center;gap:9px;padding-left:11px;
   background:var(--s0);border-bottom:1px solid var(--hair)}
 .tbmark{width:16px;height:16px}
 .tbtitle{font-size:12.5px;color:var(--ink3);white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;min-width:0;max-width:52%}
 .tbspace{flex:1}
-/* 46 px wide, because that is the width of the caption buttons this replaces -
-   "close is the top-right corner" is muscle memory and it should survive.
+/* 40 px wide, and now living inside the intent bar rather than a bar of their
+   own. "Close is the top-right corner" is muscle memory and it survives: they
+   are still the rightmost thing in the window, still in the same order.
    `.capbtn`, not `.wbtn`: the title screen already owns `.wbtn` for its three
    ways in, and a second rule of the same name declared earlier in this file
    wins on any property the later one does not also set - which is how a 46 px
    `width` from here ended up on "Create new project" and squashed the title
-   screen into a column of single words. Caught by looking at the screenshot. */
-.capctl{display:flex;align-self:stretch;flex:none}
-.capbtn{width:46px;display:flex;align-items:center;justify-content:center;
-  color:var(--ink2)}
-.capbtn:hover{background:var(--s3);color:var(--ink1)}
+   screen into a column of single words. Caught by looking at the screenshot.
+
+   They are 40 and not 46 because they no longer sit in a bar of their own: at
+   46 they read as a separate strip bolted to the end of the intent bar, and at
+   40 with the group's own vertical rule they read as the last group in it. */
+.capctl{display:flex;align-self:stretch;flex:none;margin-left:2px;
+  border-left:1px solid var(--hair)}
+/* The glyphs at rest are --ink1, not --ink2.
+   Windows draws its own caption buttons essentially white on a dark bar, and a
+   person reaches for them without looking. At --ink2 (#9A9AA4) they were a
+   mid-grey hairline on #0B0B0E and read as faint scratches - which is what the
+   screenshot showed. This is the one place in the chrome where the platform
+   convention beats a quieter palette: minimise and close are muscle memory, and
+   making them findable matters more than making them discreet. */
+.capbtn{width:40px;display:flex;align-items:center;justify-content:center;
+  color:var(--ink1);border-radius:0}
+/* Hover lifts the *background*, not the ink, because the ink is already at full
+   strength. Dimming from --ink1 to --ink1 on hover would be no signal at all. */
+.capbtn:hover{background:var(--s3)}
 .capbtn:active{background:var(--s4)}
 /* Windows 11's own close-button red. The one place in the bar where the system
    colour is worth more than the interface's own palette: it is the one button
@@ -104,6 +114,12 @@ html[data-shell="tauri"] .shell{grid-template-rows:34px 44px 1fr 28px}
   user-select:none;position:relative;z-index:6}
 .intent .left{display:flex;align-items:center;gap:10px;min-width:0}
 .intent .right{display:flex;align-items:center;gap:10px;justify-self:end}
+/* The language's own mark, leading the intent bar.
+   It replaced a text title in a caption bar above: the window is undecorated and
+   the interface has to say what it is somewhere, and 16 px of the real mark at
+   the left edge - where the old caption bar had it - says it without a row of
+   its own. Height-matched to `.iconbtn` so the row reads as one line. */
+.ibmark{width:16px;height:16px;flex:none;opacity:.9}
 .mark{display:flex;align-items:center;white-space:nowrap}
 .iconbtn{width:28px;height:28px;border-radius:var(--r);display:flex;align-items:center;
   justify-content:center;color:var(--ink3)}
@@ -177,6 +193,62 @@ html[data-shell="tauri"] .shell{grid-template-rows:34px 44px 1fr 28px}
 .body.reading .col.tree-col{display:none}
 .col{flex:none;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 .col > *{flex:1;min-height:0}
+
+/* ---- zen
+   Everything that is not the code, gone - and the shell's own row track has to
+   change with it. `.shell` is a grid with four rows (title, intent, body,
+   status); hiding the chrome with `display:none` leaves three empty tracks
+   still reserved, so the code would sit in a 1fr row with dead space above and
+   below it. The `[data-zen]` rules here redefine the grid instead, which is the
+   only way the editor actually fills the window. */
+html[data-zen="1"] .shell{grid-template-rows:1fr}
+/* In the desktop shell the row count is 5; the same collapse applies. A single
+   `1fr` row is correct for both, so this only needs to exist to beat the
+   `html[data-shell="tauri"]` rule above, which is more specific. */
+html[data-zen="1"][data-shell="tauri"] .shell{grid-template-rows:1fr}
+html[data-zen="1"] .titlebar,
+html[data-zen="1"] .intent,
+html[data-zen="1"] .status,
+html[data-zen="1"] .crumbs,
+html[data-zen="1"] .col.tree-col,
+html[data-zen="1"] .col.panel-col,
+html[data-zen="1"] .resize{display:none}
+/* The zen bar is the one piece of chrome that survives, and only its own parts
+   are shown - see the `zen*` settings. It is a single 26px row pinned to the
+   bottom of the body, so `flex-direction: column` on `.body` is what makes it
+   sit under the editor rather than beside it. */
+html[data-zen="1"] .body{flex-direction:column}
+.zenbar{display:none}
+html[data-zen="1"] .zenbar{display:flex;align-items:center;gap:14px;
+  height:26px;padding:0 12px;flex:none;
+  background:var(--s0);border-top:1px solid var(--hair);
+  font-size:11.5px;color:var(--ink3);user-select:none}
+/* An empty bar is a 26px stripe of nothing. Collapsing it when every part is
+   off is what makes "just code" actually mean just code. */
+html[data-zen="1"] .zenbar.empty{display:none}
+html[data-zen="1"] .zenbar .z {display:flex;align-items:center;gap:5px;white-space:nowrap}
+html[data-zen="1"] .zenbar .z.act{cursor:pointer;border-radius:4px;padding:2px 6px;margin:0 -6px}
+html[data-zen="1"] .zenbar .z.act:hover{background:var(--s3);color:var(--ink1)}
+html[data-zen="1"] .zenbar .z b{color:var(--ink2);font-weight:500}
+html[data-zen="1"] .zenbar .space{flex:1}
+html[data-zen="1"] .zenbar .zesc{opacity:.55}
+/* The reserved gutter for the zen exit hint. Zen needs one discoverable way out
+   that is not Esc-only, because a mode you cannot leave is a trap. */
+.zenhint{display:none;position:fixed;top:12px;left:50%;transform:translateX(-50%);
+  padding:5px 11px;border-radius:6px;background:var(--s4);border:1px solid var(--hair);
+  font-size:11.5px;color:var(--ink2);z-index:40;pointer-events:none}
+html[data-zen="1"] .zenhint.show{display:block}
+/* Centred column. The editor is `flex:1` and the textarea is absolutely
+   positioned inside it, so the readable measure is set by insetting the
+   surface rather than by a max-width on the text - which would leave the
+   line-number gutter outside it and the caret in the wrong place. */
+html[data-zen="1"] .body.zen-narrow .surface{
+  max-width:var(--zen-w);margin:0 auto;width:100%}
+html[data-zen="1"] .body.zen-surround .surface{
+  padding-top:28px;padding-bottom:40px}
+/* Zen is for reading as much as writing, so the code itself can breathe. */
+html[data-zen="1"] .hl,html[data-zen="1"] .code,html[data-zen="1"] .ghost{
+  padding-top:0;padding-bottom:0}
 
 .tree{background:var(--s1);display:flex;
   flex-direction:column;min-height:0}
@@ -381,12 +453,20 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .edscroll{position:absolute;inset:0;overflow:auto}
 /* The gutter sits over the text on the scroller's own scroll, so it has to be
    pinned by the editor's scroll handler. A solid back behind it is what makes
-   the left edge read as a clean corner instead of numbers drifting over code. */
+   the left edge read as a clean corner instead of numbers drifting over code.
+
+   The rule on the right edge is gone and the padding is down to 10px, because
+   58px of gutter with a hairline and 14px of inner padding read as a separate
+   column - a 58px-wide stripe of empty chrome between the explorer and the
+   first character of every line. The number is a marker, not a field. What the
+   width has to cover is a three-digit number at 13px mono (~24px) plus room to
+   breathe; 40 does that, and the code then starts 18px from the number, which
+   is what makes the pair read as one block rather than two columns. */
 .gutterback{position:absolute;left:0;top:0;width:var(--gut);bottom:0;
-  background:var(--s0);z-index:2;border-right:1px solid var(--hair)}
+  background:var(--s0);z-index:2}
 .gutter{position:absolute;left:0;top:0;width:var(--gut);padding:12px 0;text-align:right;
-  font-family:var(--mono);font-size:13px;line-height:var(--lh);color:var(--ink4);user-select:none;z-index:3}
-.gutter div{padding-right:14px}
+  font-family:var(--mono);font-size:12.5px;line-height:var(--lh);color:var(--ink4);user-select:none;z-index:3}
+.gutter div{padding-right:12px}
 .gutter div.cur{color:var(--ink2)}
 .gutter div.err{color:var(--err)}
 .gutter div.warn{color:var(--warn)}
@@ -412,21 +492,50 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 
 .panel{background:var(--s1);display:flex;
   flex-direction:column;min-height:0}
-/* One row, and off the edge rather than wrapped.
-   Six tabs do not fit in a 250px panel, and this used to wrap them into three
-   rows - which made the strip change height every time a tab was added, and made
-   the tabs read as a grid of buttons rather than as a strip. They stay on one row
-   now and the ones that do not fit go past the right edge.
-   The reason the old version wrapped was real, though: with a hidden scrollbar,
-   "AI" and "Generate" were unreachable and nothing said they existed. So the row
-   is still scrollable, the scrollbar is hidden, and `Panel` scrolls the selected
-   tab into view - which is the part that actually solved the problem. Settings ->
-   View lists every tab, so hiding the ones you never open is a real answer too. */
+/* The panel's header, and the strip of tabs inside it.
+   Eight tabs will not fit in a 264px panel, so the row runs off the edge rather
+   than wrapping - wrapping made the strip change height as tabs came and went and
+   made the tabs read as a grid of buttons instead of as a strip.
+
+   What was wrong with the first version of this: the overflow was real and
+   nothing said so. Measured in the running window at 1440x900 the row wants
+   380px in a 264px box - 116px unreachable - and selecting the last tab scrolled
+   the first one out the LEFT edge, to x 1066 with the panel's own left edge at
+   1176. `Problems` was therefore sitting over the code column, outside its own
+   container, while a 0px scrollbar claimed there was nothing to scroll. A tab
+   you cannot see and cannot reach is a tab that does not exist, and hiding that
+   behind `scrollbar-width:none` made it look like a deliberate design.
+
+   So: the row scrolls, the scrollbar stays hidden because two 22px buttons are
+   a better affordance than a 6px trough, and the buttons appear only when
+   `.phead` carries `.crowded` - which `Panel` sets from the measured scroll
+   width, not from an estimate. */
+/* No rule under the tab strip. The line was a 264px hairline sitting directly
+   beneath the words `Issues`/`Symbols`/`Project`, and at that distance it read
+   as an underline belonging to the active tab rather than as the seam between
+   the strip and the panel body. The strip already has its own background and the
+   body already has its own padding, so the seam is legible without a stroke. */
+.phead{position:relative;flex:none}
 .ptabs{display:flex;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;gap:2px;
-  padding:7px 6px;border-bottom:1px solid var(--hair);scrollbar-width:none}
+  padding:7px 6px;scrollbar-width:none;scroll-behavior:smooth}
 .ptabs::-webkit-scrollbar{height:0}
+/* Room for the two buttons, so the last tab is not permanently underneath them. */
+.phead.crowded .ptabs{padding-right:52px}
 .ptabs button{height:30px;padding:0 10px;border-radius:var(--r);font-size:12.5px;
   color:var(--ink3);white-space:nowrap;display:flex;align-items:center;gap:5px;flex:none}
+.ptabs button:hover{color:var(--ink2);background:var(--s3)}
+/* The scroll arrows. `--s1` behind them rather than transparent, because a tab
+   sliding under a see-through button is worse than one sliding under an opaque
+   one - and the surface is the panel's own, so they read as part of it. */
+.pscroll{position:absolute;top:0;right:0;height:100%;display:flex;align-items:center;
+  gap:1px;padding:0 5px;background:var(--s1)}
+.tabnav{width:22px;height:22px;display:flex;align-items:center;justify-content:center;
+  border-radius:5px;color:var(--ink3)}
+.tabnav:hover:not(:disabled){background:var(--s3);color:var(--ink1)}
+/* A direction with nothing further in it is disabled rather than hidden, so the
+   two buttons do not swap places as you scroll. */
+.tabnav:disabled{opacity:.28;cursor:default}
+.tabnav svg{display:block}
 .ptabs button:hover{color:var(--ink2);background:var(--s3)}
 /* The active tab used to carry a 72px teal underline - `border-bottom-color:
    var(--live)`. Measured in the running window at 1441x935 it is 72 px wide and
@@ -477,6 +586,29 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
   font-family:var(--mono);font-size:13px;color:var(--ink2);cursor:pointer}
 .sym:hover{background:var(--s3);color:var(--ink1)}
 .sym.on{background:var(--s3);color:var(--ink1)}
+
+/* Chat (the third AI tab).
+   The transcript is the panel, so it scrolls as a column of bubbles rather than
+   being a form with a result under it - which is what makes it read as a
+   conversation instead of as a generate box with history bolted on. The role
+   marker is a lowercase word, not an avatar: at 264px an avatar is 24px of the
+   width spent on a picture of a person who is not there. */
+.chat{display:flex;flex-direction:column;gap:9px}
+.chat .msg{border-radius:var(--r2);padding:9px 11px;background:var(--s2)}
+.chat .msg.user{background:var(--s3)}
+.chat .msg .who{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--ink3);margin-bottom:5px}
+.chat .msg .mtext{font-size:12.5px;line-height:1.62;color:var(--ink2);
+  white-space:pre-wrap;word-break:break-word}
+.chat .msg .ins{margin-top:8px;max-height:260px;overflow:auto}
+/* The context strip is a card with a live size in it, so it has to look like a
+   readout rather than like another message. */
+.ctxcard pre{margin-bottom:8px}
+.ctxbtns{display:flex;gap:7px;flex-wrap:wrap}
+.chat .composer{display:flex;gap:7px;align-items:flex-end;margin-top:2px}
+.chatfield{flex:1;margin:0;height:auto;min-height:44px;max-height:140px;padding:8px 9px;
+  resize:vertical;line-height:1.5;font-family:var(--sans);font-size:12.5px}
+.chat .composer .mini{height:28px;flex:none}
 
 /* Three columns, so the git state sits in the actual middle.
    `minmax(0,1fr) auto minmax(0,1fr)` rather than a flex row with a `flex:1`
@@ -616,11 +748,25 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 
 /* ------------------------------------------------------- keyboard and motion */
 
-/* Nearly everything here is a div or a button with the platform appearance
-   removed, so the browser's default focus ring either does not show or draws an
-   un-radiused rectangle around a 6px-cornered control. One ring, one colour,
-   and `:focus-visible` so clicking with the mouse never draws it. */
-:focus-visible{outline:none;box-shadow:var(--focus)}
+/* No focus ring anywhere.
+   There used to be one shared mint ring (`--focus`, rgba(125,211,192,.55)) on
+   `:focus-visible`, meant to serve controls that had their platform appearance
+   stripped. In practice the one place it appeared most was the code surface the
+   moment you clicked into it - a green box drawn around the whole editor, every
+   time you started typing. An editor's caret already says where focus is; a ring
+   around the buffer adds nothing and reads as a selection that will not go away.
+
+   So the ring is gone rather than quietened. The controls that genuinely need to
+   announce focus - the palette, the filter field, the settings fields - keep the
+   subtler treatments they already had below, and everything else relies on the
+   caret, the hover state and the pressed state, which is how the rest of this
+   interface already signals. */
+:focus{outline:none}
+:focus-visible{outline:none}
+/* The few places that DO want a visible focus cue, because they are keyboard
+   destinations with no caret and no hover to lean on. The palette's own input
+   already gets a soft inset edge; the file filter and the browser's path field
+   get the same treatment instead of a ring. */
 .search:focus-within,.filter:focus,.field:focus,.pinput:focus{outline:none}
 
 /* The status lights. An "off" LED was #3A3A42 on #101014 - 1.74:1, a light
@@ -694,6 +840,11 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 </div>
 <div id="faults" class="faults"></div>
 <div id="root"></div>
+<!-- Which build this is. `scripts/build-ui.mjs` replaces this whole block, so a
+     development page that skips the build gets the full studio - the same
+     default as `build-ui.mjs --core` being absent. Set before anything else so
+     `app.js` can read it at load time. -->
+<script>/* __DS_VARIANT__ */</script>
 <script src="/vendor/react.production.min.js"></script>
 <script src="/vendor/react-dom.production.min.js"></script>
 <script src="/vendor/htm.umd.js"></script>

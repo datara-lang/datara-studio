@@ -69,12 +69,29 @@ use explorer
 /// exactly such connections, which made the interface load to a blank page.
 /// With no subresources there is nothing for the browser to open an extra socket
 /// for. See PORTING.md SEAM-6.
-fn st_ui_page() -> Str {
+///
+/// Two variants exist and neither is a separate server: `ui/studio.html` is the
+/// studio with the companion, `ui/studio-core.html` is the same interface with
+/// the two AI tabs taken out. `?core=1` on the root request serves the second
+/// one, so the desktop shell, a browser tab and a shortcut can each choose
+/// without a flag to the process. The fallback order is deliberate - if the core
+/// file has not been built, the full studio is served rather than an error,
+/// because a working IDE without the requested variant beats a broken page.
+fn st_ui_page( core: Bool) -> Str {
     mut html = ""
     unsafe(justification: "serving the IDE interface to the local browser") {
-        if file_exists("ui/studio.html") {
-            html = file_read("ui/studio.html")
+        if core {
+            if file_exists("ui/studio-core.html") {
+                html = file_read("ui/studio-core.html")
+            }
+        } else {
+            if file_exists("ui/studio.html") {
+                html = file_read("ui/studio.html")
+            }
         }
+    }
+    if byte_len(html) == 0 && core {
+        return st_ui_page(false)
     }
     if byte_len(html) == 0 {
         return "<html><body style=\"font-family:sans-serif;padding:40px;background:#101013;color:#e6e6ea\">"
@@ -104,7 +121,13 @@ fn st_handle( fd: Int, tc: Str) {
     let body = st_body_of(raw)
 
     if path == "/" || path == "/index.html" {
-        let sent = st_respond(fd, 200, "text/html; charset=utf-8", st_ui_page())
+        // `st_path_of` deliberately cuts the query off, so the variant flag has
+        // to be read from the raw request line. Any `core=1` substring is
+        // accepted rather than an exact match: a browser may append anything
+        // (a cache buster, a fragment the shell adds), and the only thing that
+        // matters here is whether the root request asked for the core build.
+        let wants_core = str_index_of(line, "core=1") >= 0
+        let sent = st_respond(fd, 200, "text/html; charset=utf-8", st_ui_page(wants_core))
         return
     }
     if path == "/api/health" {
@@ -253,7 +276,7 @@ fn main() {
     }
 
     println("")
-    println("  Datara Studio 0.2.0")
+    println("  Datara Studio 0.3.0")
     println("  interface  http://127.0.0.1:" + int_to_str(port))
     println("  ai         http://127.0.0.1:7890  (optional, start it from D:\\ryan)")
     println("  stop       Ctrl+C")

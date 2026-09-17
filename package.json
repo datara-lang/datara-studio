@@ -1,7 +1,7 @@
 {
   "name": "datara-studio",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Development manifest only. The studio ships no runtime npm packages - the interface is one generated HTML file with everything inlined. This exists so the structure tests own their DOM instead of borrowing one from whatever project happens to sit above the studio on disk, which is what they did until the studio moved out of the forgen_ai project.",
   "scripts": {
     "test": "bash scripts/build.sh",

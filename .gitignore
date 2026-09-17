@@ -38,3 +38,11 @@ shots/
 # Local scratch that predates the repository. Kept on disk, kept out of history
 # until someone decides what it is.
 .p1.py
+
+# The server's own stdout when it is started with a redirect, which is how
+# `start.sh` and the launch instructions run it. It is a live log of the running
+# process, not a source file.
+studio-run*.log
+
+# The build cache forgen writes beside the sources. Regenerated on every build.
+.forgen_cache/
