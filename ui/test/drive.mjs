@@ -325,8 +325,20 @@ async function answer(page, text, which) {
     } catch (e) {}
   });
   const probBadge = async () => {
-    const b = page.locator(".ptabs button", { hasText: "Problems" }).locator(".badge");
-    return (await b.count()) ? (await b.first().innerText()) : "none";
+    // The strip shows the SHORT label (`PANEL_TAB_SHORT`), which is `Issues` for
+    // the `prob` tab; `Problems` is only the tooltip and the Settings name.
+    //
+    // Matched on the button's *label* with a prefix test rather than on its whole
+    // text, because once a badge exists the button reads "Issues\n1" and an
+    // exact-match selector stops finding it - which is how this check spent its
+    // time comparing "none" to "none" and passing for the wrong reason.
+    return (await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll(".ptabs button"));
+      const prob = btns.find((b) => /^(Issues|Problems)/.test(b.innerText.trim()));
+      if (!prob) return "no tab";
+      const bad = prob.querySelector(".badge");
+      return bad ? bad.innerText.trim() : "none";
+    }));
   };
   const before = await probBadge();
   await page.locator(".code").fill("fn main() -> Int {\n    return nope()\n}\n");
@@ -468,33 +480,42 @@ async function answer(page, text, which) {
   await ctx.close();
 }
 
-// ---- 10. A browser draws no title bar
+// ---- 10. A browser draws no title bar and no window controls
 //
-// The window is created undecorated (`src-tauri/src/main.rs`), so the interface
-// has to draw the bar itself. That makes "the bar is only drawn in the shell" a
-// load-bearing property rather than a nicety: a browser that drew it would show
-// three window controls that control nothing, and the layout would be 34 px
-// wrong. It is the easiest thing here to lose silently, so it is asserted.
+// There is no caption bar in any build now - it was removed, and the three
+// window controls moved into the intent bar, where they appear only in the
+// shell. That makes "no separate bar row, and no controls outside the intent
+// bar" the load-bearing property rather than a nicety: a browser that drew the
+// controls would show three buttons that control nothing, and the layout would
+// be 34 px wrong. It is the easiest thing here to lose silently, so it is
+// asserted.
 {
   const { ctx, page } = await open(() => { try { localStorage.clear(); } catch (e) {} });
   const bars = await page.locator(".titlebar").count();
+  const caps = await page.locator(".capctl").count();
   const shellAttr = await page.evaluate(() => document.documentElement.getAttribute("data-shell"));
   const rows = await page.evaluate(() =>
     getComputedStyle(document.querySelector(".shell")).gridTemplateRows.split(" ").length);
   const handle = await page.evaluate(() => typeof window.__DS_SHELL__);
   check("a browser draws no title bar", bars === 0, "found " + bars);
+  check("a browser draws no window controls at all", caps === 0, "found " + caps);
   check("a browser is not marked as the shell", shellAttr === null, JSON.stringify(shellAttr));
   check("the browser layout keeps its three rows", rows === 3, rows + " rows");
   check("no shell handle exists in a browser", handle === "undefined", handle);
   await ctx.close();
 }
 
-// ---- 11. In the shell the bar appears, and its buttons reach the window
+// ---- 11. In the shell the controls appear in the intent bar, and reach the window
 //
 // What the shell injects before any page script runs, stubbed to a recorder.
-// The real `ui/tauri-bridge.js` consumes it and the real React bar is what is
-// clicked, so this exercises both halves of the seam without needing a Rust
+// The real `ui/tauri-bridge.js` consumes it and the real React controls are what
+// is clicked, so this exercises both halves of the seam without needing a Rust
 // build - which is the only way to test this in the browser suite at all.
+//
+// The controls are no longer in a bar of their own: they sit at the right-hand
+// end of the intent bar, next to the Run button, and the intent bar is the drag
+// region. So the assertions are about `.intent .capctl`, and the row count does
+// not change - there is no extra row to add.
 {
   const { ctx, page } = await open(() => {
     try { localStorage.clear(); } catch (e) {}
@@ -510,19 +531,22 @@ async function answer(page, text, which) {
     };
   });
   const bars = await page.locator(".titlebar").count();
-  const btns = await page.locator(".titlebar .capbtn").count();
-  const names = await page.locator(".titlebar .capbtn").evaluateAll((els) => els.map((e) => e.getAttribute("title")));
+  const caps = await page.locator(".intent .capctl").count();
+  const btns = await page.locator(".intent .capbtn").count();
+  const names = await page.locator(".intent .capbtn").evaluateAll((els) => els.map((e) => e.getAttribute("title")));
   const rows = await page.evaluate(() =>
     getComputedStyle(document.querySelector(".shell")).gridTemplateRows.split(" ").length);
-  const barH = await page.locator(".titlebar").evaluate((el) => el.getBoundingClientRect().height);
-  check("the shell draws its own title bar", bars === 1, "found " + bars);
+  const drag = await page.evaluate(() =>
+    !!document.querySelector(".intent[data-tauri-drag-region]"));
+  check("the shell draws no separate title bar", bars === 0, "found " + bars);
+  check("the controls are in the intent bar", caps === 1, "found " + caps);
   check("it has the three window controls", btns === 3, names.join(" / "));
-  check("the bar is the height it claims", Math.round(barH) === 34, barH + "px");
-  check("the title bar adds a row to the layout", rows === 4, rows + " rows");
+  check("the intent bar is the drag region", drag, String(drag));
+  check("the bar adds no extra row to the layout", rows === 3, rows + " rows");
 
-  await page.locator(".titlebar .capbtn").nth(0).click();
-  await page.locator(".titlebar .capbtn").nth(1).click();
-  await page.locator(".titlebar .capbtn").nth(2).click();
+  await page.locator(".intent .capbtn").nth(0).click();
+  await page.locator(".intent .capbtn").nth(1).click();
+  await page.locator(".intent .capbtn").nth(2).click();
   await page.waitForTimeout(250);
   const sent = await page.evaluate(() => window.__DS_INVOKES__);
   const cmds = sent.map((c) => c.cmd);
@@ -537,7 +561,7 @@ async function answer(page, text, which) {
     labelled + " of " + cmds.length);
   const faults = await page.locator("#faults .fault").count();
   check("nothing was refused", faults === 0, faults + " fault line(s)");
-  await page.screenshot({ path: join(out, "d11-titlebar.png") });
+  await page.screenshot({ path: join(out, "d11-controls.png") });
   await ctx.close();
 }
 
@@ -648,7 +672,14 @@ async function answer(page, text, which) {
     if (on !== name) broke.push(name + " is not the active tab after clicking it (got " + on + ")");
   }
   check("every panel tab opens without killing the interface", broke.length === 0, broke.join(" | "));
-  check("all six tabs were walked", labels.length >= 6, labels.join(" / "));
+  // Named, not counted. `>= 6` passed while Chat was missing, which is the
+  // failure a count-only assertion is blind to - and the tab strip is exactly
+  // where a new tab silently failing to be reachable has happened before.
+  const want = ["Issues", "Symbols", "Project", "Layout", "AI", "Generate", "Chat"];
+  const missing = want.filter((w) => !labels.some((l) => l.startsWith(w)));
+  check("every panel tab is present, Chat included", missing.length === 0,
+        "missing: " + missing.join(", ") + "  ·  saw: " + labels.join(" / "));
+  check("the strip was actually walked", labels.length >= want.length, labels.join(" / "));
   await page.screenshot({ path: join(out, "d13-tabs.png") });
   await ctx.close();
 }
@@ -680,7 +711,7 @@ async function answer(page, text, which) {
   await page.keyboard.press("Tab");
   await page.waitForTimeout(400);
   check("Tab writes the whole function, not the two letters",
-    await code.inputValue(), "fn name() -> Int {\n    return 0\n}");
+    await code.inputValue(), "fn name() {\n    \n}");
 
   // the placeholder is selected, which is what makes the template usable: the
   // next character typed replaces the name instead of landing after it
@@ -689,8 +720,18 @@ async function answer(page, text, which) {
   await page.keyboard.type("main");
   await page.waitForTimeout(300);
   check("typing the name replaces the placeholder",
-    await code.inputValue(), "fn main() -> Int {\n    return 0\n}");
+    await code.inputValue(), "fn main() {\n    \n}");
   await page.screenshot({ path: join(out, "d14-snippet-accepted.png") });
+
+  // and the second Tab steps into the empty body, which is the whole point of
+  // removing the `return 0` placeholder
+  await page.keyboard.press("Tab");
+  await page.waitForTimeout(300);
+  check("a second Tab lands in the empty body",
+    await code.evaluate((el) => {
+      const upto = el.value.slice(0, el.selectionStart);
+      return upto.split("\n").length;
+    }), 2);
 
   // and the body follows the indentation of the line it was typed on
   await code.press("Control+a");
@@ -699,7 +740,7 @@ async function answer(page, text, which) {
   await page.keyboard.press("Tab");
   await page.waitForTimeout(400);
   check("an indented fn indents its body to match",
-    await code.inputValue(), "    fn name() -> Int {\n        return 0\n    }");
+    await code.inputValue(), "    fn name() {\n        \n    }");
 
   // a keyword with no shape must still insert as itself
   await code.press("Control+a");

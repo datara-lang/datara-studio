@@ -2,12 +2,18 @@
 //
 // Read the Datara mark out of its .ico container.
 //
-// The artwork lives in exactly one file - `assets/datara.ico`, the same icon
-// the language extension ships - and every other copy in the tree is derived
-// from it: the window icon, the browser tab, and the mark beside a `.dtr` file
-// in the explorer. Deriving them here instead of hand-maintaining four copies
-// is what stops them drifting apart, which is how the app icon and the file
-// icon ended up as two different designs.
+// This module only *reads* ICO files - it does not know what the mark looks
+// like. For years it read `assets/datara.ico` on the assumption that the file
+// was the single source of the artwork, and it was not: that file held an
+// orange palm in a yellow square, while the interface drew light brackets
+// around a mint dot. Two marks were live at once and the taskbar showed the
+// wrong one.
+//
+// The geometry now lives in `scripts/mark.mjs` (the same shape as
+// `ui/icon.svg`), `scripts/build-icons.mjs` writes it to `ui/mark.ico`, and
+// this module reads that back for the data URIs. So the chain is one shape ->
+// one generated .ico -> everything else, and the reading half stays as simple
+// as it was.
 //
 // The ICO format is a small directory of images. Each entry carries a width, a
 // height, a byte size and an offset, and the modern entries are PNG files

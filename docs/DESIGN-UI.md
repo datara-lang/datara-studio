@@ -224,13 +224,175 @@ instrumentation for the wasm core and had no business in the user's eyeline.
 3. The status line, including deleting the telemetry.
 4. The semantic rail last, because it needs real structure from the provider.
 
+## Done since this was written
+
+Kept here rather than deleted, because each one records a decision that would
+otherwise be re-litigated.
+
+* **Tokens and surfaces** - in. Five levels, one accent, three inks, two
+  families. The hairlines are translucent, which is what stopped them reading as
+  scratches.
+* **The intent bar with the run control** - in. No toolbar; one input and one
+  split button. The play triangle is off-white, not green.
+* **The status line, telemetry deleted** - in. Token counts, lexer timing and
+  character counts are gone.
+* **Icons from one source** - `scripts/mark.mjs` holds the geometry and
+  `scripts/build-icons.mjs` writes all eight artefacts from it. This replaces an
+  earlier arrangement that generated them from `assets/datara.ico`, which sounds
+  like the same thing and was not: that file was a *fourth* design - a yellow
+  palm inside a yellow rounded square - while the interface drew two pale
+  brackets and a mint dot. Two marks were live in one window and the one on the
+  taskbar was the one that did not match. `ui/icon.svg` and `mark.mjs` now
+  describe the same shape, and the build fails if the SVG stops containing the
+  three brand colours.
+* **Small sizes are drawn for the grid, not scaled onto it** - see below.
+* **The companion is a guest, not the host** - the AI tabs are last, the panel
+  opens on Problems, and the whole interface works with the companion off.
+
+### The 16px icon, which is where icons actually live
+
+The taskbar icon looked blurry and unreadable. It was not a resolution problem:
+the 16px entry was there and correctly sized. Rendering it back out as ASCII
+made the cause obvious in one screen:
+
+```
+.++++MM++MM++++.     the node, split into four corners
+.++++#++++#++++.     the bracket, one pixel wide
+.+++#++MM++#+++.     and the node poking through it
+```
+
+Scaling the 64-unit drawing down by 0.8 made the 5.5-unit node *wider* than the
+5-unit stroke. At 16px one unit is a quarter of a pixel, so both shapes were
+fighting over the same one-pixel budget and neither won. Shrinking harder cannot
+fix that - the two shapes have to stop being the same drawing.
+
+So `SMALL` in `mark.mjs` carries a separate 16px and 24px layout with its own
+numbers, fitted on the pixel grid in pixels rather than in 64-space units. A
+16px icon is a different drawing that resembles the 256px one.
+
+Two things this cost, both worth keeping:
+
+* The first attempt invented plausible numbers (`spread 9, tip 9`) and produced
+  **two solid vertical bars with no bracket at all** - a polyline whose apex and
+  tips are equidistant from the centre is a straight line. The working numbers
+  came from fitting the shape on a character grid first, then converting.
+* The second attempt fed those pixel offsets straight into the sampler, which
+  works in 64-space, so the brackets came out half a pixel wide and vanished.
+  The fields are now named `apexPx`, `tipPx`, `topPx` and converted once, on the
+  way in. The `Px` suffix is load-bearing.
+
+`scripts/verify-ico.mjs` now runs in the build and reads the finished `.ico`
+back: every size present, square, RGBA, in bounds, the declared size equal to
+the encoded size, no yellow surviving. The generator can only report that it
+wrote something; this is what notices when what it wrote is wrong.
+`scripts/taskbar-sheet.mjs` draws old and new at 16/20/24/32/48 on both
+surfaces, because reviewing a 256px PNG would never have caught this.
+
+### Zen mode
+
+`Ctrl+Shift+Z`, or the button beside the panel toggle. Everything that is not the
+code goes: title bar, toolbar, explorer, right panel, breadcrumbs, status bar.
+`Esc` leaves.
+
+The mode is carried on `<html>` as `data-zen`, not as a React class, because the
+rules it drives are about the shell's own **grid** - and a grid track cannot be
+removed by a rule inside the grid's subtree. Hiding five children with
+`display:none` leaves the reserved tracks behind, so the code would sit in a 1fr
+row with dead space above and below it. Collapsing to `grid-template-rows:1fr` is
+what makes the editor actually fill the window, and that rule has to sit outside.
+
+What survives is one 26px bar, and every part of it is opt-in in Settings:
+
+* **file name** - where you are
+* **position, language, running** - another question people ask mid-sentence
+* **problems** - an error and warning count, clickable, that leaves Zen and opens
+  the panel. This is the one piece of the right panel worth interrupting for, and
+  a count you cannot act on is a taunt. A clean file says `no problems` rather
+  than going quiet, because silence is indistinguishable from a broken bar.
+* **soft wrap**, **breathing room**, **extra size**, **column width**
+
+With all of the informational parts off the bar collapses entirely, so "just the
+code" means just the code rather than a 26px stripe of nothing.
+
+Three decisions worth keeping:
+
+* **The mode is not persisted; its preferences are.** Restoring a window with no
+  interface and no obvious way back is how a person concludes the app is broken.
+* **The shortcut is registered at window level, not in the editor mount.** The
+  editor effect begins `if (!edRef.current) return;`, so anything inside it exists
+  only while a file is open. Zen registered there did nothing at all on a cold
+  start with no file - the key arrived, no handler was listening, and the mode
+  looked broken rather than unavailable.
+* **The centred column insets the text surface, not the text.** A `max-width` on
+  the code alone would leave the line-number gutter stranded at the window edge
+  and put the caret in the wrong place, because the gutter is positioned from the
+  surface's own box.
+
+`ui/test/zen.mjs` drives all of this in a real browser and measures, because
+"did the grid collapse" is not a question a static DOM can answer. Two traps it
+records: the API endpoints take a **raw path** as the body rather than JSON
+(sending `"{}"` made the server treat `{}` as the workspace root and answered
+"cannot read that folder"), and a fresh browser profile has no remembered
+workspace, so it shows the welcome screen and there is no editor to measure -
+every layout assertion came back `-1`, which reads as "Zen is broken" when the
+truth was "there is no editor here".
+
+### The core build
+
+`scripts/build-ui.mjs --core`, served at `/?core=1`, is the same interface with
+the companion removed: four compiler tabs instead of six, no plug in the bar, no
+"start the companion" in the palette, no companion section in Settings. Not a
+separate source file - one `app.js` with `window.__DS_CORE__` read in four
+places. A fork would be two files that get to disagree; a flag is auditable.
+
+### The panel tab strip, which was the worst thing in the window
+
+Eight tabs will not fit in a 264px panel, so the row runs off the edge and
+scrolls. That was the intent, and the first implementation of it was wrong in a
+way nothing caught for a long time:
+
+* The auto-scroll that keeps the selected tab visible was not clamped. Selecting
+  the last tab scrolled the row to an offset past its own end, which pushed the
+  **first** tab out the **left** edge - measured at 1440x900, `Problems` was
+  reported at x 1066 with the strip's own left edge at 1176. It was sitting over
+  the code column, outside its container, while a 0px scrollbar said there was
+  nothing to scroll.
+* Nothing said the row overflowed at all. No arrows, no fade, no partial tab at
+  the edge on load. You found the hidden tabs by accident or not at all.
+
+Both are fixed and both are now checked by `ui/test/tabs.mjs`, which drives the
+real page in Chromium and asserts reachability rather than appearance: every tab,
+when clicked, is brought fully into view; the row starts at `scrollLeft 0`; and
+the arrows only exist when the row actually overflows.
+
+Two things that came out of building that check, worth keeping:
+
+* **`getBoundingClientRect` does not know about clipping.** A child scrolled past
+  its container still reports its geometric position, so a check written as "no
+  tab may have `left < strip.left`" fails against a strip that is working
+  perfectly. The screenshot settles it - at full scroll `Project` is cut
+  mid-word at the panel edge, which is clipping. Assert on whether hiding is in
+  effect, not on rects. (This cost two rounds.)
+* **Labels were abbreviated to fit, not to look tidy.** `Issues` and `Symbols`
+  instead of `Problems` and `Structure` bring 380px of tabs down to 268, which
+  fits a default panel with room to spare. The full name stays in the tooltip and
+  in the Settings list.
+
+### The labels in the strip are the short ones
+
+`PANEL_TAB_LABELS` is what a tab is *called* (Settings, tooltips);
+`PANEL_TAB_SHORT` is what the strip *draws*. They are separate because the
+Settings list is a comfortable place for `Structure` and a 264px strip is not.
+
 ## Open questions for Kirill
 
 * The accent: mint-teal as proposed, or warmer? The whole interface is built
-  around this one choice and it is the easiest thing to get wrong.
+  around this one choice and it is the easiest thing to get wrong. *(Shipped as
+  mint, #7DD3C0 - say the word and it is one token.)*
 * Does the intent bar replace the file tree too, or does the tree stay open by
-  default?
+  default? *(Shipped: the tree stays, and folds to a rail.)*
 * Reading mode: a separate layout, or just a different density of the same one?
+  *(Shipped: the same layout with the tree hidden.)*
 
 ### Found by driving the interface, and left for you to decide
 

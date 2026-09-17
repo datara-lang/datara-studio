@@ -71,7 +71,7 @@ const appSrc = readFileSync(join(here, "..", "app.js"), "utf8");
 const load = new Function(
   "React", "ReactDOM", "htm", "window", "document", "fetch", "localStorage",
   "performance", "TextEncoder", "TextDecoder", "atob", "setInterval", "setTimeout", "clearTimeout", "AbortController",
-  appSrc + "\n; return { App, Editor, Palette, Tree, TreeNode, Panel, IntentBar, Mark, Browser, NewRow, Settings, coreHighlight, symbols, buildTree, resolveName, parseForgenDiagnostics, stripAnsi, checkTarget, checkBody, checkNote, dirOf, hoverInfo, fileIcon, completerFor, KEYWORDS, TYPES, BUILTINS, DATARA_DOCS, FILE_KINDS, DATARA_LANG, PLAIN_LANG, PROVIDERS, providerFor };"
+  appSrc + "\n; return { App, Editor, Palette, Tree, TreeNode, Panel, IntentBar, ZenBar, Mark, Browser, NewRow, Settings, DEFAULTS, coreHighlight, symbols, buildTree, resolveName, parseForgenDiagnostics, stripAnsi, checkTarget, checkBody, checkNote, dirOf, hoverInfo, fileIcon, completerFor, KEYWORDS, TYPES, BUILTINS, DATARA_DOCS, FILE_KINDS, DATARA_LANG, PLAIN_LANG, PROVIDERS, providerFor };"
 );
 
 const noop = () => {};
@@ -138,11 +138,36 @@ const wanted = [
 for (const [label, needle] of wanted) check(label, has(out, needle), true);
 
 console.log("\npanel tabs are all there, offline ones first");
+// The labels in the table, which the Settings list and the tooltips read.
 for (const label of ["Problems", "Structure", "Project", "Layout", "AI", "Generate"]) {
   check("tab: " + label, has(out, label), true);
 }
+// And the labels actually drawn in the strip, which are the short ones. The row
+// wants 404px in a 264px panel, so a six-tab strip cannot show every full name
+// and still let you reach the rest - abbreviating is what makes the row fit, and
+// a rename back to the long forms would quietly undo it.
+//
+// Scoped to the strip: the Settings screen legitimately prints the full names in
+// a <select>, and it is rendered in the same document, so a bare `has()` over
+// the whole page cannot tell the two apart.
+const stripHtml = (() => {
+  const at = out.indexOf('class="ptabs"');
+  if (at < 0) return "";
+  return out.slice(at, out.indexOf("</div>", out.indexOf('class="pbody"')));
+})();
+check("the strip rendered", stripHtml.length > 0, true);
+for (const [label, long] of [["Issues", "Problems"], ["Symbols", "Structure"]]) {
+  check("strip draws '" + label + "', not '" + long + "'",
+    has(stripHtml, ">" + label) && !has(stripHtml, ">" + long), true);
+}
+check("the strip keeps short names for the tabs that need no abbreviation",
+  has(stripHtml, ">AI<") && has(stripHtml, ">Generate"), true);
+// The scroll arrows are part of the strip's contract: `Panel` draws them
+// whenever the measured row is wider than the panel, which at the default width
+// it always is.
+check("the strip has scroll arrows", has(out, 'class="tabnav"'), true);
 // the first tab must be one that works with no companion running
-check("opens on Problems, not on AI", out.indexOf(">Problems") < out.indexOf(">AI<"), true);
+check("opens on Problems, not on AI", stripHtml.indexOf(">Issues") < stripHtml.indexOf(">AI<"), true);
 
 console.log("\nthe run control says run, not check/build/lint");
 check("labelled Run", has(out, ">Run<") || has(out, "Run</span>"), true);
@@ -515,6 +540,53 @@ console.log("\nthe language provider seam");
 
   check("Datara's symbols are wired to the real scanner",
     Studio.DATARA_LANG.symbols("pub fn rope_len() {}").map((s) => s.name), ["rope_len"]);
+}
+
+// --- zen --------------------------------------------------------------------
+//
+// Zen is a layout claim, so most of it belongs in ui/test/zen.mjs, which drives
+// a real browser and measures the grid. What is checked here is the part that
+// does not need one: that the pieces the CSS keys off actually exist in the
+// markup, and that the settings behind it are complete. A missing `.zenbar`, or
+// a `zen*` preference the Settings screen writes but DEFAULTS does not carry,
+// would otherwise only show up as a mode that silently does nothing.
+console.log("\nzen");
+{
+  const render = (props) => ReactDOMServer.renderToStaticMarkup(
+    React.createElement(Studio.ZenBar, Object.assign({
+      values: Studio.DEFAULTS, onExit: noop, onOpenProblems: noop,
+      fileName: "api.dtr", cursor: { line: 3, col: 12 }, lang: "Datara",
+      dirty: false, counts: { error: 0, warn: 0 }, running: false,
+    }, props || {}))
+  );
+
+  const full = render();
+  check("the bar renders", has(full, 'class="zenbar"'), true);
+  check("and carries the file name", has(full, "api.dtr"), true);
+  check("and the position", has(full, "3") && has(full, "12"), true);
+  check("and the language", has(full, "Datara"), true);
+  // "no problems" rather than nothing: silence would be indistinguishable from
+  // a bar that failed to render.
+  check("a clean file says so rather than going quiet", has(full, "no problems"), true);
+  check("the bar is not marked empty", has(full, "zenbar empty"), false);
+
+  const errs = render({ counts: { error: 2, warn: 1 } });
+  check("errors are counted", has(errs, "2 errors"), true);
+  check("warnings are counted", has(errs, "1 warning"), true);
+  check("the count is clickable", has(errs, 'class="z act"'), true);
+  check("one error is singular", has(render({ counts: { error: 1, warn: 0 } }), "1 error"), true);
+
+  // Every part off must collapse the bar, or "just the code" is a lie.
+  const off = render({ values: Object.assign({}, Studio.DEFAULTS,
+    { zenFile: false, zenStatus: false, zenProblems: false }) });
+  check("with every part off the bar is marked empty", has(off, "zenbar empty"), true);
+
+  // The preferences the Settings screen writes must all have defaults, or a
+  // fresh profile renders a bar with `undefined` in it.
+  for (const k of ["zenFile", "zenStatus", "zenProblems", "zenWrap", "zenSurround", "zenWidth", "zenFontDelta"]) {
+    check("DEFAULTS carries " + k, Object.prototype.hasOwnProperty.call(Studio.DEFAULTS, k), true);
+  }
+  check("zen is off by default", Studio.DEFAULTS.zenWidth, 0);
 }
 
 console.log("\n" + pass + " passed, " + fail + " failed");

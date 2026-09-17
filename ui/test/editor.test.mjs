@@ -206,21 +206,38 @@ console.log("\nsnippets");
     E.comp.items[0].hint, "snippet");
   E.acceptComplete();
   check("accepting fn writes a whole function",
-    E.ta.value, "fn name() -> Int {\n    return 0\n}");
+    E.ta.value, "fn name() {\n    \n}");
+  check("  with an empty body, not a return 0",
+    !/return/.test(E.ta.value), true);
   check("  with the name selected so typing replaces it", sel(), "name");
   check("  and the caret at the start of it", E.ta.selectionStart, 3);
+  check("  and a second stop armed for the body",
+    !!(E.pendingStop && E.pendingStop.line === 2), true);
+
+  // The tab stop, which is the reason `return 0` could be removed at all: after
+  // the name is typed, Tab goes into the body instead of inserting an indent.
+  E.ta.selectionStart = 3;
+  E.ta.selectionEnd = 7;
+  E.ta.value = "fn probe() {\n    \n}";
+  E.updateCursor && E.updateCursor();
+  check("  Tab consumes the stop", E.takeStop(), true);
+  check("  and the caret is in the empty body",
+    E.ta.value.slice(0, E.ta.selectionStart).split("\n").length, 2);
+  check("  and no indent was inserted",
+    E.ta.value, "fn probe() {\n    \n}");
+  check("  and the stop is not reusable", E.takeStop(), false);
 
   // the indentation rule: continuation lines take the line's own indent
   check("a nested fn indents to where it was typed",
     type("    fn", "fn", 6) && (E.acceptComplete(), true), true);
   check("  and the body follows",
-    E.ta.value, "    fn name() -> Int {\n        return 0\n    }");
+    E.ta.value, "    fn name() {\n        \n    }");
   check("  and the caret still lands on the name", E.ta.selectionStart, 7);
 
   check("a snippet replaces only the word typed, not the line",
     type("let x = fn", "fn", 10) && (E.acceptComplete(), true), true);
   check("  and the text before it is untouched",
-    E.ta.value.startsWith("let x = fn name() -> Int {"), true);
+    E.ta.value.startsWith("let x = fn name() {"), true);
 
   // the caret goes inside the quotes for the capability scope, because the
   // justification is not optional and an empty one does not compile
