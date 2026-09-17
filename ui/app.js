@@ -2278,6 +2278,28 @@ struct below says which of the two applies.</pre>
     return parts;
   };
 
+  // Where the classifier stops having matched.
+  //
+  // `confidence` is the only field that reveals a miss. 0.15 is the floor the
+  // companion assigns when a request falls through every shape to `generic`,
+  // and `verified: true` only means forgen compiled the result - it says nothing
+  // about whether the code answers the question. Read together, those two let a
+  // skeleton be inserted as though it were an answer, which is exactly what
+  // happened. Below the floor the insert asks first.
+  const CONFIDENCE_FLOOR = 0.5;
+  const weakGen = !!(genRes && genRes.confidence != null && genRes.confidence < CONFIDENCE_FLOOR);
+  async function insertWeak() {
+    const yes = await askUser({
+      title: "Insert a skeleton?",
+      body: "The companion matched this request at " + genRes.confidence
+        + " confidence, so it fell through to a generic shape. The code compiles,"
+        + " but nothing in it was derived from what you asked.",
+      ok: "Insert anyway",
+      danger: true,
+    });
+    if (yes) onInsert(genRes.code);
+  }
+
   const genBody = () => html`<div>
     <div class="card">
       <div class="ch"><b>Generate Datara</b>
@@ -2306,9 +2328,15 @@ Python, so it needs no ML runtime. The open file is sent as context.</pre>
         <span class="mono">${genWhere}</span>
         <span class="hint">at the caret - Ctrl+S to save it</span>
       </div>` : null}
+      ${weakGen ? html`<div class="genweak">
+        <b>This is a skeleton, not an answer.</b>
+        <span>The companion matched your request at ${genRes.confidence} confidence, which
+is the floor it assigns when nothing in its shape table fits. The code compiles
+- it is verified - but none of it came from your question.</span>
+      </div>` : null}
       <div class="ins">${genRes.code}</div>
       ${genWhere ? null : html`<button class="mini" style=${{ marginTop: "9px" }}
-        onClick=${() => onInsert(genRes.code)}>insert at caret</button>`}
+        onClick=${() => (weakGen ? insertWeak() : onInsert(genRes.code))}>insert at caret</button>`}
     </div>` : null}
   </div>`;
 

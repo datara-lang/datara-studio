@@ -562,6 +562,13 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
    the user needs to know, which file now holds it, was the one thing missing. */
 .genwhere{display:flex;flex-direction:column;gap:2px;margin-top:9px;padding:8px 10px;
   border-radius:var(--r);background:var(--s3)}
+/* A generated skeleton that matched nothing is the one result the reader must
+   not mistake for an answer, so it is stated in the panel rather than left to
+   the confidence tag to imply. */
+.genweak{display:flex;flex-direction:column;gap:4px;margin-top:10px;padding:9px 11px;
+  border-radius:var(--r);background:var(--s3);border-left:2px solid var(--warn)}
+.genweak b{font-size:12px;font-weight:500;color:var(--warn)}
+.genweak span{font-size:11.5px;line-height:1.5;color:var(--ink3)}
 .genwhere .ok{font-size:11px;font-weight:500;letter-spacing:.06em;text-transform:uppercase;
   color:var(--ok)}
 .genwhere .mono{font-size:12px;color:var(--ink1);word-break:break-all}
