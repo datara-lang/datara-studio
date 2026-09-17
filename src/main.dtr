@@ -288,7 +288,7 @@ fn main() {
     }
 
     println("")
-    println("  Datara Studio 0.4.0")
+    println("  Datara Studio 0.5.0")
     println("  interface  http://127.0.0.1:" + int_to_str(port))
     println("  ai         http://127.0.0.1:7890  (optional, start it from D:\\ryan)")
     println("  stop       Ctrl+C")

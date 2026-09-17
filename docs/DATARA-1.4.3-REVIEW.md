@@ -11,6 +11,17 @@ a benchmark; it is a program that has to work, and it does. Every claim below
 either cites a measurement taken today or says which earlier measurement it is
 quoting.
 
+**This supersedes `DATARA-ERGONOMICS.md` for the state of the language.**
+That document was written against forgen 1.3.4 and re-tested against 1.4.0, and
+it is now three releases stale - its ranked list of problems is the part a reader
+would act on, and three of the seven entries no longer hold while two more are
+half retired. It has been marked
+historical and cross-referenced rather than deleted: how the findings were
+reached is still worth reading, and the method in it is the method used here.
+The one claim from it that this report did not re-measure was re-checked today
+anyway, because it is a reason not to use the language at all - see
+`probes/modulo_ifexpr`.
+
 ---
 
 ## The headline

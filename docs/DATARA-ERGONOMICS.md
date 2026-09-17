@@ -1,12 +1,47 @@
 # Writing Datara, day to day
 
+> **Historical record. This is not the current assessment of the language.**
+>
+> It was written against forgen **1.3.4** and re-tested against **1.4.0**, and the
+> state it describes is now three releases old. Read
+> **[`DATARA-1.4.3-REVIEW.md`](DATARA-1.4.3-REVIEW.md)** for where Datara actually
+> stands today; read this one for how the findings were reached and what the
+> compiler looked like on the way there. The measurement method below is still
+> the method - build it AOT, run it, and believe the output.
+>
+> The ranked list in "The short version" is the part most likely to mislead,
+> because a reader will act on it. What the current report re-measured:
+>
+> | # | Problem as ranked here | Status, measured on 1.4.3 |
+> |---|---|---|
+> | 1 | Struct field offsets resolved by bare name across the program | **Fixed.** `probes/field_offset_min` prints `77` and `42`, both correct |
+> | 2 | `exec` returns the console codepage, rejects UTF-8 arguments | Partly fixed on 1.4.0 - `system()` and `process_run()` return the real exit code, so status is no longer inferred from output text. **Not re-measured since.** |
+> | 3 | `file_read` returns `""` for binary content | Half retired on 1.4.0 - `file_read_bytes` exists, so binary content is *detectable*. **Not re-measured since.** |
+> | 4 | A local `List<Str>` element read returns a pointer | Reported fixed in the 1.4.0 update below. **Not re-measured since.** |
+> | 5 | Diagnostics colourised even into a pipe | **Not re-measured.** Treat as unknown rather than current |
+> | 6 | No `break` / `continue` / `%` / if-expressions | **Retired.** `break`, `continue` and `loop` compile and are in the editor's keyword table, and `%` and the if-expression were measured today: `probes/modulo_ifexpr` builds and prints `1` and `1` |
+> | 7 | `unsafe(justification:)` around every I/O call | Unchanged - still the house style in `src/` |
+>
+> The current report also covers a family of defects that **this document never
+> saw**, because they were found in the kernel rather than in the IDE: `Str`
+> comparison returning a different order on every run, a run-time-built string
+> not surviving the trip into `system()` under AOT, `env_set` corrupting a built
+> value, and `str_index_of` segfaulting on a long haystack. All four are fixed on
+> 1.4.3. Their measurements are in `COMPILER-NOTES.md`.
+>
+> And one defect has taken their place, which this document could not have known
+> about: on 1.4.3 `forgen check` reports "Verified 100% OK" while `forgen build`
+> then fails with `[E0901] DMIR verification failed` in the release optimizer.
+> **`check` is not a build gate.** That is the most important open issue today.
+
 An assessment from the inside. Everything here comes from writing roughly 2000
 lines of Datara - the server, the filesystem explorer, the layout inspector and
 the HTTP layer of this IDE - and from tracing four silent defects to their cause
 in forgen's source. Where a claim is measured, the measurement is given.
 
-Version: written against **forgen 1.3.4**. Re-tested against the installed
-**1.4.0** - see the update immediately below, which changes two of the rankings.
+Version: written against **forgen 1.3.4**, re-tested against **1.4.0** (see the
+update immediately below, which changes two of the rankings). Superseded for the
+1.4.3 state by `DATARA-1.4.3-REVIEW.md` - see the banner above.
 
 ---
 
@@ -420,7 +455,7 @@ capability to a module is what makes it ceremony.
 
 ---
 
-## 6. What is genuinely good
+## 7. What is genuinely good
 
 It would be dishonest to leave this section out.
 

@@ -1,0 +1,35 @@
+//! Probe: the modulo operator and the if-expression both compile on forgen
+//! 1.4.3, and both produce the right value.
+//!
+//! `docs/DATARA-ERGONOMICS.md` section 6 lists "No `break` / `continue` / `%` /
+//! if-expressions" as a constant friction cost. That document was written
+//! against 1.3.4 and re-tested against 1.4.0, so the entry is three releases
+//! stale rather than wrong about its own time. Two thirds of it are now retired;
+//! `break` and `continue` are the third and are covered by the editor's keyword
+//! table instead.
+//!
+//! Why this is a probe and not a note: the claim it retires is one a reader
+//! would act on. "This language has no modulo" is a reason not to use it.
+//!
+//!     forgen build probes/modulo_ifexpr
+//!     ./main.exe
+//!
+//! Expected, and it is what the binary prints:
+//!
+//!     1    7 % 3
+//!     1    5 > 0, so the if-expression takes the first arm
+//!
+//! A wrong value here would be a silent miscompile of the same class as the
+//! field-offset defect, so the numbers are chosen to be distinguishable: `%`
+//! returning the operands, a sum, or 0 would all print something else, and an
+//! if-expression that always took one arm would print 2 for the second line.
+
+fn main() -> Int {
+    mut rem = 7 % 3
+    out rem
+
+    mut n = 5
+    mut sign = if n > 0 { 1 } else { 2 }
+    out sign
+    return 0
+}
