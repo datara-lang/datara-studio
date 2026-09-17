@@ -278,6 +278,66 @@ console.log("\nsnippets");
   E.completer = null;
 }
 
+// A new function is named for the project it is written in, and the tab stops
+// have to move with the name. This is driven through the accept path rather than
+// asserted on the pure function, because the offsets are where a derived name
+// breaks: `calculate` is five characters longer than `name`, so a `stop` left at
+// the table's 16 would put the second Tab in the middle of the braces, and a
+// `select` left at 4 would only half-select the name.
+console.log("\na new fn is named for the project");
+{
+  const E = S.Editor;
+  const sel = () => E.ta.value.slice(E.ta.selectionStart, E.ta.selectionEnd);
+  const type = (text, word, caretAt, ctx) => {
+    E.setText(text);
+    E.ta.selectionStart = E.ta.selectionEnd = caretAt === undefined ? text.length : caretAt;
+    E.completer = (w) => S.completerFor(w, [], [], ctx);
+    E.updateComplete();
+    return E.comp && E.comp.items[0] && E.comp.items[0].label === word;
+  };
+  const ctx = { file: "/x/calculator/main.dtr", root: "/x/calculator" };
+
+  check("in a calculator project fn is still offered", type("fn", "fn", undefined, ctx), true);
+  check("  and the hint names what it will write",
+    E.comp.items[0].hint, "snippet - calculate");
+  E.acceptComplete();
+  check("  and accepting writes the derived name",
+    E.ta.value, "fn calculate() {\n    \n}");
+  check("  with the whole derived name selected", sel(), "calculate");
+  check("  and the caret at the start of it", E.ta.selectionStart, 3);
+  check("  and a second stop armed for the body",
+    !!(E.pendingStop && E.pendingStop.line === 2), true);
+
+  // The stop is stored as a line and a column, so it survives the name being
+  // replaced - but it has to have been recorded from the shifted offset in the
+  // first place, which is what this checks.
+  E.ta.value = "fn calculate() {\n    \n}";
+  E.ta.selectionStart = 3;
+  E.ta.selectionEnd = 3 + "calculate".length;
+  E.updateCursor && E.updateCursor();
+  check("  Tab consumes the stop", E.takeStop(), true);
+  check("  and lands in the empty body, not after the name",
+    E.ta.value.slice(0, E.ta.selectionStart).split("\n").length, 2);
+  check("  with the braces intact", E.ta.value, "fn calculate() {\n    \n}");
+  check("  and the stop is not reusable", E.takeStop(), false);
+
+  // the file's own name wins, and a project the table does not know is neutral
+  check("the file's own name beats the folder's",
+    type("fn", "fn", undefined, { file: "/x/calculator/sorter.dtr", root: "/x/calculator" })
+      && (E.acceptComplete(), E.ta.value), "fn sort() {\n    \n}");
+  check("a project the table does not know keeps the placeholder",
+    type("fn", "fn", undefined, { file: "/x/studio/main.dtr", root: "/x/studio" })
+      && (E.comp.items[0].hint === "snippet")
+      && (E.acceptComplete(), E.ta.value), "fn name() {\n    \n}");
+
+  // and the indentation rule still applies to a derived name
+  check("an indented derived fn indents its body to match",
+    type("    fn", "fn", 6, ctx) && (E.acceptComplete(), E.ta.value),
+    "    fn calculate() {\n        \n    }");
+  check("  and the caret still lands on the name", E.ta.selectionStart, 7);
+  E.completer = null;
+}
+
 console.log("");
 if (errors.length) for (const e of errors) { fail++; console.log("  FAIL  window error: " + e); }
 else { pass++; console.log("  PASS  no window errors"); }

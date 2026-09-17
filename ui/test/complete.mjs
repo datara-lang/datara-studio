@@ -67,13 +67,15 @@ const source = [
   takeConst("SNIPPETS"),
   takeConst("TYPES"),
   takeConst("BUILTINS"),
+  takeConst("PROJECT_VERBS"),
   takeFunction("byRank"),
   takeFunction("declaredTypes"),
   takeFunction("enclosingType"),
   takeFunction("localType"),
   takeFunction("memberCompletions"),
+  takeFunction("contextFunctionName"),
   takeFunction("completerFor"),
-  "return { KEYWORDS, KEYWORD_SET, DECL_RE, SNIPPETS, declaredTypes, enclosingType, localType, memberCompletions, completerFor };",
+  "return { KEYWORDS, KEYWORD_SET, DECL_RE, SNIPPETS, declaredTypes, enclosingType, localType, memberCompletions, PROJECT_VERBS, contextFunctionName, completerFor };",
 ].join("\n");
 
 const L = new Function(source)();
@@ -216,6 +218,77 @@ if (ENTITY) {
   ok(items.length === 0, "a dot with an unresolvable receiver returns an empty list");
   const plain = L.completerFor("fn", [], [], null);
   ok(plain.length > 0 && plain[0].label === "fn", "without a receiver the normal list still works");
+}
+
+// ------------------------------------------------- a new fn is named for the project
+//
+// `fn` used to always offer `fn name()`, so the placeholder had to be retyped in
+// every project. The name now comes from the file and the folder. The table is
+// the whole policy, so its invariants are worth asserting: every value is
+// inserted into the buffer as an identifier, which is a claim about the shape of
+// the string and not about the word.
+{
+  const keys = Object.keys(L.PROJECT_VERBS);
+  const vals = Object.values(L.PROJECT_VERBS);
+  const badVal = vals.filter((v) => !/^[a-z_][a-z0-9_]*$/.test(v));
+  ok(badVal.length === 0, "every derived name is a legal Datara identifier", badVal.join(", "));
+  const badKey = keys.filter((k) => !/^[a-z][a-z0-9]*$/.test(k));
+  ok(badKey.length === 0, "every table key is a bare lower-case word", badKey.join(", "));
+  ok(new Set(keys).size === keys.length, "no key is repeated", "");
+  ok(keys.length >= 20, "the table covers a useful number of projects", keys.length + " entries");
+}
+
+// the file's stem wins over the folder, `main` is skipped, and a miss is `name`
+{
+  const at = (file, root) => L.contextFunctionName({ file, root });
+  ok(at("/x/calculator/main.dtr", "/x/calculator") === "calculate",
+    "a main.dtr in calculator/ is named for the folder");
+  ok(at("/x/calculator/sorter.dtr", "/x/calculator") === "sort",
+    "a file with a name of its own wins over the folder");
+  ok(at("C:\\x\\calculator\\main.dtr", "C:\\x\\calculator") === "calculate",
+    "a Windows path is split on backslashes too");
+  ok(at("/x/calculator/main.dtr", "/x/calculator/") === "calculate",
+    "a trailing slash on the root does not change the answer");
+  ok(at("/x/Calculator/main.dtr", "/x/Calculator") === "calculate",
+    "the match is case-insensitive, because the file system's case is not the table's");
+  ok(at("/x/studio/main.dtr", "/x/studio") === "name",
+    "a project that is not in the table falls back to name");
+  ok(at("/x/main.dtr", "/x") === "name", "a bare main.dtr at the root falls back to name");
+  ok(L.contextFunctionName(null) === "name", "no context at all falls back to name");
+  ok(L.contextFunctionName({}) === "name", "an empty context falls back to name");
+  ok(L.contextFunctionName({ file: "/x/calculator/main.dtr" }) === "name",
+    "a file with no root falls back to name rather than guessing");
+}
+
+// and the derived name has to reach the completion, with the offsets moved with it
+{
+  const ctx = { file: "/x/calculator/main.dtr", root: "/x/calculator" };
+  const fn = L.completerFor("fn", [], [], ctx).find((i) => i.label === "fn");
+  ok(!!fn, "fn is offered in a calculator project");
+  ok(!!fn && fn.insert === "fn calculate() {\n    \n}",
+    "  and the snippet is named calculate", fn ? JSON.stringify(fn.insert) : "");
+  // `stop` is where the body begins: `fn ` + name + `() {` + newline + indent
+  ok(!!fn && fn.caret === 3 && fn.select === "calculate".length
+    && fn.stop === 12 + "calculate".length,
+    "  and the caret offsets moved with the name",
+    fn ? JSON.stringify([fn.caret, fn.select, fn.stop]) : "");
+  ok(!!fn && /calculate/.test(fn.hint), "  and the hint names it before Tab is pressed",
+    fn ? fn.hint : "");
+
+  // The neutral case has to stay exactly what the editor test asserts by hand:
+  // a ctx-less caller gets the table's own offsets, which is why adding the
+  // derivation did not require touching that suite.
+  const plain = L.completerFor("fn", [], [], null).find((i) => i.label === "fn");
+  ok(!!plain && plain.insert === "fn name() {\n    \n}" && plain.caret === 3
+    && plain.select === 4 && plain.stop === 16,
+    "with no context the placeholder is name and the offsets are the table's",
+    plain ? JSON.stringify([plain.insert, plain.caret, plain.select, plain.stop]) : "");
+  ok(!!plain && plain.hint === "snippet", "  and the hint is the plain one",
+    plain ? plain.hint : "");
+  // `calculate` is longer than `name`, so a hardcoded 16 would put the body stop
+  // in the middle of the braces. The two must differ.
+  ok(!!fn && !!plain && fn.stop !== plain.stop,
+    "the derived stop is not the placeholder's stop", "both were " + (plain && plain.stop));
 }
 
 console.log("\ncomplete.mjs: " + pass + " passed, " + fail + " failed");

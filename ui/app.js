@@ -1326,6 +1326,67 @@ function memberCompletions(src, pos, receiver) {
   return out;
 }
 
+/** The verb a project's name implies, when it implies one.
+ *
+ * Typing `fn` inserts `fn name()`, and `name` is a placeholder that has to be
+ * deleted before the function can be written. In a project called `calculator`
+ * the useful default is `calculate`, which is what "the completion should know
+ * what I am writing" means in practice.
+ *
+ * This is a table rather than a rule because the rule does not exist in English.
+ * `sorter` drops the suffix, `calculator` needs its silent `e` back, and
+ * `handler` needs one added - three different transformations, and a stem-plus-
+ * suffix heuristic gets two of them wrong. A table is predictable, and the cost
+ * of a miss is one word retyped, so the table is the honest shape.
+ *
+ * Only agent nouns are here. A word that is already a verb (`sort`, `parse`)
+ * needs no entry, and one that is not a verb at all (`sparks`, `studio`) is
+ * deliberately absent: guessing a name for those would be invention, and the
+ * neutral `name` is better than a confident wrong one.
+ */
+const PROJECT_VERBS = {
+  calculator: "calculate", adder: "add", subtractor: "subtract", multiplier: "multiply",
+  divider: "divide", counter: "count", summer: "sum", averager: "average",
+  parser: "parse", lexer: "lex", tokenizer: "tokenize", compiler: "compile",
+  interpreter: "interpret", evaluator: "evaluate", checker: "check", validator: "validate",
+  sorter: "sort", searcher: "search", finder: "find", matcher: "match", filterer: "filter",
+  reader: "read", writer: "write", loader: "load", saver: "save", fetcher: "fetch",
+  builder: "build", creator: "create", generator: "generate", maker: "make",
+  renderer: "render", formatter: "format", printer: "print", drawer: "draw",
+  converter: "convert", encoder: "encode", decoder: "decode", mapper: "map",
+  scanner: "scan", splitter: "split", joiner: "join", merger: "merge",
+  runner: "run", tester: "test", dispatcher: "dispatch", handler: "handle",
+  sender: "send", receiver: "receive", updater: "update", deleter: "delete",
+  tracker: "track", recorder: "record", comparer: "compare", crawler: "crawl",
+};
+
+/** The name to put in a new function, from the file and folder it is written in.
+ *
+ * The file's own stem wins over the folder, because `calculator.dtr` inside
+ * `src/` is about the calculator and not about `src`. `main` is skipped: a
+ * project whose file is called `main` has said nothing about what it does.
+ *
+ * When nothing matches, this answers `name` - the same placeholder as before -
+ * rather than inventing something. A completion that guesses wrong is worse
+ * than one that offers an obvious blank, because the wrong name looks like
+ * advice.
+ */
+function contextFunctionName(ctx) {
+  const sources = [];
+  const stemOf = (p) => String(p || "").replace(/\\/g, "/").replace(/\/+$/, "").split("/").pop() || "";
+
+  const file = stemOf(ctx && ctx.file).replace(/\.dtr$/i, "").toLowerCase();
+  if (file && file !== "main") sources.push(file);
+
+  const folder = stemOf(ctx && ctx.root).toLowerCase();
+  if (folder) sources.push(folder);
+
+  for (const s of sources) {
+    if (PROJECT_VERBS[s]) return PROJECT_VERBS[s];
+  }
+  return "name";
+}
+
 function completerFor(word, outline, suggestions, ctx) {
   const out = [], seen = new Set();
   // `stop` is carried through explicitly. It was silently dropped when it was
@@ -1363,6 +1424,18 @@ function completerFor(word, outline, suggestions, ctx) {
     // the two letters already on screen has to be visible before it is pressed.
     // A snippet may sharpen that hint further - `class` says it is deprecated -
     // and that note has to reach the list or the advice arrives after the fact.
+    // `fn` is the one snippet whose placeholder is worth deriving from the
+    // project, because it is typed constantly and its name is the first thing
+    // written. The offsets are the table's, shifted by the name's length: with
+    // the default `name` they are 3, 4 and 16, and `stop` is where the body
+    // begins - `fn ` + name + `() {` + newline + indent.
+    if (k === "fn") {
+      const name = contextFunctionName(ctx);
+      add(k, "fn " + name + "() {\n    \n}",
+        name === "name" ? "snippet" : "snippet - " + name,
+        3, name.length, 12 + name.length, COMPLETE_RANK.snippet);
+      continue;
+    }
     if (snip) add(k, snip.body, snip.note || "snippet", snip.caret, snip.select, snip.stop, COMPLETE_RANK.snippet);
     else add(k, k, "keyword", undefined, undefined, undefined, COMPLETE_RANK.keyword);
   }
@@ -3966,7 +4039,14 @@ function App() {
         // completion and hover both ask the language, not this module.
         // `ctx` carries the receiver and the caret, because member access is a
         // different question from "what names exist" and needs different data.
-        Editor.completer = (w, ctx) => langRef.current.complete(w, outlineRef.current, suggestionsRef.current, ctx);
+        Editor.completer = (w, ctx) => langRef.current.complete(w, outlineRef.current, suggestionsRef.current, {
+          ...ctx,
+          // Where the code is being written, so a new `fn` can be named for the
+          // project instead of `name`. Read from refs, because this handler is
+          // installed once and cannot close over a render value.
+          file: currentRef.current,
+          root: rootRef.current,
+        });
         const lines = Editor.lines.length;
         setStats({ lines, chars, lexMs, tokens });
       },
@@ -5767,7 +5847,8 @@ if (typeof window !== "undefined") {
     App, Editor, Palette, Tree, TreeNode, Panel, IntentBar, CapControls, Mark, Browser, NewRow, Settings,
     coreHighlight, symbols, buildTree, resolveName, parseForgenDiagnostics, hoverInfo,
     stripAnsi, checkTarget, checkBody, checkNote, dirOf,
-    fileIcon, completerFor, KEYWORDS, SNIPPETS, TYPES, BUILTINS, DATARA_DOCS, FILE_KINDS,
+    fileIcon, completerFor, contextFunctionName, PROJECT_VERBS,
+    KEYWORDS, SNIPPETS, TYPES, BUILTINS, DATARA_DOCS, FILE_KINDS,
     DATARA_LANG, PLAIN_LANG, PROVIDERS, providerFor,
   };
 }

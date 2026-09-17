@@ -63,7 +63,14 @@ writeFileSync(join(ws, "move-me.dtr"), HELLO);
 // Deleted by the delete check. Its own file, so that deleting it does not pull
 // the ground out from under a later section.
 writeFileSync(join(ws, "doomed.dtr"), HELLO);
+// Opened by the context-aware naming check. A project whose folder says what it
+// does, because that is what a new function is named after - and a second file
+// whose own name beats the folder's, which is the precedence rule.
+mkdirSync(join(ws, "calculator"), { recursive: true });
+writeFileSync(join(ws, "calculator", "main.dtr"), HELLO);
+writeFileSync(join(ws, "calculator", "sorter.dtr"), HELLO);
 const wsPosix = ws.replace(/\\/g, "/");
+const CALC = wsPosix + "/calculator";
 console.log("scratch workspace: " + wsPosix);
 
 const results = [];
@@ -84,9 +91,9 @@ const errors = [];
 // against at the end of section 3.
 const native = [];
 
-async function open(seed) {
+async function open(seed, args) {
   const ctx = await browser.newContext({ viewport: { width: 1500, height: 940 } });
-  if (seed) await ctx.addInitScript(seed, [wsPosix]);
+  if (seed) await ctx.addInitScript(seed, args || [wsPosix]);
   const page = await ctx.newPage();
   page.on("pageerror", (e) => errors.push("pageerror: " + e.message));
   page.on("dialog", async (d) => {
@@ -816,6 +823,95 @@ async function answer(page, text, which) {
   await page.waitForTimeout(300);
   check("a keyword with no shape still inserts as the word",
     await code.inputValue(), "let");
+  await ctx.close();
+}
+
+// ---- 15. A new function is named for the project it is written in
+//
+// Asked for as "когда я пишу например fn и там до этого я писал калькулятор, то
+// он предложит calculate, и по нажатию таб оно все сработает". The completion
+// knew the language but not the project, so `fn` always offered `fn name()` and
+// the placeholder was retyped in every file.
+//
+// The derivation itself is asserted in `complete.mjs`, which needs no browser.
+// What is checked here is the wiring: `completerFor` can derive the right name
+// while the editor never passes it the file and the root, and only a real page
+// shows which of those happened. The fixture folder is `calculator/`, so the
+// folder name is the only thing that can produce `calculate`.
+{
+  /** Open `file` inside the calculator project, type `fn`, and press Tab `tabs`
+   *  times - one to accept the snippet, two to also take the body stop. */
+  const fnIn = async (file, tabs) => {
+    const { ctx, page } = await open(([r, f]) => {
+      try {
+        localStorage.setItem("datara.studio.lastRoot", r);
+        localStorage.setItem("datara.studio.lastFile", f);
+      } catch (e) {}
+    }, [CALC, CALC + "/" + file]);
+
+    const code = page.locator(".code");
+    await code.click();
+    const opened = await code.inputValue();
+    await code.press("Control+a");
+    await page.keyboard.type("fn");
+    await page.waitForTimeout(450);
+    const items = await page.locator(".comp .ci").allTextContents();
+    const n = tabs || 1;
+    for (let i = 0; i < n; i++) {
+      await page.keyboard.press("Tab");
+      await page.waitForTimeout(400);
+    }
+    const value = await code.inputValue();
+    const selected = await code.evaluate((el) => el.value.slice(el.selectionStart, el.selectionEnd));
+    const line = await code.evaluate((el) =>
+      el.value.slice(0, el.selectionStart).split("\n").length);
+    if (file === "main.dtr" && n === 1) await page.screenshot({ path: join(out, "d15-derived-name.png") });
+    await ctx.close();
+    return { opened, items: items.join(" / "), value, selected, line };
+  };
+
+  const calc = await fnIn("main.dtr", 1);
+  // The file has to have opened, or the rest of this passes for the wrong reason
+  // - an empty editor would still expand `fn` into whatever the name is.
+  check("the calculator project opened", calc.opened.startsWith("fn main()"), JSON.stringify(calc.opened));
+  check("the list offers a function named for the project",
+    /snippet - calculate/.test(calc.items), calc.items);
+  check("Tab writes fn calculate()", calc.value, "fn calculate() {\n    \n}");
+  check("  with the derived name selected to type over", calc.selected, "calculate");
+
+  // The second stop was recorded from an offset shifted by the name's length, so
+  // Tab goes into the body rather than into the middle of the braces.
+  const body = await fnIn("main.dtr", 2);
+  check("a second Tab lands in the body of the derived function", body.line, 2);
+  check("  and the braces are intact", body.value, "fn calculate() {\n    \n}");
+
+  // The file's own name outranks the folder's: `sorter.dtr` in `calculator/` is
+  // about sorting, not about arithmetic.
+  const sorter = await fnIn("sorter.dtr", 1);
+  check("a file with a name of its own beats the folder", sorter.value, "fn sort() {\n    \n}");
+
+  // And a project the table does not know keeps the neutral placeholder rather
+  // than inventing a name. Section 14 already asserts the value for `hello.dtr`
+  // in `ds-drive`; this asserts the hint, which is what the reader sees before
+  // pressing Tab.
+  const { ctx, page } = await open(([r]) => {
+    try {
+      localStorage.setItem("datara.studio.lastRoot", r);
+      localStorage.setItem("datara.studio.lastFile", r + "/hello.dtr");
+    } catch (e) {}
+  });
+  const code = page.locator(".code");
+  await code.click();
+  await code.press("Control+a");
+  await page.keyboard.type("fn");
+  await page.waitForTimeout(450);
+  const items = await page.locator(".comp .ci").allTextContents();
+  // `.ci` carries its label and its hint as one run of text ("fnsnippet"), so
+  // the hint is matched against the joined string and the label against the
+  // start of an item - `/^fn\b/` does not match "fnsnippet", because there is no
+  // word boundary between the label and the hint.
+  check("an unknown project keeps the plain snippet hint",
+    items.some((i) => i.startsWith("fn")) && !/snippet - /.test(items.join(" ")), items.join(" / "));
   await ctx.close();
 }
 
