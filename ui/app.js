@@ -1598,7 +1598,6 @@ const IntentBar = memo(function IntentBar({ root, wsName, coreVersion, aiOnline,
   }, [menu, aiMenu]);
   return html`<div class="intent" data-tauri-drag-region="deep">
     <div class="left">
-      <i class="fico fico-dtr ibmark" aria-hidden="true"></i>
       <button class="iconbtn" title="Settings   Ctrl+," onClick=${onSettings}><${Ico} k="gear" /></button>
       <button class=${"iconbtn" + (treeFold ? " off" : "")} title="Show or hide the explorer"
         onClick=${onFoldTree}><${Ico} k="panel" /></button>
@@ -1617,10 +1616,11 @@ const IntentBar = memo(function IntentBar({ root, wsName, coreVersion, aiOnline,
           <path d="M8 8l5.4-3.1M8 8v6.4M8 8L2.6 4.9" strokeLinecap="round"></path>
         </svg></span>` : null}
     </div>
-    <div class="search" title="Search and open files   Ctrl+P" onClick=${() => onPalette()}>
+    <button class="search" type="button" title="Search and open files   Ctrl+P"
+      onMouseDown=${(e) => e.stopPropagation()} onClick=${(e) => { e.stopPropagation(); onPalette(); }}>
       <${Ico} k="search" size=${13} />
       <span class="searchhint">search</span>
-    </div>
+    </button>
     <div class="right">
       ${CORE ? null : html`<${React.Fragment}>
       <button class=${"aistat" + (aiOnline ? " on" : "")}
@@ -1697,7 +1697,15 @@ function buildTree(paths, dirs, root) {
     for (let i = 0; i < parts.length; i++) {
       prefix = prefix ? prefix + "/" + parts[i] : parts[i];
       if (!node.dirs[parts[i]]) {
-        node.dirs[parts[i]] = { name: parts[i], key: prefix, dirs: {}, files: [] };
+        // `key` is relative and only identifies the row in React state;
+        // `path` is absolute and is what the filesystem move endpoint needs.
+        // Without this distinction a folder row dropped onto another folder
+        // sent the relative key (or an empty string) to `/api/move`, so the
+        // visual drag appeared to do nothing.
+        const absolute = root && root !== "."
+          ? root.replace(/[\\/]+$/, "") + "/" + prefix
+          : prefix;
+        node.dirs[parts[i]] = { name: parts[i], key: prefix, path: absolute, dirs: {}, files: [] };
       }
       node = node.dirs[parts[i]];
     }
@@ -1754,14 +1762,28 @@ const TreeNode = memo(function TreeNode({ node, depth, closed, toggle, current, 
   const pad = { paddingLeft: (8 + depth * 13) + "px" };
   const rowDepth = node.key === "" ? 0 : depth + 1;
 
+  const dragPath = (e) => {
+    try { return e.dataTransfer.getData("text/plain") || drag; }
+    catch (err) { return drag; }
+  };
   const dropTarget = (key, path) => ({
-    onDragOver: (e) => { e.preventDefault(); e.stopPropagation(); setOver(key); },
-    onDragLeave: () => setOver((o) => (o === key ? null : o)),
+    onDragEnter: (e) => { e.preventDefault(); e.stopPropagation(); setOver(key); },
+    onDragOver: (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+      setOver(key);
+    },
+    onDragLeave: (e) => {
+      // A folder row contains several children; only clear when the pointer
+      // really leaves the row, not when it crosses its icon or label.
+      if (!e.currentTarget.contains(e.relatedTarget)) {
+        setOver((o) => (o === key ? null : o));
+      }
+    },
     onDrop: (e) => {
       e.preventDefault(); e.stopPropagation();
-      setOver(null);
-      const src = e.dataTransfer.getData("text/plain") || drag;
-      setDrag(null);
+      const src = dragPath(e);
+      setOver(null); setDrag(null);
       if (src) onDropInto(src, path);
     },
   });

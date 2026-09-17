@@ -77,6 +77,11 @@ const index = readFileSync(join(ui, "index.html"), "utf8");
 const mark = readIco(join(studio, "ui", "mark.ico"));
 const uri32 = dataUri(pickIco(mark, 32));
 const uri128 = dataUri(pickIco(mark, 128));
+// The language file icon is the actual Datara logo supplied by the language
+// project, not the compact window mark. Keep the two identities separate:
+// the logo is what people recognise beside a `.dtr` file.
+const dtrLogo = "data:image/png;base64," +
+  readFileSync(join(studio, "assets", "datara-logo.png")).toString("base64");
 
 // A literal `</script` inside a string would end the block early.
 const guard = (js) => js.replace(/<\/script/gi, "<\\/script");
@@ -115,7 +120,8 @@ const out = index
   // which is the whole point of the single-file build (see the note above)
   .replace(/__DATARA_FAVICON__/g, uri32)
   .replace(/__DATARA_ICON_32__/g, uri32)
-  .replace(/__DATARA_ICON_128__/g, uri128);
+  .replace(/__DATARA_ICON_128__/g, uri128)
+  .replace(/__DATARA_DTR_LOGO__/g, dtrLogo);
 
 if (inlined === 0) throw new Error("no script tags were inlined - did index.html change?");
 if (out.includes("__DATARA_")) throw new Error("an icon token was left unsubstituted in index.html");

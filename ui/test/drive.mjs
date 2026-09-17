@@ -58,6 +58,8 @@ writeFileSync(join(ws, "broken.dtr"), HELLO);
 // its own file, so that the write the check performs cannot disturb a section
 // that expects `hello.dtr` to still hold HELLO.
 writeFileSync(join(ws, "livecheck.dtr"), HELLO);
+mkdirSync(join(ws, "move-target"), { recursive: true });
+writeFileSync(join(ws, "move-me.dtr"), HELLO);
 // Deleted by the delete check. Its own file, so that deleting it does not pull
 // the ground out from under a later section.
 writeFileSync(join(ws, "doomed.dtr"), HELLO);
@@ -159,11 +161,28 @@ async function answer(page, text, which) {
   check("the file's text is in the editor", text.replace(/\s+/g, " ").trim() === HELLO.replace(/\s+/g, " ").trim(),
     JSON.stringify(text.slice(0, 40)));
   check("the text is highlighted, not just present", hl.includes("span"), "hl markup " + hl.length + " chars");
+  const dtrIcon = await page.locator(".tfile", { hasText: "hello.dtr" }).first().locator(".fico-dtr").count();
+  const dtrBackground = dtrIcon ? await page.locator(".tfile", { hasText: "hello.dtr" }).first().locator(".fico-dtr").evaluate((el) => getComputedStyle(el).backgroundImage) : "";
+  check(".dtr files use the Datara language logo", dtrIcon === 1 && dtrBackground.includes("data:image/png"), dtrBackground.slice(0, 40));
   // The file ends with a newline, so the editor shows four lines - the fourth
   // is the empty one the trailing "\n" opens. Asserting three here was wrong.
   check("the gutter has one number per line", gutter.split("\n").length === 4, JSON.stringify(gutter));
   const cursor = await page.locator(".status").innerText().catch(() => "");
   check("the caret starts at the top of the file", /1:1/.test(cursor), JSON.stringify(cursor.slice(0, 60)));
+
+  // The top search surface must work with a mouse click, not only Ctrl+P.
+  const searchButton = page.locator("button.search").first();
+  await searchButton.click();
+  await page.locator(".palette").waitFor({ state: "visible", timeout: 4000 });
+  check("clicking the top search control opens the palette", await page.locator(".palette").count() === 1);
+  await page.keyboard.press("Escape");
+  await page.locator(".palette").waitFor({ state: "detached", timeout: 4000 }).catch(() => {});
+
+  // The top-left intent controls start with Settings, not the application mark.
+  const leftControls = await page.locator(".intent .left > *").evaluateAll((els) =>
+    els.map((el) => el.getAttribute("title") || el.className || el.tagName));
+  check("the top-left controls start with Settings",
+    leftControls.length > 0 && /Settings/.test(String(leftControls[0])), JSON.stringify(leftControls.slice(0, 3)));
 
   // the green band the reader asked to be rid of
   const curline = await page.locator(".curline").count();
@@ -204,6 +223,53 @@ async function answer(page, text, which) {
   check("it offers rename and delete",
     rows.some((t) => /rename/i.test(t)) && rows.some((t) => /delete/i.test(t)), rows.join(" | "));
   await page.screenshot({ path: join(out, "d3-contextmenu.png") });
+
+  // Move a file into a folder and back to the workspace root with real HTML5
+  // drag/drop events. The app must use the absolute folder path sent by the
+  // tree node, not its relative React key.
+  const moveFile = page.locator(".tfile", { hasText: "move-me.dtr" }).first();
+  const moveDir = page.locator(".tdir", { hasText: "move-target" }).first();
+  await moveDir.scrollIntoViewIfNeeded();
+  await page.evaluate(() => {
+    window.__dragDrop = (source, target) => {
+      const transfer = {
+        effectAllowed: "all", dropEffect: "move", data: {},
+        setData(type, value) { this.data[type] = value; },
+        getData(type) { return this.data[type] || ""; },
+        clearData() {},
+      };
+      const fire = (el, type) => {
+        const event = new Event(type, { bubbles: true, cancelable: true });
+        Object.defineProperty(event, "dataTransfer", { value: transfer });
+        el.dispatchEvent(event);
+      };
+      fire(source, "dragstart");
+      fire(target, "dragenter");
+      fire(target, "dragover");
+      fire(target, "drop");
+      fire(source, "dragend");
+    };
+  });
+  await page.evaluate(() => window.__dragDrop(
+    document.querySelector('.tfile[title$="move-me.dtr"]'),
+    [...document.querySelectorAll('.tdir')].find((el) => el.textContent.includes('move-target'))
+  ));
+  await page.waitForTimeout(900);
+  const movedIn = existsSync(join(ws, "move-target", "move-me.dtr"));
+  check("dragging a file into a folder moves it on disk", movedIn);
+
+  // The folder is collapsed after the move in some hosts; the root list still
+  // accepts a drop and must move the file back out.
+  const movedRow = page.locator(".tfile", { hasText: "move-me.dtr" }).first();
+  await page.evaluate(() => {
+    window.__dragDrop(
+      [...document.querySelectorAll('.tfile')].find((el) => el.textContent.includes('move-me.dtr')),
+      document.querySelector('.list')
+    );
+  });
+  await page.waitForTimeout(900);
+  const movedOut = existsSync(join(ws, "move-me.dtr"));
+  check("dragging a file back to the workspace root moves it out", movedOut);
 
   // rename, through the app's own dialog rather than a platform one
   await page.locator(".ctxmenu .row", { hasText: /rename/i }).first().click();

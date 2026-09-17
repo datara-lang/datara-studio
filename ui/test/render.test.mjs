@@ -235,8 +235,9 @@ console.log("\nthe tree shows empty folders");
   const t = Studio.buildTree(files, dirs, root);
   check("top-level folders", Object.keys(t.dirs).sort(), ["src", "tools"]);
   check("a folder with no files still exists", Object.keys(t.dirs.tools).sort(),
-    ["dirs", "files", "key", "name"]);
+    ["dirs", "files", "key", "name", "path"]);
   check("its key is the relative path", t.dirs.tools.key, "tools");
+  check("its path is absolute for filesystem moves", t.dirs.tools.path, "D:/ws/tools");
   check("nested folders", Object.keys(t.dirs.src.dirs), ["deep"]);
   check("files land in their folder", t.dirs.src.files.map((f) => f.name), ["b.dtr"]);
   check("top-level files stay at the top", t.files.map((f) => f.name), ["a.dtr"]);
