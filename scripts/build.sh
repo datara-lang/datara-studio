@@ -18,14 +18,14 @@ cd "$(dirname "$0")/.."
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
-echo "== 1/11 Rust text core -> wasm ==============================="
+echo "== 1/12 Rust text core -> wasm ==============================="
 if ! node scripts/build-wasm.mjs; then
   echo "wasm build failed"
   exit 2
 fi
 
 echo
-echo "== 2/11 single-file interface + icons ========================"
+echo "== 2/12 single-file interface + icons ========================"
 # The icon set first, from the geometry in `scripts/mark.mjs`: the window icon,
 # the taskbar icon, the tab and the mark beside a .dtr file all come from that
 # one shape, which is the same shape `ui/icon.svg` describes. Generating them
@@ -60,35 +60,35 @@ if ! node scripts/build-ui.mjs --core; then
 fi
 
 echo
-echo "== 3/11 text core tests ======================================"
+echo "== 3/12 text core tests ======================================"
 if ! node crates/textcore/test/test.mjs; then
   echo "text core tests failed"
   exit 1
 fi
 
 echo
-echo "== 4/11 highlighting pipeline ================================"
+echo "== 4/12 highlighting pipeline ================================"
 if ! node ui/test/highlight.test.mjs; then
   echo "highlighting tests failed"
   exit 1
 fi
 
 echo
-echo "== 5/11 interface renders ===================================="
+echo "== 5/12 interface renders ===================================="
 if ! node ui/test/render.test.mjs; then
   echo "render tests failed"
   exit 1
 fi
 
 echo
-echo "== 6/11 the editor, driven as the app drives it =============="
+echo "== 6/12 the editor, driven as the app drives it =============="
 if ! node ui/test/editor.test.mjs; then
   echo "the editor does not render text"
   exit 1
 fi
 
 echo
-echo "== 7/11 completion ==========================================="
+echo "== 7/12 completion ==========================================="
 # Reads `ui/app.js` itself and exercises the scanners and the ranking against
 # the compiler's own examples. It is here, before the boot test, because it
 # needs no DOM and no browser: if the vocabulary the editor offers is wrong,
@@ -102,7 +102,7 @@ if ! node ui/test/complete.mjs; then
 fi
 
 echo
-echo "== 8/11 boot the built artifact =============================="
+echo "== 8/12 boot the built artifact =============================="
 echo "  (loads ui/studio.html in a DOM and runs it; needs: npm install, once)"
 if ! node ui/test/boot.test.mjs; then
   echo "the built interface does not boot"
@@ -110,7 +110,7 @@ if ! node ui/test/boot.test.mjs; then
 fi
 
 echo
-echo "== 9/11 the launcher's two questions ========================="
+echo "== 9/12 the launcher's two questions ========================="
 # Both of these are about whether the IDE can be started at all, which is not
 # something the interface tests can see.
 #
@@ -151,17 +151,40 @@ if ! node scripts/verify-version.mjs; then
 fi
 
 echo
-echo "== 10/11 Datara server ======================================="
+echo "== 10/12 Datara server ======================================="
 if ! forgen check src/main.dtr; then
   echo "server check failed"
   exit 2
 fi
 
 echo
-echo "== 11/11 every snippet is Datara ============================="
+echo "== 11/12 every snippet is Datara ============================="
 if ! node scripts/check-snippets.mjs; then
   echo "a snippet the editor offers does not compile"
   exit 3
+fi
+
+echo
+echo "== 12/12 the desktop shell's own tests ======================="
+# The shell is the one component the rest of this gate cannot see. It is Rust,
+# it is not served by the Datara server, and every browser test drives the
+# server the way a developer runs it - from the project root, which is the one
+# layout that worked. So when 0.5.0's installers reached users unable to start a
+# server on any platform, eleven green stages said nothing about it and `cargo
+# test` had no tests to run.
+#
+# What they assert is where the studio's sources are inside a bundle. Tauri
+# answers that per platform - beside the executable on Windows, in
+# `Contents/Resources` on macOS, in `/usr/lib/<exe_name>` on Linux - and the
+# shell had been guessing. The fixtures are built from `bundle.resources` in
+# `tauri.conf.json` rather than from a second copy of the layout, so the test
+# compares the shell against the bundler's own declaration.
+#
+# Also in `ci.yml`. Here as well because this is the script that is run before a
+# release, and a release is where the installer gets made.
+if ! cargo test --manifest-path src-tauri/Cargo.toml; then
+  echo "the desktop shell's tests failed"
+  exit 1
 fi
 
 echo

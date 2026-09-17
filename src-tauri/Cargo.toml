@@ -1,6 +1,6 @@
 [package]
 name = "datara-studio"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Desktop shell for Datara Studio. Tauri is the window; the editor, the compiler bridge and the server are Datara."
 build = "build.rs"
@@ -13,6 +13,13 @@ tauri-build = { version = "2", features = [] }
 # Datara server over loopback exactly as it does in a browser, which is why the
 # desktop and browser builds cannot drift apart.
 tauri = { version = "2", features = [] }
+
+[dev-dependencies]
+# Only the tests read `tauri.conf.json`. They do so instead of hard-coding the
+# layout a second time, so that a change to the bundler's mapping cannot leave
+# the resolver agreeing with a stale copy of it. Already in the dependency graph
+# through tauri, so this adds no download and no compile.
+serde_json = "1"
 
 [profile.release]
 opt-level = "s"

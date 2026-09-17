@@ -59,7 +59,7 @@ use toolchain
 /// also means the linker is in place before the first build arrives.
 pub fn st_health( tc: Str) -> Str {
     let linker = tc_linker_report()
-    return "{\"ok\":true,\"service\":\"datara-studio\",\"version\":\"0.5.0\","
+    return "{\"ok\":true,\"service\":\"datara-studio\",\"version\":\"0.5.1\","
          + "\"toolchain\":\"" + st_json_escape(tc) + "\","
          + "\"linker\":\"" + st_json_escape(linker) + "\","
          + "\"llvm\":" + st_bool(byte_len(linker) > 0 && linker != "not installed") + ","

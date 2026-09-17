@@ -157,7 +157,12 @@
     <div class="card">
       <h2>If it stays like this</h2>
       <p>Run the server by hand, in the studio directory, and read what it prints:</p>
-      <pre>cd "D:\IDE datara\datara-studio"
+      <!-- Filled in by the shell from the directory it actually resolved. The
+           path used to be hardcoded here, so every user was told to cd into the
+           machine the shell was built on. When the shell did not tell us where
+           it is looking, the page says so instead of printing a plausible
+           wrong path. -->
+      <pre id="howto">cd "&hellip;"
 forgen run src/main.dtr</pre>
       <p style="margin-top:14px">The usual causes, in order:</p>
       <p class="muted">
@@ -186,6 +191,15 @@ forgen run src/main.dtr</pre>
   var elLed = document.getElementById("led");
   var elPorts = document.getElementById("ports");
   var elSub = document.getElementById("splash-sub");
+
+  // Where the shell is actually looking for the studio. The shell injects this
+  // before any page script runs. There is no such thing in a browser build, and
+  // none is needed there - the page stays as the ellipsis the markup ships
+  // rather than naming a directory it cannot know.
+  var elHowto = document.getElementById("howto");
+  if (elHowto && typeof window.__DS_STUDIO_DIR === "string" && window.__DS_STUDIO_DIR) {
+    elHowto.textContent = 'cd "' + window.__DS_STUDIO_DIR + '"\nforgen run src/main.dtr';
+  }
 
   PORTS.forEach(function (p) {
     var d = document.createElement("span");

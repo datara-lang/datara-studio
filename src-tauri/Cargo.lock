@@ -505,8 +505,9 @@ dependencies = [
 
 [[package]]
 name = "datara-studio"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
+ "serde_json",
  "tauri",
  "tauri-build",
 ]

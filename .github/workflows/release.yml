@@ -160,6 +160,26 @@ jobs:
           node scripts/build-ui.mjs
           node scripts/build-ui.mjs --core
 
+      # The shell's own tests, before anything is bundled.
+      #
+      # This step exists because of the release it would have stopped. v0.5.0's
+      # installers were built, uploaded and downloaded by real users, and none of
+      # them could start: the shell looked for the studio's sources in
+      # `resources/studio` while `bundle.resources` creates `studio`, so it fell
+      # through to the working directory, ran `forgen run src/main.dtr` in a
+      # directory with no `src/`, and the window sat on "the interface server is
+      # not answering". Every check in the repository passed, because every check
+      # looked at the repository layout - which is the one layout that worked.
+      #
+      # These tests build their fixture from `bundle.resources` in
+      # `tauri.conf.json` and assert the shell resolves what the bundler
+      # declares, on the layout of each of the three platforms this matrix
+      # builds. `cargo test` also runs in `ci.yml`, but `ci.yml` does not run on
+      # a tag push - so without this step a release could still be cut from a
+      # tree that no test had looked at.
+      - name: The shell's own tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
       - name: Bundle
         shell: bash
         run: |
@@ -169,7 +189,6 @@ jobs:
             args+=(--target "${{ matrix.target }}")
           fi
           tauri build "${args[@]}"
-
       # Collect the installers as an array, not by looping over the globs.
       #
       # `for f in $ASSETS` is wrong twice over: the outer expansion globs, so the
