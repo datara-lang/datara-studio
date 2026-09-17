@@ -856,6 +856,13 @@ async function answer(page, text, which) {
     await page.keyboard.type("fn");
     await page.waitForTimeout(450);
     const items = await page.locator(".comp .ci").allTextContents();
+    // Captured with the list still open, because that is the moment the reader
+    // is being asked about - the hint has to say `calculate` before Tab is
+    // pressed, and a shot taken afterwards shows the accepted code instead and
+    // cannot tell the two apart.
+    if (file === "main.dtr" && (tabs || 1) === 1) {
+      await page.screenshot({ path: join(out, "d15-derived-name.png") });
+    }
     const n = tabs || 1;
     for (let i = 0; i < n; i++) {
       await page.keyboard.press("Tab");
@@ -865,7 +872,6 @@ async function answer(page, text, which) {
     const selected = await code.evaluate((el) => el.value.slice(el.selectionStart, el.selectionEnd));
     const line = await code.evaluate((el) =>
       el.value.slice(0, el.selectionStart).split("\n").length);
-    if (file === "main.dtr" && n === 1) await page.screenshot({ path: join(out, "d15-derived-name.png") });
     await ctx.close();
     return { opened, items: items.join(" / "), value, selected, line };
   };
