@@ -1,0 +1,7 @@
+//! Half of the deliberate collision. Import BOTH broken_a and broken_b from
+//! main.dtr to observe the silent miscompilation. Never import only one.
+pub struct BrokenA { brk_shared: Int }
+
+pub fn broken_a_make() -> BrokenA => BrokenA { brk_shared: 123 }
+
+pub fn broken_a_get(view x: BrokenA) -> Int => x.brk_shared

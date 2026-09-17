@@ -1,0 +1,7 @@
+//! The other half: `brk_shared` is `Str` here and `Int` in broken_a.dtr. forgen
+//! emits no diagnostic for this; one of the two structs is silently wrong.
+pub struct BrokenB { brk_shared: Str }
+
+pub fn broken_b_make() -> BrokenB => BrokenB { brk_shared: "text" }
+
+pub fn broken_b_get(view x: BrokenB) -> Str => x.brk_shared

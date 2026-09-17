@@ -1,0 +1,95 @@
+fn rank( t: Str) -> Int {
+    if t == "Int" || t == "Float" || t == "Str" {
+        return 8
+    }
+    return 8
+}
+
+fn labels( names: List<Str>, order: List<Int>) -> Str {
+    let n = order.len()
+    mut s = ""
+    mut i = 0
+    while i < n {
+        s = s + names[order[i]] + " "
+        i = i + 1
+    }
+    return s
+}
+
+fn struct_json( name: Str, names: List<Str>, types: List<Str>) -> Str {
+    let n = names.len()
+    mut order: List<Int> = []
+    mut i = 0
+    while i < n {
+        order = order.push(i)
+        i = i + 1
+    }
+    mut a = 1
+    while a < n {
+        let cur = order[a]
+        let cur_rank = rank(types[cur])
+        let cur_name = names[cur]
+        mut b = a - 1
+        mut placed = false
+        while b >= 0 && !placed {
+            let prev = order[b]
+            let prev_rank = rank(types[prev])
+            let prev_name = names[prev]
+            mut before = false
+            if prev_rank < cur_rank {
+                before = true
+            }
+            if prev_rank == cur_rank && prev_name > cur_name {
+                before = true
+            }
+            if before {
+                order[b + 1] = prev
+                b = b - 1
+            } else {
+                placed = true
+            }
+        }
+        order[b + 1] = cur
+        a = a + 1
+    }
+    return name + ":" + labels(names, order)
+}
+
+fn main() -> Int {
+    let content = "pub struct Short {\n    a: Int\n    b: Int\n    c: Int\n    d: Int\n}\n"
+    let lines = str_split(content, "\n")
+    let ln_total = lines.len()
+    mut in_struct = false
+    mut sname = ""
+    mut names: List<Str> = []
+    mut types: List<Str> = []
+    mut li = 0
+    while li < ln_total {
+        let line = lines[li]
+        li = li + 1
+        let t = str_trim(line)
+        if !in_struct {
+            if str_ends_with(t, "{") {
+                in_struct = true
+                sname = t
+                names = []
+                types = []
+            }
+            continue
+        }
+        if t == "}" {
+            if names.len() > 0 {
+                println(struct_json(sname, names, types))
+            }
+            in_struct = false
+            continue
+        }
+        let idx = str_index_of(t, ":")
+        if idx <= 0 {
+            continue
+        }
+        names = names.push(str_trim(str_substring(t, 0, idx)))
+        types = types.push(str_trim(str_substring(t, idx + 1, byte_len(t) - idx - 1)))
+    }
+    return 0
+}

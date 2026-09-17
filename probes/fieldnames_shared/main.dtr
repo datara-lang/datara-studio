@@ -1,0 +1,130 @@
+//! GENERATED: field names are shared between structs.
+
+pub struct SA {
+    id: Int
+    kind: Str
+    subsystem: Str
+    priority: Int
+    scope: Str
+    scope_id: Int
+    deferred_mode: Bool
+    cancelled: Bool
+    delivery_count: Int
+    muted: List<Str>
+}
+
+pub fn sA_new(id: Int, kind: Str, scope_id: Int) -> SA {
+    return SA {
+        id: id,
+        kind: kind,
+        subsystem: "",
+        priority: 10,
+        scope: "document",
+        scope_id: scope_id,
+        deferred_mode: false,
+        cancelled: false,
+        delivery_count: 0,
+        muted: []
+    }
+}
+
+fn sA_get_scope_id(view x: SA) -> Int => x.scope_id
+fn sA_get_deferred_mode(view x: SA) -> Bool => x.deferred_mode
+fn sA_get_cancelled(view x: SA) -> Bool => x.cancelled
+
+pub struct SB {
+    id: Int
+    kind: Str
+    scope_id: Int
+    deferred_mode: Bool
+    cancelled: Bool
+}
+
+pub fn sB_new(id: Int, kind: Str, scope_id: Int) -> SB {
+    return SB {
+        id: id,
+        kind: kind,
+        scope_id: scope_id,
+        deferred_mode: false,
+        cancelled: false
+    }
+}
+
+fn sB_get_scope_id(view x: SB) -> Int => x.scope_id
+fn sB_get_deferred_mode(view x: SB) -> Bool => x.deferred_mode
+fn sB_get_cancelled(view x: SB) -> Bool => x.cancelled
+
+pub struct SC {
+    id: Int
+    kind: Str
+    scope_id: Int
+    deferred_mode: Bool
+    cancelled: Bool
+    delivery_count: Int
+}
+
+pub fn sC_new(id: Int, kind: Str, scope_id: Int) -> SC {
+    return SC {
+        id: id,
+        kind: kind,
+        scope_id: scope_id,
+        deferred_mode: false,
+        cancelled: false,
+        delivery_count: 0
+    }
+}
+
+fn sC_get_scope_id(view x: SC) -> Int => x.scope_id
+fn sC_get_deferred_mode(view x: SC) -> Bool => x.deferred_mode
+fn sC_get_cancelled(view x: SC) -> Bool => x.cancelled
+
+fn b2s(v: Bool) -> Str {
+    mut res = "false"
+    if v {
+        res = "true"
+    }
+    return res
+}
+
+fn main() {
+    mut i = 0
+    println("=== SA ===")
+    mut xs: List<SA> = []
+    i = 0
+    while i < 3 {
+        xs = xs.push(sA_new(i, "K", i))
+        i = i + 1
+    }
+    i = 0
+    while i < xs.len() {
+        let x = xs[i]
+        println("i=" + int_to_str(i) + " scope_id=" + int_to_str(sA_get_scope_id(x)) + " deferred_mode=" + b2s(sA_get_deferred_mode(x)) + " cancelled=" + b2s(sA_get_cancelled(x)))
+        i = i + 1
+    }
+    println("=== SB ===")
+    mut xs: List<SB> = []
+    i = 0
+    while i < 3 {
+        xs = xs.push(sB_new(i, "K", i))
+        i = i + 1
+    }
+    i = 0
+    while i < xs.len() {
+        let x = xs[i]
+        println("i=" + int_to_str(i) + " scope_id=" + int_to_str(sB_get_scope_id(x)) + " deferred_mode=" + b2s(sB_get_deferred_mode(x)) + " cancelled=" + b2s(sB_get_cancelled(x)))
+        i = i + 1
+    }
+    println("=== SC ===")
+    mut xs: List<SC> = []
+    i = 0
+    while i < 3 {
+        xs = xs.push(sC_new(i, "K", i))
+        i = i + 1
+    }
+    i = 0
+    while i < xs.len() {
+        let x = xs[i]
+        println("i=" + int_to_str(i) + " scope_id=" + int_to_str(sC_get_scope_id(x)) + " deferred_mode=" + b2s(sC_get_deferred_mode(x)) + " cancelled=" + b2s(sC_get_cancelled(x)))
+        i = i + 1
+    }
+}

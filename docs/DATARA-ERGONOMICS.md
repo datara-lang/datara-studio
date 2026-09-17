@@ -70,8 +70,8 @@ pub struct Short {:d c a b
 ```
 
 Correct output is `a b c d`. Reproduce with
-`ryan-harness/probes/str_compare_order/`; full analysis in finding 13 of
-`ryan-harness/docs/COMPILER-NOTES.md`.
+`probes/str_compare_order/`; full analysis in finding 13 of
+`docs/COMPILER-NOTES.md`.
 
 Instrumented, the comparison is the liar - both operands print correctly
 immediately before being compared, and the result differs between runs:
@@ -185,7 +185,7 @@ Two smaller defects in the same area, both silent:
   changes its memory layout.
 
 **A note on the probe that was supposed to demonstrate this, found while making
-the IDE check the whole project.** `ryan-harness/probes/field_collision/` exists
+the IDE check the whole project.** `probes/field_collision/` exists
 to show the collision, and it has never run: both `broken_a.dtr` and
 `broken_b.dtr` name their field `shared`, and **`shared` is a reserved word**.
 The compiler stops at `E-SYNTAX-001: Expected member name` on line 3, so the

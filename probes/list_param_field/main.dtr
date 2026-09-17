@@ -1,0 +1,55 @@
+//! Finding 14: a `List<Struct>` parameter cannot have its elements' fields read.
+//!
+//! `forgen check` passes on this file. `forgen build` fails with:
+//!
+//!   [E0944] cannot resolve the receiver class for field access
+//!   '.dlv_subscription_id' in function 'count_by_sub' : refusing to guess the
+//!   field offset
+//!
+//! The two functions differ only in where the list comes from. `count_local`
+//! indexes a list that is a local and builds; `count_by_sub` indexes a list that
+//! is a parameter and does not. Delete either one and the file compiles, which is
+//! the whole of the finding.
+//!
+//! Run:  source scripts/env.sh && forgen check probes/list_param_field/main.dtr
+//!       source scripts/env.sh && forgen build probes/list_param_field/main.dtr
+
+pub struct Delivery {
+    dlv_subscription_id: Int
+    dlv_deferred_mode: Bool
+}
+
+/// Fails code generation: `plan` is a parameter.
+pub fn count_by_sub( plan: List<Delivery>, sub_id: Int) -> Int {
+    mut n = 0
+    mut i = 0
+    while i < plan.len() {
+        if plan[i].dlv_subscription_id == sub_id {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+/// Builds: the same loop over a list that is a local.
+pub fn count_local( sub_id: Int) -> Int {
+    mut plan: List<Delivery> = []
+    plan = plan.push(Delivery { dlv_subscription_id: 7, dlv_deferred_mode: false })
+    mut n = 0
+    mut i = 0
+    while i < plan.len() {
+        if plan[i].dlv_subscription_id == sub_id {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn main() {
+    mut plan: List<Delivery> = []
+    plan = plan.push(Delivery { dlv_subscription_id: 1, dlv_deferred_mode: false })
+    println("by parameter: " + int_to_str(count_by_sub(plan, 1)))
+    println("by local:     " + int_to_str(count_local(7)))
+}

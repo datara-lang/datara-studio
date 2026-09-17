@@ -959,7 +959,7 @@ only inside forgen.
    the mirror has to be updated; that file is the thing to fix, and it says so at
    the top. Its field sort compares bytes as integers rather than using `Str`
    `<`, because `Str` comparison is not deterministic on 1.4.0 (finding 13 in
-   `ryan-harness/docs/COMPILER-NOTES.md`).
+   `docs/COMPILER-NOTES.md`).
 12. **Deleting is permanent, and an ASCII-only operation.** Delete and rename
     both work in the explorer now, but delete shells out - forgen 1.4.0 has no
     file-delete builtin - so a name that is not ASCII cannot be spelled for the

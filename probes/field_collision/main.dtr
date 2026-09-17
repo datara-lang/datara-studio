@@ -1,0 +1,35 @@
+//! Probe: forgen 1.3.0 struct field-name collision behaviour.
+//!
+//! Run:  source scripts/env.sh && forgen run probes/field_collision/main.dtr
+//!
+//! Expected output (all values correct, exit 0):
+//!
+//!   same-name-same-type        A.f=7 B.f=9
+//!   collection-element-differs P.items[0]=11 Q.items[0]=zz
+//!   generic-param-vs-concrete  G.k=5 H.k=6
+//!   stdlib-generic-field       Outcome.value=ok
+//!
+//! To observe the failure mode, add `use broken` below. The compiler emits no
+//! diagnostic; the program silently misbehaves or prints nothing.
+
+use alpha
+use beta
+use gamma
+use delta
+use eps
+use zeta
+use stdlib.result.result.Outcome
+
+fn main() {
+    println("same-name-same-type        A.f=" + int_to_str(a_get(a_make()))
+            + " B.f=" + int_to_str(b_get(b_make())))
+
+    println("collection-element-differs P.items[0]=" + int_to_str(p_get(p_make()))
+            + " Q.items[0]=" + q_get(q_make()))
+
+    println("generic-param-vs-concrete  G.k=" + int_to_str(g_get_int(g_make_int()))
+            + " H.k=" + int_to_str(h_get(h_make())))
+
+    let o: Outcome<Str> = Outcome<Str> { is_success: true, value: "ok", error_msg: "" }
+    println("stdlib-generic-field       Outcome.value=" + o.value)
+}

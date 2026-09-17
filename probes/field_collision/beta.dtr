@@ -1,0 +1,3 @@
+pub struct B { f: Int }
+pub fn b_make() -> B => B { f: 9 }
+pub fn b_get(view x: B) -> Int => x.f

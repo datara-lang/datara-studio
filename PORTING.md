@@ -58,8 +58,8 @@ later - both are handled structurally.
 2. **`Str` comparison is not deterministic.** `<` and `>` on `Str` return
    different answers for the same operands on different runs of the same binary.
    A six-request loop against one unchanged file returned six different field
-   orders. See finding 13 in `ryan-harness/docs/COMPILER-NOTES.md` and the
-   reproduction under `ryan-harness/probes/str_compare_order/`. Worked around by
+   orders. See finding 13 in `docs/COMPILER-NOTES.md` and the
+   reproduction under `probes/str_compare_order/`. Worked around by
    comparing bytes as integers (`st_name_before` in `src/layout.dtr`).
 
 Also still missing from the installed binary while present in the source:

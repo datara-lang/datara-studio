@@ -21,7 +21,7 @@
 //! global bare-name map built first-wins over sorted class names. Two structs
 //! sharing a field name at different offsets meant one of them read the wrong
 //! offset - no diagnostic, exit 0. The repro
-//! (`ryan-harness/probes/field_offset_min`) printed `5` where `42` was
+//! (`probes/field_offset_min`) printed `5` where `42` was
 //! required.
 //!
 //! **That is fixed in 1.4.0.** Re-measured: `field_offset_min` now prints

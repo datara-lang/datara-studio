@@ -1,0 +1,59 @@
+//! Minimal repro: two structs that share one field name, at different offsets.
+//!
+//! Run:  forgen run probes/field_offset_min/main.dtr
+//!
+//! Expected output:
+//!
+//!   SA.scope_id = 77
+//!   SB.scope_id = 42      <-- forgen prints 5
+//!
+//! `SB` declares `scope_id` second (offset 8); `SA` declares it first (offset
+//! 0). The read of `SB.scope_id` returns `SB.s_id` - that is, it reads at the
+//! *first* struct's offset. No diagnostic, no warning, exit code 0.
+//!
+//! This file exists because the probe that was supposed to demonstrate this
+//! (`probes/field_collision/broken_a.dtr`) named its field `shared`, which is a
+//! reserved word, so it never compiled and never demonstrated anything.
+//!
+//! **Do not "fix" this file by renaming the field.** Sharing the name is the
+//! entire point, and `scripts/style_check.py` (R11) would flag it - which is why
+//! that script defaults to `src` and must not be pointed at `probes/`.
+//!
+//! **The field name matters, and that is the part worth knowing.** In exactly
+//! this shape, with two Int fields, measured 5 runs each:
+//!
+//!   corrupt: x, y, w, z, zz, zzz, size, value, scope_id, total, state
+//!   correct: a, aa, aaa, q, qq, qqq, s, r, m, b, f, n, id, count, data,
+//!            kind, flag, dup, len
+//!
+//! Nonsense names split too (`zzz` corrupts, `aaa` does not), so the deciding
+//! factor is a property of the name itself rather than its meaning - most
+//! likely its hash. Renaming the field in this file may make the bug disappear;
+//! that is the bug, not a fix. The same trap cost an afternoon of "it will not
+//! reproduce": the first three hand-built repros used a name from the correct
+//! list.
+//!
+//! The layout is a second variable, and it is why the defect looks random in a
+//! real program: with the same name and *two* fields ahead of it in `SA`, the
+//! two offsets coincide and the program is accidentally correct.
+
+pub struct SA { scope_id: Int }
+
+pub struct SB { s_id: Int, scope_id: Int }
+
+pub fn sa_make() -> SA => SA { scope_id: 77 }
+
+pub fn sb_make() -> SB => SB { s_id: 5, scope_id: 42 }
+
+fn sa_get(view x: SA) -> Int => x.scope_id
+fn sb_get(view x: SB) -> Int => x.scope_id
+
+fn main() {
+    // read through a List element, the way a real program reaches a struct
+    mut xs: List<SB> = []
+    xs = xs.push(sb_make())
+    let x = xs[0]
+
+    println("SA.scope_id = " + int_to_str(sa_get(sa_make())) + "   expected 77")
+    println("SB.scope_id = " + int_to_str(sb_get(x)) + "   expected 42")
+}

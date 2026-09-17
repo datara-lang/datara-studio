@@ -1,0 +1,3 @@
+pub struct G<T> { k: T }
+pub fn g_make_int() -> G<Int> => G<Int> { k: 5 }
+pub fn g_get_int(view x: G<Int>) -> Int => x.k

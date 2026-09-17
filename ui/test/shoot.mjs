@@ -14,8 +14,8 @@
 // exits rather than pretending to pass when playwright is missing.
 
 import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Finding playwright.
 //
@@ -115,8 +115,13 @@ await shoot("01-title", () => {
 // 2. A real workspace open, with a Datara file in the editor - this is the one
 //    that shows the .dtr mark, the gutter and the absence of a current-line
 //    band.
-const root = "D:/IDE datara/ryan-harness";
-const open = "D:/IDE datara/ryan-harness/src/main.dtr";
+// The demo workspace is this repository itself. It is a real Datara project, it
+// always sits next to this script, and deriving it means the shots cannot rot
+// when the tree moves. This used to name the kernel by absolute path, which
+// broke the moment that directory stopped existing.
+const here = dirname(fileURLToPath(import.meta.url));
+const root = resolve(here, "..", "..").replace(/\\/g, "/");
+const open = root + "/src/main.dtr";
 await shoot("02-workspace", ([r, f]) => {
   try {
     localStorage.setItem("datara.studio.lastRoot", r);
@@ -142,7 +147,7 @@ await shoot("03-panel", ([r, f]) => {
 //    is inconvenient" is a complaint about a specific 40 pixels.
 const leftSeed = () => {
   try {
-    localStorage.setItem("datara.studio.lastRoot", "D:/IDE datara/ryan-harness");
+    localStorage.setItem("datara.studio.lastRoot", root);
   } catch (e) {}
 };
 await shoot("04-left-corner", leftSeed, null, null, { x: 0, y: 0, width: 340, height: 240 });

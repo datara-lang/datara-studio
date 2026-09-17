@@ -805,7 +805,7 @@ pub fn st_is_windows() -> Bool {
 
 /// Every path in this module is stored with forward slashes.
 ///
-/// Measured: mixing separators produced `D:/IDE datara\ryan-harness`, which
+/// Measured: mixing separators produced `D:/IDE datara\datara-studio`, which
 /// Windows tolerates but which then travelled into `/api/tree` and `/api/read`
 /// as a different string from the one the user picked. Forward slashes work on
 /// Windows too, so one separator everywhere removes the whole class of problem.
