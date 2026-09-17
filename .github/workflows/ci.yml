@@ -121,7 +121,25 @@ jobs:
       # search order, the PATH lookup, CREATE_NO_WINDOW on Windows and its
       # absence elsewhere. Compiling it on all three is the cheapest way to keep
       # the `#[cfg]` branches honest.
+      #
+      # It cannot be compiled without the interface, and that is not obvious from
+      # the crate. `tauri.conf.json` declares `../ui/studio.html` as a bundled
+      # resource, `tauri-build`'s build script **requires every declared resource
+      # to exist**, and that file is gitignored and generated. Measured on the
+      # first run of this workflow, on all three platforms:
+      #
+      #     error: failed to run custom build command for `datara-studio v0.3.0`
+      #       resource path `../ui/studio.html` doesn't exist
+      #
+      # So the build inputs come first here too, in the same order the
+      # `verify-build-order.mjs` step in the other job enforces.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Install the Linux webview dependencies
         if: runner.os == 'Linux'
@@ -131,6 +149,12 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
             libayatana-appindicator3-dev libxdo-dev libssl-dev \
             build-essential curl wget file
+
+      - name: Build the resources the shell bundles
+        run: |
+          node scripts/build-wasm.mjs
+          node scripts/build-icons.mjs
+          node scripts/build-ui.mjs
 
       - name: cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets

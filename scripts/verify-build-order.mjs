@@ -22,19 +22,23 @@
 // it. That is the shape of the bug: one source of truth, four copies, no test.
 // This is the test.
 //
-// What it checks, for each entry point, after dropping comment lines:
+// What it checks, for each entry point:
 //
 //   1. all three build steps are named at all;
-//   2. they appear in the order wasm -> icons -> interface.
+//   2. every occurrence of the interface step is preceded by the other two
+//      since the previous one - so a file with two independent build sequences,
+//      like `ci.yml` with its `interface` and `shell` jobs, has to get both
+//      right and cannot pass on the strength of the first.
 //
-// Comment lines are dropped so that an explanation of the order does not count
-// as an occurrence of it - `release.yml` and `build-desktop.cmd` both discuss
-// `build-ui.mjs` in prose above the step that runs it.
+// Comment lines are dropped, and for Markdown only fenced code blocks are read,
+// so that an explanation of the order does not count as an occurrence of it -
+// `release.yml`, `build-desktop.cmd` and `README.md` all discuss `build-ui.mjs`
+// in prose away from the step that runs it.
 //
 // Run:  node scripts/verify-build-order.mjs
 
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -45,6 +49,7 @@ const STEPS = [
   { file: "build-icons.mjs", what: "src-tauri/icons/ and ui/mark.ico, which build-ui.mjs embeds" },
   { file: "build-ui.mjs", what: "ui/studio.html, a bundled resource" },
 ];
+const INTERFACE = "build-ui.mjs";
 
 // Every path from "I have the source" to "the interface exists". A new one
 // belongs in this list; that is the point of the list.
@@ -58,6 +63,44 @@ const ENTRY_POINTS = [
 ];
 
 const isComment = (line) => /^\s*(#|REM\b|REM\s|<!--|\/\/)/i.test(line);
+
+/** The parts of a file that instruct rather than explain. */
+function instructionsOf(rel, text) {
+  const lines = text.split(/\r?\n/);
+  if (extname(rel) !== ".md") return lines.filter((l) => !isComment(l)).join("\n");
+
+  // Markdown: only what is inside a fenced block. Prose that happens to name
+  // `build-icons.mjs` while discussing icon geometry is not a build step.
+  const out = [];
+  let inside = false;
+  for (const line of lines) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inside = !inside;
+      continue;
+    }
+    if (inside) out.push(line);
+  }
+  return out.join("\n");
+}
+
+/** The build steps named, in order, with consecutive repeats collapsed.
+ *
+ *  Collapsing is what makes `build-ui.mjs && node scripts/build-ui.mjs --core`
+ *  one event rather than two - the `--core` line is the same step run twice, and
+ *  treating it as a second sequence would demand a second text-core build that
+ *  nothing needs. */
+function stepsIn(code) {
+  const found = [];
+  for (const s of STEPS) {
+    let i = code.indexOf(s.file);
+    while (i >= 0) {
+      found.push({ at: i, file: s.file });
+      i = code.indexOf(s.file, i + 1);
+    }
+  }
+  found.sort((a, b) => a.at - b.at);
+  return found.filter((f, n) => n === 0 || f.file !== found[n - 1].file);
+}
 
 let passed = 0;
 let failed = 0;
@@ -73,52 +116,75 @@ function check(name, ok, detail) {
   }
 }
 
+/** The rule, as a function, so the negative controls can run the real thing. */
+function findProblem(code) {
+  const named = new Set(stepsIn(code).map((s) => s.file));
+  const missing = STEPS.filter((s) => !named.has(s.file));
+  if (missing.length) {
+    return { kind: "missing", detail: `never runs ${missing.map((s) => s.file).join(", ")} - ${missing[0].what} would be missing` };
+  }
+
+  const seen = new Set();
+  for (const step of stepsIn(code)) {
+    if (step.file === INTERFACE) {
+      const lacking = STEPS.filter((s) => s.file !== INTERFACE && !seen.has(s.file));
+      if (lacking.length) {
+        return { kind: "order", detail: `${INTERFACE} is reached without ${lacking.map((s) => s.file).join(", ")} before it` };
+      }
+      seen.clear();
+    } else {
+      seen.add(step.file);
+    }
+  }
+  return null;
+}
+
 process.stdout.write("build order\n");
 
 for (const rel of ENTRY_POINTS) {
-  const text = readFileSync(join(ROOT, rel), "utf8");
-  const code = text
-    .split(/\r?\n/)
-    .filter((l) => !isComment(l))
-    .join("\n");
-
-  const at = new Map();
-  for (const s of STEPS) {
-    const i = code.indexOf(s.file);
-    at.set(s.file, i);
-  }
-
-  const missing = STEPS.filter((s) => at.get(s.file) < 0).map((s) => s.file);
-  check(
-    `${rel}: builds all three`,
-    missing.length === 0,
-    missing.length ? `never runs ${missing.join(", ")} - ${STEPS.find((s) => s.file === missing[0]).what} would be missing` : "",
-  );
-  if (missing.length) continue;
-
-  // First occurrence, so a later mention cannot rescue an earlier inversion.
-  const order = STEPS.map((s) => ({ file: s.file, i: at.get(s.file) }));
-  const sorted = [...order].sort((a, b) => a.i - b.i).map((o) => o.file);
-  const want = STEPS.map((s) => s.file);
-  check(
-    `${rel}: in the order wasm -> icons -> interface`,
-    sorted.join(",") === want.join(","),
-    `found ${sorted.join(" -> ")}`,
-  );
+  const code = instructionsOf(rel, readFileSync(join(ROOT, rel), "utf8"));
+  const problem = findProblem(code);
+  const label = problem ? `${rel}: ${problem.kind === "missing" ? "builds all three" : "in the order wasm -> icons -> interface"}` : `${rel}: ok`;
+  check(label, !problem, problem ? problem.detail : "");
 }
 
-// And the negative control: the check has to be able to fail. `build-desktop.cmd`
-// as it was before this test existed - interface first, no text core - is fed
-// through the same logic here rather than trusted to have been caught.
+// The negative controls. Each is fed through `findProblem` itself rather than
+// through a second copy of the rule, because a test that cannot fail is not
+// evidence - and the first of these is the real pre-fix content of
+// `scripts/build-desktop.cmd`, which shipped in that state.
 {
-  const broken = ["node scripts\\build-ui.mjs", "node scripts\\build-icons.mjs"].join("\n");
-  const seen = STEPS.filter((s) => broken.includes(s.file)).map((s) => s.file);
-  const sorted = [...seen].sort((a, b) => broken.indexOf(a) - broken.indexOf(b));
-  check(
-    "the check rejects an interface-first sequence",
-    seen.length < 3 || sorted[0] !== "build-wasm.mjs",
-    `it accepted ${sorted.join(" -> ")}`,
-  );
+  const controls = [
+    {
+      name: "rejects interface-first (build-desktop.cmd as it was)",
+      code: "node scripts\\build-ui.mjs\nnode scripts\\build-icons.mjs",
+    },
+    {
+      name: "rejects a second sequence that omits the text core",
+      code: [
+        "node scripts/build-wasm.mjs",
+        "node scripts/build-icons.mjs",
+        "node scripts/build-ui.mjs",
+        "node scripts/build-icons.mjs",
+        "node scripts/build-ui.mjs",
+      ].join("\n"),
+    },
+    {
+      name: "accepts a correct second sequence",
+      code: [
+        "node scripts/build-wasm.mjs",
+        "node scripts/build-icons.mjs",
+        "node scripts/build-ui.mjs",
+        "node scripts/build-wasm.mjs",
+        "node scripts/build-icons.mjs",
+        "node scripts/build-ui.mjs",
+      ].join("\n"),
+    },
+  ];
+  for (const c of controls) {
+    const problem = findProblem(c.code);
+    const wantProblem = !c.name.startsWith("accepts");
+    check(c.name, wantProblem ? Boolean(problem) : !problem, problem ? problem.detail : "no problem found");
+  }
 }
 
 process.stdout.write(`\n${passed}/${passed + failed} checks passed\n`);

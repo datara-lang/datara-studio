@@ -15,7 +15,7 @@
 //
 // Run:  node scripts/verify-companion.mjs
 
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,26 @@ import { tmpdir } from "node:os";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REAL = join(HERE, "find-companion.mjs");
+
+// Canonicalise before comparing any two paths, and do it to both sides.
+//
+// macOS makes this mandatory rather than tidy: `mkdtempSync` returns
+// `/var/folders/...`, while the script under test derives its answer from
+// `import.meta.url`, which Node has already resolved through the symlink, so it
+// answers `/private/var/folders/...`. Both are the same directory and a string
+// comparison says they are not. Measured on the macOS runner: this test was the
+// only failure in the whole interface job, and it was the test that was wrong -
+// the search had found exactly the right directory.
+// `realpathSync` throws on a path that does not exist, and the value being
+// canonicalised may be an empty string when the script under test failed - which
+// is exactly the case this test is supposed to report as a failure, not crash on.
+const real = (p) => {
+  try {
+    return realpathSync(p).replace(/\\/g, "/");
+  } catch {
+    return String(p).replace(/\\/g, "/");
+  }
+};
 
 let passed = 0;
 let failed = 0;
@@ -78,7 +98,7 @@ process.stdout.write("companion search\n");
   plantCompanion(join(base, "a", "ryan", "python"));
   const r = run(script, { env: fakeHome(base), args: ["--json"] });
   const j = JSON.parse(r.out || "{}");
-  check("finds a sibling project's companion when nothing else matches", r.code === 0 && j.dir === `${base.replace(/\\/g, "/")}/a/ryan/python`, `${r.code} ${r.out}`);
+  check("finds a sibling project's companion when nothing else matches", r.code === 0 && j.dir === real(join(base, "a", "ryan", "python")), `${r.code} ${j.dir}`);
   check("and says it found it by the sweep", j.foundVia === "$ROOT/../../*/python", j.foundVia);
   rmSync(base, { recursive: true, force: true });
 }
@@ -113,7 +133,7 @@ process.stdout.write("companion search\n");
   plantCompanion(mine);
   const r = run(script, { env: { ...fakeHome(base), FORGEN_AI_DIR: mine }, args: ["--json"] });
   const j = JSON.parse(r.out || "{}");
-  check("FORGEN_AI_DIR wins over every guess", j.foundVia === "FORGEN_AI_DIR" && j.dir === mine.replace(/\\/g, "/"), j.dir);
+  check("FORGEN_AI_DIR wins over every guess", j.foundVia === "FORGEN_AI_DIR" && j.dir === real(mine), j.dir);
   rmSync(base, { recursive: true, force: true });
 }
 
