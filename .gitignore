@@ -17,8 +17,16 @@ ui/vendor/textcore.js
 *.pdb
 .forgen_cache/
 
-# generated single-file interface
+# generated single-file interface, both variants.
+#
+# `build-ui.mjs` writes the first and `build-ui.mjs --core` writes the second,
+# and both are declared resources in tauri.conf.json. Only the first was ignored:
+# the core variant was committed by oversight, so every interface build left
+# 660 KB of churn in `git status` and the tracked copy drifted from the generator
+# that owns it. Both are build outputs now, and `verify-build-order.mjs` checks
+# that every entry point builds them before anything that needs them runs.
 ui/studio.html
+ui/studio-core.html
 
 # local test dependency for the boot test
 node_modules/
@@ -43,6 +51,9 @@ shots/
 # `start.sh` and the launch instructions run it. It is a live log of the running
 # process, not a source file.
 studio-run*.log
+
+# the gate's own transcript, written by scripts/build.sh when it is redirected
+.build.log
 
 # The build cache forgen writes beside the sources. Regenerated on every build.
 .forgen_cache/

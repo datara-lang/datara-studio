@@ -209,6 +209,13 @@ fn st_handle( fd: Int, tc: Str) {
         st_json(fd, st_ai_start(str_trim(body)))
         return
     }
+    if path == "/api/ai/stop" {
+        // The other half of the switch in the bar. Without it the interface could
+        // only clear a checkbox while the process kept the port, so "off" was a
+        // lie the next health check could not see through.
+        st_json(fd, st_ai_stop())
+        return
+    }
     if path == "/api/layout" {
         st_json(fd, st_layout_report(str_trim(body)))
         return
@@ -281,7 +288,7 @@ fn main() {
     }
 
     println("")
-    println("  Datara Studio 0.3.0")
+    println("  Datara Studio 0.4.0")
     println("  interface  http://127.0.0.1:" + int_to_str(port))
     println("  ai         http://127.0.0.1:7890  (optional, start it from D:\\ryan)")
     println("  stop       Ctrl+C")

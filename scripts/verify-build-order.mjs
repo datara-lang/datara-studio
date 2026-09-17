@@ -53,10 +53,22 @@ const INTERFACE = "build-ui.mjs";
 
 // Every path from "I have the source" to "the interface exists". A new one
 // belongs in this list; that is the point of the list.
+//
+// The last three were added after this file had already shipped, because the
+// list was the bug. `scripts/build-desktop.sh` ran the interface BEFORE the
+// icons and never built the text core - the identical defect this test was
+// written to catch, in the one script that builds the Linux and macOS app. It
+// survived because it was not on the list, and the machine it was written on is
+// Windows. `start.sh` and `start.cmd` had the same omission behind their
+// "if the interface is missing" guard, which fires on exactly the fresh checkout
+// where it does the most damage. A verifier is only as good as its coverage.
 const ENTRY_POINTS = [
   "scripts/build.sh",
+  "scripts/build-desktop.sh",
   "scripts/build-desktop.cmd",
   "start-tauri.cmd",
+  "start.sh",
+  "start.cmd",
   "README.md",
   ".github/workflows/ci.yml",
   ".github/workflows/release.yml",

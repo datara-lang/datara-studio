@@ -34,10 +34,20 @@ if ! command -v forgen >/dev/null 2>&1 && [ -z "${DATARA_FORGEN:-}" ]; then
   echo "forgen is not on PATH. Install the Datara toolchain or set DATARA_FORGEN." >&2
   exit 1
 fi
-if [ ! -f "ui/studio.html" ]; then
-  command -v node >/dev/null 2>&1 || { echo "node is required to build ui/studio.html" >&2; exit 1; }
-  echo "  ui/studio.html is missing - building it ..."
-  node scripts/build-ui.mjs
+# The interface is built on demand, but "run build-ui.mjs" is not a complete
+# instruction: it INLINES ui/vendor/textcore.js and embeds ui/mark.ico, and
+# neither is in git. On a fresh checkout this branch used to run build-ui.mjs
+# alone and die on "cannot inline /vendor/textcore.js" - so the first launch of
+# a clean clone failed, which is the worst possible time for it. All three run
+# now, in the order that makes them inputs, and the guard asks for both variants
+# because tauri.conf.json declares both as bundled resources.
+if [ ! -f "ui/studio.html" ] || [ ! -f "ui/studio-core.html" ]; then
+  command -v node >/dev/null 2>&1 || { echo "node is required to build the interface" >&2; exit 1; }
+  echo "  the interface is missing - building it ..."
+  node scripts/build-wasm.mjs || { echo "the text core did not build" >&2; exit 1; }
+  node scripts/build-icons.mjs || { echo "the icons did not build" >&2; exit 1; }
+  node scripts/build-ui.mjs || { echo "the interface did not build" >&2; exit 1; }
+  node scripts/build-ui.mjs --core || { echo "the core interface did not build" >&2; exit 1; }
 fi
 
 # Does this port have a server that actually *answers*?

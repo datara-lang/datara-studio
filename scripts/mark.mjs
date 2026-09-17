@@ -26,71 +26,91 @@ import { deflateSync } from "node:zlib";
 import { writeFileSync } from "node:fs";
 
 // ---- geometry, in the 64-unit space ui/icon.svg uses ------------------------
-
+//
+// The second design. The first was two angle brackets around a mint dot - "a
+// node held between two brackets". It was replaced because it read as a
+// *generic* developer mark: `<>` with a dot in it is the default shape of every
+// code-adjacent logo, and at 16px its diagonals had to be fought onto the pixel
+// grid (see the SMALL table for how much fighting).
+//
+// What is here now is square brackets around a mint caret - `[|]`, a text
+// cursor inside structure. Three reasons, in order of how much they decided it:
+//
+//   1. It says what the program is. Datara Studio is an editor first; a caret
+//      inside brackets is "editing, inside the language's structure", where a
+//      dot was an abstraction that happened to be symmetrical.
+//   2. Every stroke is axis-aligned. Nothing here is a diagonal, so a 1.5px
+//      stroke is a whole number of pixels at every size instead of a staircase.
+//      The old mark's chevrons were the reason the 16px entry needed its own
+//      hand-fitted geometry at all.
+//   3. The bracket corners are rounded joins, so the drawing still reads as
+//      drawn rather than as a monospace glyph dropped on a tile.
+//
+// The palette is deliberately unchanged - the plate, the ink and the mint are
+// the same three values the rest of the interface uses, so nothing in the CSS,
+// the title screen or `verify-ico.mjs` had to move with it.
 export const MARK = {
   box: 64,
   plate: { r: 15, fill: [15, 15, 18, 255] },              // #0F0F12
   stroke: { w: 5, color: [233, 233, 238, 255] },           // #E9E9EE
+  // `[` and `]`: down the outside, with a short arm inward at each end. The
+  // arms are 6 units, so the opening between them is 12 - wide enough that the
+  // caret does not look boxed in at 32px and above.
   brackets: [
-    [[23.5, 17.5], [13.5, 32], [23.5, 46.5]],
-    [[40.5, 17.5], [50.5, 32], [40.5, 46.5]],
+    [[25, 17], [19, 17], [19, 47], [25, 47]],
+    [[39, 17], [45, 17], [45, 47], [39, 47]],
   ],
-  node: { cx: 32, cy: 32, r: 5.5, color: [125, 211, 192, 255] }, // #7DD3C0
+  // The caret. A stroked vertical segment with round caps, not a filled bar, so
+  // it is drawn by the same code path as the brackets and cannot disagree with
+  // them about width.
+  caret: { x: 32, y0: 24, y1: 40, w: 5, color: [125, 211, 192, 255] }, // #7DD3C0
 };
 
 // How the drawing is laid out per size.
 //
-// Measured, not guessed. Two failures showed up on the contact sheet
-// (`scripts/icon-sheet.mjs`), one per surface:
+// This table exists because of a measured failure, and the failure is worth
+// keeping in view even though the shape underneath it changed.
 //
-//   * At 16 and 24 with the plate on, the plate's 15/64 corner radius lands on
-//     the edge of the pixel grid: the four corners render as a pixel of
-//     near-black on a transparent tile, and the brackets run into them. The icon
-//     read as a blob with dirty corners.
-//   * At 16 and 24 with the plate OFF, the brackets are `#E9E9EE` - which is
-//     invisible on a light surface. The icon vanished entirely in light mode,
-//     leaving only the mint dot. That one was only visible on the light half of
-//     the sheet; on the dark half it looked correct.
-//
-// So the plate stays at every size and the *inset* is what changes. A smaller
-// rounded square at 16px still has clean corners because the radius scales with
-// the plate rather than staying at 15 units.
-//
-// --- and then a third failure, which is the one that reached the taskbar ---
-//
-// Uniform inset is not enough at 16px. Rendering the entry back out as ASCII
-// (`scripts/_diag16.mjs` during the fix) showed why:
+// At 16 and 24 with the plate on and everything scaled uniformly, the first
+// design's corner radius landed on the edge of the pixel grid and the icon read
+// as a blob with dirty corners. With the plate off, the light brackets vanished
+// on a light surface and only the mint dot was left. And at 16px the mint node
+// came out about as wide as the stroke, so the dot split the pale bracket into
+// specks:
 //
 //     .++++MM++MM++++.     row 5
 //     .++++#++++#++++.     row 6   <- bracket is ONE pixel
 //     .+++#++MM++#+++.     row 7   <- node poking through it
-//     .++++#++++#++++.
-//     .++++MM++MM++++.     row 10
 //
-// The node (r 5.5 units, scaled 0.80) came out about as wide as the stroke, so
-// at 16px the mint dot split the pale bracket into specks and the whole thing
-// read as a mint cross on a grey smudge. Shrinking everything together cannot
-// fix that: at 16px one unit is a quarter of a pixel, so *both* the 5-unit
-// stroke and the 5.5-unit node are fighting over the same one-pixel budget.
+// Shrinking everything together cannot fix that: at 16px one unit is a quarter
+// of a pixel, so the stroke and the node are fighting over the same one-pixel
+// budget. The fix is to stop scaling and start drawing for the grid - a 16px
+// icon is a different drawing that resembles the 256px one, not the same drawing
+// made smaller.
 //
-// The fix is to stop scaling and start drawing for the grid. The small sizes
-// get their own numbers: a stroke that is a clean 1.6px, a node small enough to
-// sit inside the gap, and a gap wide enough to survive. This is the ordinary
-// thing icon design does - a 16px icon is a different drawing that resembles the
-// 256px one, not the same drawing made smaller.
+// The current numbers were derived from the grid rather than fitted by eye, and
+// the derivation is the point. The strokes are drawn by distance, so a stroke of
+// width `w` centred at `c` inks `c-w/2 .. c+w/2`; a 1.4px stroke is therefore
+// grey on *both* sides of the boundary no matter where you put it. Measured with
+// the ASCII dump (`ascii-mark.mjs`, a throwaway): at 16px a 1.4px spine centred
+// on 4.9 inked column 4 at 80% and column 5 at 60%, which reads as a grey smudge
+// and is exactly the "blurry, you can't see it" complaint in miniature.
 //
-// These numbers were *derived*, not guessed, and the derivation is the point.
-// The first attempt invented plausible-looking units (spread 9, tip 9) and
-// produced two solid vertical bars with no bracket shape at all, because a
-// polyline whose apex and tips are the same distance from the centre is a
-// straight line. The working version was fitted on the pixel grid in
-// `scripts/_fit16.mjs`, in pixels, and only then committed:
+// So at 16 the layout is solved as a sum of whole columns:
 //
-//     strokePx 1.6   nodePx 1.2   apexPx 4.0   tipPx 2.0   topPx 4.2
+//     margin 2 | spine 2 | arm 2 | gap 1 | caret 2 | gap 1 | arm 2 | spine 2 | margin 2
 //
-// which is the `⟨` shape below at 16, and its 24px sibling at 24. Both were
-// checked as ASCII before being committed; a bracket you cannot see in a
-// character grid is a bracket you will not see on a taskbar.
+// which is 16 exactly, and lands the spine on columns 2-3, the arm on 4-5, the
+// caret on 7-8 and the mirror on 10-13. Every stroke is 2px and covers its
+// columns completely, so nothing is half-lit. 24 is the same drawing at 1.5x.
+//
+// A 1px stroke was tried first and rejected, for a reason worth writing down:
+// the caret has to sit on the mark's centreline, and in a 16px tile the
+// centreline is x=8.0 - so a 1px caret spans 7.5..8.5 and is grey on both sides,
+// which is the same failure as before with a thinner line. A 1px stroke can be
+// grid-aligned or centred, not both; a 2px stroke is the smallest one that can be
+// both. That is why the small drawing is chunkier than the large one, and it is
+// the whole reason this table is not a scale factor.
 //
 // Positions are given in PIXELS at that size, unlike the 64-unit drawing above,
 // because the whole point of this table is to land on the pixel grid and pixels
@@ -98,22 +118,26 @@ export const MARK = {
 // once, on the way into the sampler. The `Px` suffix is load-bearing.
 export const SMALL = {
   16: {
-    strokePx: 1.6,
-    nodePx: 1.2,     // radius, so a ~2-3px dot
-    apexPx: 4.0,     // apex sits 4px left/right of centre
-    tipPx: 2.0,      // tips sit 2px from centre, so the bracket opens outward
-    topPx: 4.2,      // half-height of the bracket
-    insetPx: 1.6,    // plate margin
-    radiusPx: 3.2,   // plate corner radius
+    strokePx: 2.0,
+    spinePx: 3.0,        // bracket spine centre, from the box edge
+    armPx: 2.0,          // arm tip, measured the same way
+    topPx: 4.0,          // bracket top, from the top edge
+    botPx: 12.0,         // bracket bottom, from the top edge
+    caretTopPx: 7.0,     // caret, likewise
+    caretBotPx: 9.0,
+    insetPx: 0.5,        // plate margin
+    radiusPx: 3.0,       // plate corner radius
   },
   24: {
-    strokePx: 2.4,
-    nodePx: 1.6,
-    apexPx: 4.2,
-    tipPx: 2.1,
-    topPx: 4.4,
-    insetPx: 1.9,
-    radiusPx: 4.2,
+    strokePx: 3.0,
+    spinePx: 4.5,
+    armPx: 3.0,
+    topPx: 6.0,
+    botPx: 18.0,
+    caretTopPx: 10.5,
+    caretBotPx: 13.5,
+    insetPx: 0.75,
+    radiusPx: 4.5,
   },
 };
 
@@ -174,25 +198,42 @@ export function renderMark(size, opts = {}) {
   // field names carry the unit to stop the two being confused again. (They were
   // confused: the first version fed pixel offsets straight into the sampler and
   // the brackets came out half a pixel wide and invisible.)
-  let strokeW, nodeR, brackets, plateHalf, plateR;
+  let strokeW, brackets, caret, plateHalf, plateR;
   if (small) {
     const u = s / size;                 // pixels -> 64-space
     strokeW = small.strokePx * u;
-    nodeR = small.nodePx * u;
-    const apex = mid - small.apexPx * u;
-    const tip = mid - small.tipPx * u;
-    const t = small.topPx * u;
+    const spine = small.spinePx * u;
+    const arm = small.armPx * u;
+    const top = small.topPx * u;
+    const bot = small.botPx * u;
+    // `[` and its mirror: down the spine, with an arm at each end.
     brackets = [
-      [[tip, mid - t], [apex, mid], [tip, mid + t]],
-      [[s - tip, mid - t], [s - apex, mid], [s - tip, mid + t]],
+      [[spine + arm, top], [spine, top], [spine, bot], [spine + arm, bot]],
+      [[s - spine - arm, top], [s - spine, top], [s - spine, bot], [s - spine - arm, bot]],
     ];
+    caret = {
+      x: mid,
+      y0: small.caretTopPx * u,
+      y1: small.caretBotPx * u,
+      w: strokeW,
+      color: MARK.caret.color,
+    };
     plateHalf = mid - small.insetPx * u;
     plateR = Math.min(small.radiusPx * u, plateHalf);
   } else {
     strokeW = MARK.stroke.w;
-    nodeR = MARK.node.r;
     const fit = (v) => mid + (v - mid) * lay.scale;
     brackets = MARK.brackets.map((poly) => poly.map(([x, y]) => [fit(x), fit(y)]));
+    // The caret is drawn by the same segment-distance test the brackets use, so
+    // it cannot disagree with them about width - and `fit` is the identity at
+    // every size above 24, which is why only the small path needs its own copy.
+    caret = {
+      x: fit(MARK.caret.x),
+      y0: fit(MARK.caret.y0),
+      y1: fit(MARK.caret.y1),
+      w: MARK.caret.w * lay.scale,
+      color: MARK.caret.color,
+    };
     plateHalf = mid * lay.scale;
     plateR = Math.min(s * lay.radius * lay.scale, plateHalf);
   }
@@ -222,8 +263,10 @@ export function renderMark(size, opts = {}) {
             if (onStroke) break;
           }
           if (onStroke) { [cr, cg, cb, ca] = MARK.stroke.color; }
-          // node last: it sits on top of the brackets, as in the SVG
-          if (Math.hypot(ux - mid, uy - mid) <= nodeR) { [cr, cg, cb, ca] = MARK.node.color; }
+          // the caret last: it sits on top of the brackets, as in the SVG
+          if (segDist(ux, uy, caret.x, caret.y0, caret.x, caret.y1) <= caret.w / 2) {
+            [cr, cg, cb, ca] = caret.color;
+          }
 
           r += cr * (ca / 255); g += cg * (ca / 255); b += cb * (ca / 255);
           a += ca;

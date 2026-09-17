@@ -1,9 +1,8 @@
 <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img">
   <title>Datara Studio</title>
-  <desc>A node held between two brackets: a thing located inside structure.</desc>
+  <desc>A text caret held inside square brackets: editing, inside structure. This is the shape scripts/mark.mjs rasterises, in the same three colours the interface uses. The 1.5-unit hairline the plate used to carry here was never drawn by the rasteriser, so it is gone rather than documented as if it shipped.</desc>
   <rect width="64" height="64" rx="15" fill="#0F0F12"/>
-  <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="14.25" fill="none" stroke="#2A2A32" stroke-width="1.5"/>
-  <path d="M23.5 17.5 L13.5 32 L23.5 46.5" fill="none" stroke="#E9E9EE" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M40.5 17.5 L50.5 32 L40.5 46.5" fill="none" stroke="#E9E9EE" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="32" cy="32" r="5.5" fill="#7DD3C0"/>
+  <path d="M25 17 L19 17 L19 47 L25 47" fill="none" stroke="#E9E9EE" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M39 17 L45 17 L45 47 L39 47" fill="none" stroke="#E9E9EE" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M32 24 L32 40" fill="none" stroke="#7DD3C0" stroke-width="5" stroke-linecap="round"/>
 </svg>

@@ -40,12 +40,42 @@ if errorlevel 1 (
   exit /b 1
 )
 
-if not exist "ui\studio.html" (
-  echo   ui\studio.html is missing - building it ...
+REM The interface is built on demand, but "run build-ui.mjs" is not a complete
+REM instruction: it INLINES ui\vendor\textcore.js and embeds ui\mark.ico, and
+REM neither is in git - so a fresh checkout died here on
+REM "cannot inline /vendor/textcore.js". All three run now, in the order that
+REM makes them inputs. The guard asks for both variants because tauri.conf.json
+REM declares both as bundled resources.
+set "UIMISSING="
+if not exist "ui\studio.html" set "UIMISSING=1"
+if not exist "ui\studio-core.html" set "UIMISSING=1"
+if defined UIMISSING (
+  echo   the interface is missing - building it ...
+  node scripts\build-wasm.mjs
+  if errorlevel 1 (
+    echo.
+    echo   Could not build the text core. Run:  node scripts\build-wasm.mjs
+    pause
+    exit /b 1
+  )
+  node scripts\build-icons.mjs
+  if errorlevel 1 (
+    echo.
+    echo   Could not build the icons. Run:  node scripts\build-icons.mjs
+    pause
+    exit /b 1
+  )
   node scripts\build-ui.mjs
   if errorlevel 1 (
     echo.
     echo   Could not build the interface. Run:  node scripts\build-ui.mjs
+    pause
+    exit /b 1
+  )
+  node scripts\build-ui.mjs --core
+  if errorlevel 1 (
+    echo.
+    echo   Could not build the core interface. Run:  node scripts\build-ui.mjs --core
     pause
     exit /b 1
   )

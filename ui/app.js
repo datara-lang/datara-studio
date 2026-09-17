@@ -1705,11 +1705,17 @@ function symbols(src) {
 
 // ---------------------------------------------------------------- small components
 
+// The caret in the brackets is the mark now, not a dot. Kept in step with
+// `scripts/mark.mjs` and `ui/icon.svg` by hand - three descriptions of one
+// shape - which is why the geometry here is a copy of theirs and not an
+// approximation of it. `scripts/build-icons.mjs` fails the build if the SVG
+// stops carrying the brand colours, and `scripts/verify-ico.mjs` fails it if the
+// rasterised file stops carrying them, so the trio cannot drift silently.
 const Mark = () => html`<svg width="17" height="17" viewBox="0 0 64 64" aria-hidden="true">
   <rect width="64" height="64" rx="15" fill="#0F0F12"></rect>
-  <path d="M23.5 17.5 L13.5 32 L23.5 46.5" fill="none" stroke="#E9E9EE" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round"></path>
-  <path d="M40.5 17.5 L50.5 32 L40.5 46.5" fill="none" stroke="#E9E9EE" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round"></path>
-  <circle cx="32" cy="32" r="5.5" fill="#7DD3C0"></circle>
+  <path d="M25 17 L19 17 L19 47 L25 47" fill="none" stroke="#E9E9EE" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round"></path>
+  <path d="M39 17 L45 17 L45 47 L39 47" fill="none" stroke="#E9E9EE" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round"></path>
+  <path d="M32 24 L32 40" fill="none" stroke="#7DD3C0" strokeWidth="5" strokeLinecap="round"></path>
 </svg>`;
 
 const Ico = ({ k, size }) => {
@@ -4494,6 +4500,44 @@ function App() {
     setAiStarting(false);
   }
 
+  /** Stop the companion, and stop claiming it is running.
+   *
+   * The switch in the bar used to clear `settings.aiEnabled` and nothing else,
+   * which stopped the health poll and dimmed the lamp while the process went on
+   * holding 7890. Two consequences, both reported as "the switch does not work":
+   * turning it back on appeared to succeed because the same process was still
+   * there, and a companion that had never been started could not be turned on at
+   * all, because nothing on that path ever called `startAI`.
+   *
+   * So this is the other half - it asks the server to end the process. The server
+   * confirms by asking the port rather than by trusting `taskkill`, so the status
+   * line reports what is true rather than what was requested.
+   */
+  async function stopAI() {
+    try {
+      const r = await post("/api/ai/stop");
+      setAiOnline(false);
+      setAiLabel("off");
+      setStatus(r && r.ok
+        ? (r.already ? "the companion was not running" : "the companion is stopped")
+        : (r && r.error) || "could not stop it");
+    } catch (e) {
+      setStatus("could not stop the companion: " + e.message);
+    }
+  }
+
+  /** The one place that turns the companion on or off.
+   *
+   * Both switches - the plug in the bar and the row in Settings - go through
+   * here, because they had the same defect: each wrote the flag and stopped
+   * there. See `stopAI` for what that looked like from the outside.
+   */
+  function setAiEnabled(on) {
+    setSettings((s) => { const n = { ...s, aiEnabled: on }; applySettings(n); return n; });
+    if (on) startAI(false);
+    else stopAI();
+  }
+
   /** Move a dragged tree entry into a folder. */
   async function dropInto(src, dstDir) {
     if (!src || !dstDir) return;
@@ -4634,6 +4678,30 @@ function App() {
     setCreating(kind);
   }
 
+  /** Give a file opened from the global picker a real workspace.
+   *
+   * The old browser build could remember `lastFile` without `lastRoot` (or an
+   * installer upgrade could preserve that half of localStorage). The file then
+   * opened, but the explorer stayed empty and `/api/git` was never asked, so the
+   * worktree chip was absent and drag/drop had no destination root. Ask git for
+   * the repository root first; for a non-repository file, use its containing
+   * folder. This is also what makes opening a file from another drive useful.
+   */
+  async function ensureWorkspaceForFile(path) {
+    if (root || !path) return;
+    const clean = String(path).replace(/\\/g, "/").replace(/\/+$/, "");
+    const cut = clean.lastIndexOf("/");
+    const parent = cut > 2 ? clean.slice(0, cut) : clean;
+    if (!parent) return;
+    let workspace = parent;
+    try {
+      const g = await post("/api/git", parent);
+      if (g && g.ok && g.root) workspace = g.root;
+    } catch (e) {}
+    setRoot(workspace);
+    await refreshTree(workspace);
+  }
+
   async function openFile(path, force) {
     // Same dialog, same reason: this is a question about losing work, and it
     // used to be the platform's dialog rather than this program's.
@@ -4659,6 +4727,7 @@ function App() {
         if (!yes) return;
       }
     }
+    await ensureWorkspaceForFile(path);
     const r = await post("/api/read", path);
     if (!r.ok) { setStatus("cannot open " + path); return; }
     setCurrent(path);
@@ -5220,7 +5289,13 @@ function App() {
 
   // ---- ai
   async function checkAI() {
-    if (!settings.aiEnabled) { setAiOnline(false); setAiLabel("off"); return; }
+    // The ref, not render state. `startAI` schedules two of these with a
+    // `setTimeout`, so the closure they carry was built in the render *before*
+    // the switch was flipped - and reading `settings.aiEnabled` there meant a
+    // companion that had just been turned on was polled by a function that still
+    // believed it was off, so the lamp never came on. Same trap as `aiOnlineRef`
+    // above, same fix.
+    if (!settingsRef.current.aiEnabled) { setAiOnline(false); setAiLabel("off"); return; }
     try {
       const ctl = new AbortController();
       const t = setTimeout(() => ctl.abort(), 1200);
@@ -5392,7 +5467,7 @@ function App() {
       aiOnline=${aiOnline} aiLabel=${aiLabel} running=${running} readMode=${readMode}
       treeFold=${treeFold} panelFold=${panelFold}
       onFoldTree=${() => setTreeFold((v) => !v)} onFoldPanel=${() => setPanelFold((v) => !v)}
-      onToggleAI=${() => setSettings((s) => { const n = { ...s, aiEnabled: !s.aiEnabled }; applySettings(n); return n; })}
+      onToggleAI=${() => setAiEnabled(!settings.aiEnabled)}
       onAction=${act} onPalette=${() => setPalette(true)} onSave=${save}
       onSettings=${() => setSettingsOpen(true)}
       onOpenFolder=${() => { setBrowserMode("folder"); setBrowserOpen(true); }}
@@ -5556,7 +5631,13 @@ function App() {
       }} />` : null}
     ${settingsOpen ? html`<${Settings} values=${settings} root=${root}
       aiOnline=${aiOnline} aiStarting=${aiStarting} onStartAI=${() => startAI(false)}
-      onChange=${(v) => setSettings((s) => { const n = { ...s, ...v }; applySettings(n); return n; })}
+      onChange=${(v) => {
+        // The companion switch in Settings is the same switch as the plug in the
+        // bar, so it takes the same path - otherwise one of the two would start
+        // the process and the other would only record an intention.
+        if (v.aiEnabled !== undefined) { setAiEnabled(v.aiEnabled); return; }
+        setSettings((s) => { const n = { ...s, ...v }; applySettings(n); return n; });
+      }}
       onClose=${() => setSettingsOpen(false)}
       onRoot=${() => { setSettingsOpen(false); setBrowserOpen(true); }} />` : null}
     ${ask ? (ask.kind === "prompt"

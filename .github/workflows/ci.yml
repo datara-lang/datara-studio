@@ -101,6 +101,13 @@ jobs:
       - name: Every build entry point runs the same steps in the same order
         run: node scripts/verify-build-order.mjs
 
+      # On a tag push this also checks the tag against the tree, which is the one
+      # place the release naming can be caught before it becomes a download whose
+      # name disagrees with the binary inside it. On a branch it says so and
+      # skips rather than reporting a pass it did not earn.
+      - name: The version is the same in all six places
+        run: node scripts/verify-version.mjs
+
       - name: Record what was built
         shell: bash
         run: |
@@ -131,6 +138,10 @@ jobs:
       #     error: failed to run custom build command for `datara-studio v0.3.0`
       #       resource path `../ui/studio.html` doesn't exist
       #
+      # `../ui/studio-core.html` is declared alongside it, so both variants have
+      # to exist here too - the core one is what `?core=1` serves, and without it
+      # an installed studio silently falls back to the full interface.
+      #
       # So the build inputs come first here too, in the same order the
       # `verify-build-order.mjs` step in the other job enforces.
       - uses: actions/setup-node@v4
@@ -155,6 +166,7 @@ jobs:
           node scripts/build-wasm.mjs
           node scripts/build-icons.mjs
           node scripts/build-ui.mjs
+          node scripts/build-ui.mjs --core
 
       - name: cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets

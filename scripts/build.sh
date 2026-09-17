@@ -140,6 +140,15 @@ if ! node scripts/verify-build-order.mjs; then
   echo "a build entry point is out of step"
   exit 1
 fi
+# `verify-version.mjs` is here for the release rather than for the build. The
+# installer is named from `tauri.conf.json` and the release asset is named from
+# the git tag; the server reports its version from `src/api.dtr`. Those were
+# 0.1.0, 0.3.0 and 0.3.0 at once, so a release could have shipped an application
+# that denied being the version on the file it came from.
+if ! node scripts/verify-version.mjs; then
+  echo "the version is not the same everywhere"
+  exit 1
+fi
 
 echo
 echo "== 10/11 Datara server ======================================="

@@ -388,16 +388,38 @@ pub fn tc_msvc_bin() -> Str {
     return ""
 }
 
-/// Put the MSVC linker in front of everything else on PATH, and set LIB and
-/// INCLUDE. Returns the `bin` directory, or "" when no MSVC was found.
+/// The `set` lines that put the MSVC linker in front of everything else on the
+/// child's PATH and give it `LIB` and `INCLUDE`. "" when no MSVC was found.
+///
+/// Returned as text for a child to run, and **not** staged with `env_set`.
+///
+/// ## Why this is text and not `env_set`
+///
+/// This function used to be `tc_prepend_msvc` and it staged
+/// `env_set("PATH", bin + ";" + env_get("PATH"))`. forgen 1.4.2 corrupts a
+/// run-time-built value on its way into `env_set`, so the child received a
+/// broken PATH - and a broken PATH is not a wrong answer, it is the end of the
+/// IDE: `git` stops resolving, so `/api/git` reports the shell's complaint as
+/// the repository root and the worktree chip disappears; `python` stops
+/// resolving, so the companion cannot start; `cmd.exe` stops resolving, so every
+/// `system("cmd.exe /d /c ...")` silently does nothing. Measured side by side:
+///
+///     env_set("T3", "MARK;")                    -> child saw "MARK;"
+///     env_set("T4", env_get("PATH"))            -> child saw 2656 bytes, intact
+///     env_set("T1", "MARK;" + env_get("PATH"))  -> the child did not run at all
+///
+/// So the concatenation is handed to `cmd`, which does it correctly. `tc_win` is
+/// still applied because `link.exe` and `cl.exe` read these variables as Windows
+/// paths; a forward-slash list would work for the compiler's own search but is
+/// not what the linker expects.
 ///
 /// Prepending rather than replacing is the point: `forgen` itself may live in
 /// `~/.cargo/bin` or be launched by absolute path, and the compiler needs its
 /// own helpers to stay reachable. Only `link.exe` has to win.
 ///
 /// `LIB` and `INCLUDE` are not optional extras, and discovering that was the
-/// second half of this bug. With only PATH set, the right `link.exe` ran and
-/// then died with:
+/// second half of the original bug. With only PATH set, the right `link.exe` ran
+/// and then died with:
 ///
 ///     LINK : fatal error LNK1181: cannot open input file
 ///     "legacy_stdio_definitions.lib"
@@ -408,37 +430,26 @@ pub fn tc_msvc_bin() -> Str {
 /// `kernel32.lib` - lives in a directory only `LIB` names. Setting PATH alone
 /// therefore moved the failure rather than fixing it, which is worth stating
 /// because the first symptom looks like success: the link step *starts*.
-///
-/// Idempotence comes for free here, and the mechanism is worth stating because
-/// it is not the obvious one.
-///
-/// `env_set` stages a value for the *next child process*; it does not change
-/// this process's own environment, and `env_get` never reads it back. Measured:
-///
-///     env_set("ZZ_PROBE", "hello")   -> env_get("ZZ_PROBE") == ""
-///     system("echo %ZZ_PROBE%")      -> "hello"
-///
-/// So `env_get("PATH")` returns the original PATH every time, and
-/// `bin + ";" + cur` therefore always produces exactly one copy of `bin`
-/// however often it is called. Measured: three consecutive calls leave the child
-/// with **one** `Hostx64` entry. No flag is needed, and none would help - there
-/// is nowhere to keep one, and a real read-back guard could not fire.
-///
-/// `LIB` and `INCLUDE` are set the same way and for the same reason: the linker
-/// reads them from its own environment, which `env_set` supplies. Setting them
-/// from here rather than expecting the user's shell to have them is the whole
-/// difference between a link that runs and one that dies with LNK1181.
-pub fn tc_prepend_msvc() -> Str {
+pub fn tc_env_lines() -> Str {
     let bin = tc_msvc_bin()
     if byte_len(bin) == 0 {
         return ""
     }
-    env_set("PATH", bin + ";" + env_get("PATH"))
-    tc_set_includes(bin)
-    return bin
+    // `%PATH%` here is expanded by the child's own `cmd`, which is the whole
+    // point: the concatenation has to happen somewhere that does it correctly.
+    // See `st_sh_with_env` - `env_set` corrupts a value this program built, and
+    // the corrupted PATH then makes `git`, `python` and `cmd.exe` unresolvable
+    // for every later child.
+    mut lines = "set \"PATH=" + tc_win(bin) + ";%PATH%\""
+    let rest = tc_include_lines(bin)
+    if byte_len(rest) > 0 {
+        lines = lines + "\r\n" + rest
+    }
+    return lines
 }
 
-/// Set `LIB` and `INCLUDE` for the toolset whose `bin` was just found.
+/// The `set` lines that give `LIB` and `INCLUDE` for the toolset whose `bin`
+/// was just found, ready to be written into a child's script.
 ///
 /// The toolset root is three levels up from `bin/Hostx64/x64`, so the include
 /// and lib directories are derived rather than searched for again. The Windows
@@ -449,11 +460,13 @@ pub fn tc_prepend_msvc() -> Str {
 /// Paths are written with backslashes and `;` separators because `link.exe` and
 /// `cl.exe` read these variables as Windows paths; a forward-slash list would
 /// work for the compiler's own search but is not what the linker expects.
-fn tc_set_includes( bin: Str) {
+///
+/// Returned as text rather than staged with `env_set` - see `tc_env_lines`.
+fn tc_include_lines( bin: Str) -> Str {
     // bin = <toolset>/bin/Hostx64/x64  ->  <toolset>
     let root = tc_ancestor(bin, 3)
     if byte_len(root) == 0 {
-        return
+        return ""
     }
     let msvc_inc = tc_win(st_join(root, "include"))
     let msvc_lib = tc_win(st_join(root, "lib/x64"))
@@ -471,8 +484,7 @@ fn tc_set_includes( bin: Str) {
             + k + "\\Lib\\" + sdk + "\\ucrt\\x64;"
             + k + "\\Lib\\" + sdk + "\\um\\x64"
     }
-    env_set("INCLUDE", inc)
-    env_set("LIB", lib)
+    return "set \"INCLUDE=" + inc + "\"\r\nset \"LIB=" + lib + "\""
 }
 
 /// The newest Windows SDK version directory, or "" when the SDK is not present.
@@ -534,7 +546,7 @@ fn tc_win( p: Str) -> Str {
 /// decides what it can do, and a probe that overrode it would be a second
 /// opinion nobody asked for.
 pub fn tc_linker_ok() -> Bool {
-    return byte_len(tc_prepend_msvc()) > 0
+    return byte_len(tc_env_lines()) > 0
 }
 
 /// The optimisation flags appended to a `forgen build`/`run` command line.
@@ -600,8 +612,34 @@ pub fn tc_opt_in( target: Str) -> Str {
 /// An absent toolchain is a fact about the machine; a shadowed linker is a fact
 /// about the environment. Saying which one it is turns "the build is slower than
 /// I expected" into a report someone can act on.
+///
+/// ## This is read-only, and that is the fix
+///
+/// It used to call `tc_prepend_msvc`, on the reasoning that "the linker is then
+/// in place before the first build arrives". That reasoning cost the whole IDE.
+///
+/// `tc_prepend_msvc` stages `env_set("PATH", bin + ";" + env_get("PATH"))`, and
+/// forgen 1.4.2 corrupts a run-time-built value on its way into `env_set` -
+/// measured: a 1500-character string built in a loop reached the child as one
+/// garbage byte. The staged PATH therefore arrives unusable, `cmd.exe` stops
+/// resolving by name, and from that moment **every** `system("cmd.exe /d /c ...")`
+/// in the studio does nothing at all while reporting no error. Measured on a
+/// running server: one `GET /api/health`, and the next `mkdir` answered
+/// "could not create the folder" with an empty detail and never touched the
+/// disk, for every call thereafter.
+///
+/// And `/api/health` is the most-called endpoint there is - the interface polls
+/// it and every launcher watchdog pings it every four seconds - so the poison
+/// arrived within seconds of the window opening. That is why the failures looked
+/// unrelated and unfixable: the tree would not accept a drag, the worktree chip
+/// was missing, the companion switch did nothing, and each of them was the same
+/// dead `system()`.
+///
+/// A *report* must never mutate the process it reports on. The prepend belongs
+/// on the build path, where it is needed and where a failure is visible as a
+/// link error - and it is still called there, in `st_run`.
 pub fn tc_linker_report() -> Str {
-    let bin = tc_prepend_msvc()
+    let bin = tc_msvc_bin()
     if byte_len(bin) == 0 {
         return "not installed"
     }

@@ -68,7 +68,10 @@ REM                       the geometry in scripts\mark.mjs changes: the window
 REM                       icon gets the new mark and the title bar keeps the old
 REM                       one, which is the exact drift scripts\mark.mjs exists to
 REM                       prevent.
-REM   build-ui.mjs     -> ui\studio.html, a bundled resource.
+REM   build-ui.mjs     -> ui\studio.html and, with --core, ui\studio-core.html.
+REM                       BOTH are declared resources in tauri.conf.json, and
+REM                       tauri-build fails the build if a declared resource is
+REM                       missing. --core is what `?core=1` serves.
 echo   building the self-contained interface ...
 node scripts\build-wasm.mjs
 if errorlevel 1 exit /b 1
@@ -76,11 +79,20 @@ node scripts\build-icons.mjs
 if errorlevel 1 exit /b 1
 node scripts\build-ui.mjs
 if errorlevel 1 exit /b 1
+node scripts\build-ui.mjs --core
+if errorlevel 1 exit /b 1
 
 if not exist "src-tauri\dist\index.html" (
   echo   src-tauri\dist\index.html is missing.
   exit /b 1
 )
+
+echo   building the Datara server resource ...
+REM The Tauri bundle copies src\main.exe as studio\src\main.exe. Rebuilding
+REM only the Rust shell leaves that resource stale, so an installer can report
+REM an older version and still contain the old filesystem commands.
+bash -lc "source scripts/msvc-env.sh >/dev/null && forgen build src/main.dtr"
+if errorlevel 1 exit /b 1
 
 echo   building the desktop shell ...
 REM bash -lc so the exported MSVC environment survives into cargo

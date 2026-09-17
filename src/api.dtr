@@ -59,7 +59,7 @@ use toolchain
 /// also means the linker is in place before the first build arrives.
 pub fn st_health( tc: Str) -> Str {
     let linker = tc_linker_report()
-    return "{\"ok\":true,\"service\":\"datara-studio\",\"version\":\"0.3.0\","
+    return "{\"ok\":true,\"service\":\"datara-studio\",\"version\":\"0.4.0\","
          + "\"toolchain\":\"" + st_json_escape(tc) + "\","
          + "\"linker\":\"" + st_json_escape(linker) + "\","
          + "\"llvm\":" + st_bool(byte_len(linker) > 0 && linker != "not installed") + ","
@@ -260,20 +260,23 @@ pub fn st_run( cmd: Str) -> Str {
     //
     // "" when there is no MSVC at all, which is a supported machine: the
     // compiler's own Cranelift backend needs no linker.
-    let linker = tc_prepend_msvc()
+    // The child's environment, not this process's - see `tc_env_lines` for why
+    // the linker is put in front of PATH inside the script rather than with
+    // `env_set`. `tc_linker_report` is read-only and is what the reply quotes.
+    let env = tc_env_lines()
+    let linker = tc_linker_report()
 
-    let capture = st_run_capture()
-    mut code = -1
-    unsafe(justification: "the IDE backend runs the compiler on the user's project") {
-        code = system("(" + cmd + ") > \"" + st_back_path(capture) + "\" 2>&1")
-    }
-
-    mut output = ""
-    unsafe(justification: "the IDE backend reads back what the compiler said") {
-        if file_exists(capture) {
-            output = file_read(capture)
-        }
-    }
+    // Through `st_sh`, not through `system` directly.
+    //
+    // `cmd` is built from the project path, so it is a run-time string, and
+    // SEAM-1 is precisely that those do not survive the trip into `system()`
+    // under AOT - so this used to hand the shell a mangled line and report
+    // `exit: -1` for a build that never ran. `st_sh` puts the command in a
+    // script and invokes it by a compile-time literal, which is the one path
+    // that works, and `st_last_code` reads back the real exit code the script
+    // recorded.
+    mut output = st_sh_with_env(env, cmd)
+    let code = st_last_code()
     // `st_display_shell`, not `st_from_oem`: forgen writes UTF-8 and cmd writes
     // cp866, and the capture file is byte-transparent so both arrive unmixed
     output = st_display_shell(st_strip_ansi(output))
@@ -435,6 +438,9 @@ pub fn st_check( path: Str, within: Str) -> Str {
 /// Built from a number rather than written out three times, so the marker a
 /// section is split on and the marker the shell echoes cannot drift apart.
 fn st_git_mark( n: Int) -> Str {
+    if n == 0 {
+        return "__DS_GIT_ROOT__"
+    }
     if n == 1 {
         return "__DS_GIT_BRANCH__"
     }
@@ -637,27 +643,65 @@ pub fn st_git( dir: Str) -> Str {
     }
 
     let q = st_back_path(d)
+    let m0 = st_git_mark(0)
     let m1 = st_git_mark(1)
     let m2 = st_git_mark(2)
     let m3 = st_git_mark(3)
-    let cmd = "git -C \"" + q + "\" rev-parse --abbrev-ref HEAD 2>&1"
-            + " && echo " + m1
-            + " && git -C \"" + q + "\" status --porcelain 2>&1"
-            + " && echo " + m2
-            + " && git -C \"" + q + "\" log --oneline -10 2>&1"
-            + " && echo " + m3
+
+    // Unconditional sequencing, spelled for each shell: `&` in cmd, `;` in sh.
+    //
+    // This was `&&`, and that was wrong twice over. A repository with no commits
+    // yet - `git init`, then open the folder, which is the first thing anyone
+    // does with a new project - cannot answer `rev-parse --abbrev-ref HEAD`,
+    // because HEAD points at a branch that does not exist. Under `&&` that one
+    // failure stopped the chain dead: no branch marker, no status, no log, and
+    // the whole workspace came back as "not a git repository". The chip was
+    // absent for the exact case the chip is most useful in.
+    //
+    // `&` and `;` both mean "run the next thing whatever happened", so every
+    // section now answers for itself and a partial repository reports the parts
+    // it does have.
+    mut sep = "&"
+    if !st_is_windows() {
+        sep = ";"
+    }
+
+    // The branch probe is `symbolic-ref` first because it reads HEAD directly
+    // and therefore answers in a repository with no commits; `rev-parse
+    // --abbrev-ref HEAD` is kept as the fallback for a detached HEAD, which is
+    // the one case `symbolic-ref` refuses.
+    let cmd = "git -C \"" + q + "\" rev-parse --show-toplevel 2>&1" + sep
+            + " echo " + m0 + sep
+            + " git -C \"" + q + "\" symbolic-ref --short HEAD 2>&1"
+            + " || git -C \"" + q + "\" rev-parse --short HEAD 2>&1" + sep
+            + " echo " + m1 + sep
+            + " git -C \"" + q + "\" status --porcelain 2>&1" + sep
+            + " echo " + m2 + sep
+            + " git -C \"" + q + "\" log --oneline -10 2>&1" + sep
+            + " echo " + m3
     let raw = st_display_shell(st_sh(cmd))
 
-    let branch = st_git_section(raw, "", m1)
-    // `&&` means a failure stops the chain, so no marker at all is the same
-    // answer as a `fatal:` line: this folder is not a repository
-    if byte_len(branch) == 0 || st_has_infix(branch, "fatal:") {
+    // Whether this is a repository is decided by the root probe, not by the
+    // branch - the branch can be legitimately absent and that is not an error.
+    let repo = st_git_section(raw, "", m0)
+    if byte_len(repo) == 0 || st_has_infix(repo, "fatal:") {
         return "{\"ok\":false,\"error\":\"not a git repository\",\"branch\":\"\"}"
     }
+    mut branch = st_git_section(raw, m0, m1)
+    if st_has_infix(branch, "fatal:") {
+        branch = ""
+    }
     let status = st_git_section(raw, m1, m2)
-    let log = st_git_section(raw, m2, m3)
+    mut log = st_git_section(raw, m2, m3)
+    // A repository with no commits makes `git log` fail instead of printing
+    // nothing. Left alone, `st_git_log_json` would read the first word of the
+    // complaint as a commit shorthand and draw a commit that never happened.
+    if st_has_infix(log, "fatal:") {
+        log = ""
+    }
 
-    return "{\"ok\":true,\"branch\":\"" + st_json_escape(branch) + "\""
+    return "{\"ok\":true,\"root\":\"" + st_json_escape(repo) + "\""
+         + ",\"branch\":\"" + st_json_escape(branch) + "\""
          + ",\"dirty\":" + int_to_str(st_git_line_count(status))
          + ",\"files\":" + st_git_files_json(status)
          + ",\"log\":" + st_git_log_json(log) + "}"
@@ -717,9 +761,9 @@ pub fn st_delete( kind: Str, path: Str) -> Str {
     mut res = ""
     if st_is_windows() {
         if is_dir {
-            res = st_sh("(rd /s /q \"" + st_back_path(target) + "\") 2>&1")
+            res = st_sh("rd /s /q \"" + st_back_path(target) + "\" 2>&1")
         } else {
-            res = st_sh("(del /f /q \"" + st_back_path(target) + "\") 2>&1")
+            res = st_sh("del /f /q \"" + st_back_path(target) + "\" 2>&1")
         }
     } else {
         if is_dir {
@@ -802,20 +846,125 @@ pub fn st_ai_start( dir: Str) -> Str {
         return "{\"ok\":true,\"already\":true,\"dir\":\"" + st_json_escape(where_) + "\"}"
     }
 
-    mut res = ""
-    if st_is_windows() {
-        // `-E -s`: see the note above - the companion must not inherit this
-        // process's Python configuration.
-        let inner = "cmd /c cd /d \"" + st_back_path(where_)
-                  + "\" && python -E -s python\\forgen_ai\\ide_daemon.py --port 7890"
-        unsafe(justification: "the IDE starts its own optional companion process") {
-            res = exec("wscript //nologo //B \"scripts\\hidden.vbs\" \"" + inner + "\"")
-        }
-    } else {
-        let inner = "cd \"" + where_ + "\" && (python3 -E -s python/forgen_ai/ide_daemon.py --port 7890 >/dev/null 2>&1 & )"
-        unsafe(justification: "the IDE starts its own optional companion process") {
-            res = exec(inner)
-        }
+    // The launch is detached, so its output goes nowhere this program can read -
+    // which means a failure has to be predicted rather than reported. `python`
+    // has to be resolvable by the same shell that will run it, and the IDE is
+    // often started from a desktop icon whose PATH is not a developer's.
+    //
+    // No `2>&1` here on purpose. `python --version` writes to **stderr**, and
+    // `st_sh` appends its own redirection at the end of the line - so a `2>&1`
+    // written first duplicates stderr onto the *console* and the capture comes
+    // back empty, which reads exactly like "python is not installed". That cost a
+    // round of this fix; the version text has to be redirected by `st_sh`, not by
+    // the command.
+    if byte_len(str_trim(st_sh("python --version"))) == 0 {
+        return "{\"ok\":false,\"error\":\"python is not on PATH, so the companion cannot start\"}"
     }
-    return "{\"ok\":true,\"started\":true,\"dir\":\"" + st_json_escape(where_) + "\"}"
+
+    mut launch = ""
+    if st_is_windows() {
+        // `-E -s`: the companion must not inherit this process's Python
+        // configuration.
+        //
+        // **No nested quotes, and no `system`.** Both were defects here.
+        //
+        // The nested quotes: `st_sh` already runs everything through
+        // `cmd.exe /d /c "<command>"`, and cmd strips the outermost pair of
+        // quotes before parsing - so a second `"cmd /c ..."` inside the first is
+        // not a nested command, it is a token that ends early, and the `&&` after
+        // it becomes a separator *of the outer shell*. Measured: the payload ran
+        // as `python ...` in the studio's own directory, `python` reported
+        // "can't open file 'D:\IDE datara\datara-studio\python\...'", and the
+        // endpoint went on answering `started: true`.
+        //
+        // The `system`: this line is built from `where_`, so it is a string made
+        // at run time - and SEAM-1 (see `st_sh`) is that forgen 1.4.2 corrupts
+        // exactly those on their way into `system()` under AOT. The launch went
+        // out mangled for the same reason `move` and `mkdir` did. Going through
+        // `st_sh` puts it in the script file with everything else, which is the
+        // one path that survives.
+        //
+        // `cd /d` sets the directory and `start "" /b` runs the daemon without a
+        // window. `/b` is what replaces `scripts/hidden.vbs` here - it means "no
+        // new window", which is the only thing the VBScript wrapper was ever for,
+        // and it does it without needing to pass a quoted command line to a
+        // second program.
+        launch = "cd /d \"" + st_back_path(where_)
+               + "\" && start \"\" /b python -E -s python\\forgen_ai\\ide_daemon.py --port 7890"
+    } else {
+        // `st_sh` already goes through /bin/sh here, so a backgrounded subshell
+        // is enough and there is nothing to strip.
+        launch = "cd \"" + where_
+               + "\" && (python3 -E -s python/forgen_ai/ide_daemon.py --port 7890 >/dev/null 2>&1 & )"
+    }
+    // Not `st_sh`: this child outlives the request, and `st_sh` redirects into
+    // the one capture file every other shell feature reads. See `st_ai_launch`.
+    let launch_exit = st_ai_launch(launch)
+    // Report what happened rather than what was asked for. The launch is detached
+    // and returns at once, so `started: true` used to be true of a companion that
+    // had already died - and the interface shows an unlit lamp either way, so
+    // nothing ever said so.
+    //
+    // There is no sleep builtin, so the wait is the probing: each `st_port_busy`
+    // is a `netstat` launch (about 220 ms measured), and thirty of them is
+    // roughly six and a half seconds.
+    //
+    // It was twelve, which is about two and a half seconds, and that was
+    // measurably too short: the daemon imports, scans its corpus and only then
+    // binds, and on this machine the bind lands somewhere between two and a half
+    // and four seconds. The endpoint therefore reported "the companion did not
+    // come up on 7890" *while the companion was coming up*, and the next call
+    // found the port busy - the switch looked broken for the one reason a switch
+    // should never look broken, which is that it was right too early.
+    mut tries = 0
+    while tries < 30 {
+        if st_port_busy(7890) {
+            return "{\"ok\":true,\"started\":true,\"dir\":\"" + st_json_escape(where_) + "\"}"
+        }
+        tries = tries + 1
+    }
+    return "{\"ok\":false,\"error\":\"the companion did not come up on 7890\""
+         + ",\"dir\":\"" + st_json_escape(where_) + "\""
+         + ",\"launch_exit\":" + int_to_str(launch_exit) + "}"
+}
+
+/// Stop the companion.
+///
+/// Its absence is why the switch in the bar did nothing. The interface could
+/// clear the *flag*, which stopped the poll and dimmed the lamp, but the process
+/// went on running and went on holding 7890 - so the next "turn it on" looked like
+/// it worked only because the same process was still there. And when it had never
+/// been started, turning it on did nothing at all, because nothing on that path
+/// ever called `st_ai_start`. A switch that only changes a checkbox is not a
+/// switch.
+///
+/// The kill is confirmed by asking the port again rather than by reading
+/// `taskkill`'s message, which is localised - the rule the rest of this file
+/// already follows for shell output.
+///
+/// `pkill -f ide_daemon.py` is the Unix fallback for a machine with neither lsof
+/// nor a usable /proc. It is broader than the port lookup - it would also stop a
+/// daemon someone started by hand for another project - which is why it is second
+/// and not first.
+pub fn st_ai_stop() -> Str {
+    if !st_port_busy(7890) {
+        return "{\"ok\":true,\"already\":true}"
+    }
+    let pid = st_pid_on_port(7890)
+    mut detail = ""
+    if st_is_windows() {
+        if byte_len(pid) == 0 {
+            return "{\"ok\":false,\"error\":\"nothing could be found listening on 7890\"}"
+        }
+        detail = st_sh("taskkill /f /pid " + pid + " 2>&1")
+    } else {
+        detail = st_sh("( lsof -nP -iTCP:7890 -sTCP:LISTEN -t 2>/dev/null | xargs -r kill )"
+                     + " || ( command -v pkill >/dev/null 2>&1 && pkill -f ide_daemon.py )")
+    }
+    if st_port_busy(7890) {
+        return "{\"ok\":false,\"error\":\"the companion is still listening on 7890\""
+             + ",\"pid\":\"" + st_json_escape(pid) + "\""
+             + ",\"detail\":\"" + st_json_escape(st_display_shell(detail)) + "\"}"
+    }
+    return "{\"ok\":true,\"stopped\":true,\"pid\":\"" + st_json_escape(pid) + "\"}"
 }

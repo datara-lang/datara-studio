@@ -3,7 +3,7 @@
 // The point is that "the build said OK" is not evidence the file is right. This
 // parses the real bytes on disk: the directory, the declared sizes, and whether
 // each payload is a PNG with a sane IHDR. It also decodes a couple of entries
-// far enough to confirm the mint dot is present and the old yellow palm is not -
+// far enough to confirm the mint caret is present and the old yellow palm is not -
 // the two failure modes this icon has actually had.
 import { readFileSync } from "node:fs";
 import { inflateSync } from "node:zlib";
@@ -81,7 +81,7 @@ for (const [c, n] of top) {
   const [r, g, b2] = c.split(",").map(Number);
   const hex = "#" + [r, g, b2].map((v) => v.toString(16).padStart(2, "0")).join("");
   let what = "";
-  if (hex === "#7dd3c0") what = "<- the mint node";
+  if (hex === "#7dd3c0") what = "<- the mint caret";
   else if (hex === "#e9e9ee") what = "<- the bracket ink";
   else if (hex === "#0f0f12") what = "<- the plate";
   else if (r > 150 && g > 140 && b2 < 120) what = "<- YELLOW, the old palm?";
@@ -108,7 +108,7 @@ for (const e of entries) {
 const has = (hex) => counts.has(
   hex.slice(1).match(/../g).map((h) => parseInt(h, 16)).join(",")
 );
-if (!has("#7dd3c0")) problems.push("the mint node is missing");
+if (!has("#7dd3c0")) problems.push("the mint caret is missing");
 if (!has("#e9e9ee")) problems.push("the bracket ink is missing");
 if (!has("#0f0f12")) problems.push("the plate is missing");
 for (const [c] of counts) {
@@ -122,4 +122,4 @@ if (problems.length) {
   process.exit(1);
 }
 console.log(`\n  ${entries.length} sizes, all square RGBA PNGs, all in bounds.`);
-console.log("  the mark is the bracket pair and the mint node; no yellow.");
+console.log("  the mark is the bracket pair and the mint caret; no yellow.");

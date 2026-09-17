@@ -51,6 +51,14 @@ if not exist "ui\studio.html" (
     pause
     exit /b 1
   )
+  REM Both variants: tauri.conf.json declares ui\studio-core.html as a bundled
+  REM resource as well, and tauri-build fails if a declared resource is absent.
+  node scripts\build-ui.mjs --core
+  if errorlevel 1 (
+    echo   Could not build the core interface. Run: node scripts\build-ui.mjs --core
+    pause
+    exit /b 1
+  )
 )
 
 start "" "%EXE%"

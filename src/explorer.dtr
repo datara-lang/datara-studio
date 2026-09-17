@@ -70,18 +70,312 @@ pub fn st_ok_mark() -> Str {
     return "__DS_OK__"
 }
 
+/// Where the shell script and its capture live.
+///
+/// A temporary directory rather than the workspace: a failed move must not leave
+/// a script in the project a person is trying to clean up.
+///
+/// On Windows `TEMP` is the name the platform sets, and it is the only one of the
+/// three candidates the runtime reports on this machine (measured: `TEMP`,
+/// `TMPDIR` and `TMP` all answer `C:\Temp` here). `TMP` is deliberately not
+/// consulted as a second choice: the script is invoked by a constant string and
+/// the two have to agree, so this function and `st_sh` both ask `TEMP` and both
+/// fall back to the same literal. On Unix the answer is `/tmp`, for the same
+/// reason - the literal in `st_sh` says `/tmp` and there is no expanding `%TEMP%`
+/// there to keep them in step.
+fn st_shell_temp() -> Str {
+    if !st_is_windows() {
+        return "/tmp"
+    }
+    let t = str_trim(env_get("TEMP"))
+    if byte_len(t) == 0 {
+        return "C:/Temp"
+    }
+    return t
+}
+
+/// The fixed capture file for shell output. The server is single-threaded, so one
+/// file is enough and avoids a second process just to invent a random name.
+pub fn st_shell_capture() -> Str {
+    return st_join(st_shell_temp(), "datara-studio-shell.log")
+}
+
+/// Where the shell script records the exit code of the command it ran.
+///
+/// Separate from the output file on purpose: output and status are different
+/// facts and a caller that wants one should not have to parse the other.
+/// `st_sh` writes it as a side effect of every call and ignores it; `st_run`
+/// reads it, because the compiler's real exit code is the thing it reports.
+pub fn st_code_capture() -> Str {
+    return st_join(st_shell_temp(), "datara-studio-code.log")
+}
+
+/// The exit code of the most recent `st_sh` command, or -1 if it is unknown.
+///
+/// -1 rather than 0 for "unknown", because 0 means success and a missing file
+/// must never be read as one.
+pub fn st_last_code() -> Int {
+    mut v = ""
+    unsafe(justification: "the explorer reads the exit code its own shell script recorded") {
+        if file_exists(st_code_capture()) {
+            v = str_trim(file_read(st_code_capture()))
+        }
+    }
+    if byte_len(v) == 0 {
+        return -1
+    }
+    return str_to_int(v)
+}
+
+/// The script the command is written into. See `st_sh` - this is SEAM-1.
+fn st_shell_script() -> Str {
+    if st_is_windows() {
+        return st_join(st_shell_temp(), "datara-studio-shell.bat")
+    }
+    return st_join(st_shell_temp(), "datara-studio-shell.sh")
+}
+
 /// Run a command through the platform shell and return stdout and stderr
 /// together.
 ///
-/// Only three callers are left: `st_mkdir`, `st_move` and `st_find`. Everything
-/// that only needed to *look* at the filesystem now calls a builtin instead.
-pub fn st_sh( cmd: Str) -> Str {
-    // not named `out`: it is a reserved word in Datara
+/// ## SEAM-1 - the command travels as a file, not as an argument
+///
+/// **forgen 1.4.2 corrupts any string built at run time on its way into
+/// `system()`, `exec()` and `process_output()`, and it does so under AOT only.**
+/// Measured with an identical 57-byte string: `forgen run` (JIT) executes it and
+/// returns 0, while the built binary hands cmd a mangled line and cmd answers
+/// `"7" is not an internal or external command`. A literal is unaffected, and so
+/// is a concatenation the compiler can fold; anything that reads a variable is
+/// not. Four shapes were probed - inline, into a `let`, through a helper, and via
+/// `str_join` - and all four failed, with `system()` returning a pointer
+/// (`3022831024624`) where the exit code belongs.
+///
+/// That is the whole of "перетаскивать в папку не получается" and "ворктрее не
+/// вижу". `move`, `mkdir`, `del`, `git` and the project search all funnel through
+/// this one function, so in the shipped server every one of them silently did
+/// nothing while the endpoint reported success. It is also why the earlier
+/// `exec` -> `system` change did not help: both primitives have the defect, and
+/// the old comment blaming `exec` was describing the symptom, not the cause.
+///
+/// The way round it is to stop passing the command *as an argument*. It is
+/// written into a script, and the script is invoked by a **compile-time literal**
+/// - the one thing this AOT path passes through intact. `%TEMP%` is expanded by
+/// cmd itself, so the literal stays constant while the directory is still
+/// whatever the machine actually uses. Output comes back through a file, which is
+/// what the callers already expected, and a script also removes the nested-quote
+/// hazard: nothing here has to survive being re-parsed by a second shell.
+///
+/// Do not "tidy" this back into one `system("cmd /c " + command)`. It compiles,
+/// it passes every structure test, and it does nothing.
+///
+/// One seam on purpose. When forgen stops corrupting the argument, the body of
+/// this function is the only thing that has to change.
+pub fn st_sh( command: Str) -> Str {
+    return st_sh_with_env("", command)
+}
+
+/// `st_sh` with a preamble of `set` lines, for the one caller that has to hand
+/// the child an environment.
+///
+/// ## Why the environment is set in the child and not with `env_set`
+///
+/// Because `env_set` cannot take a value this program built.
+///
+/// `tc_prepend_msvc` used to stage `env_set("PATH", bin + ";" + env_get("PATH"))`
+/// - a concatenation - and forgen 1.4.2 corrupts a run-time-built value on its
+/// way into `env_set`. Measured, with three shapes side by side:
+///
+///     env_set("T3", "MARK;")              -> child saw  "MARK;"
+///     env_set("T4", env_get("PATH"))      -> child saw  2656 bytes, intact
+///     env_set("T1", "MARK;" + env_get("PATH"))  -> the child did not run at all
+///
+/// and a 1500-character string built in a loop reached the child as one garbage
+/// byte. The consequence was not a wrong PATH, it was an unusable one: `git`,
+/// `python` and `cmd.exe` all stopped resolving, so the tree could not be read,
+/// the worktree chip disappeared and every shell-driven feature answered with
+/// the shell's own complaint pasted into a field that expected a path. That is
+/// the screenshot: EXPLORER reading "cannot read that folder - not a folder:
+/// \"git\" is not recognized as an internal or external command".
+///
+/// `cmd` does the concatenation correctly, so the concatenation is moved into
+/// `cmd`. The preamble is written into the script file, which is the one route
+/// that carries a run-time string intact - the same route SEAM-1 uses.
+///
+/// The asymmetry in the `%` handling below is deliberate. The preamble is
+/// written by this program and *needs* `%PATH%` to expand, so it is passed
+/// through untouched. The command carries paths that came from the user, so a
+/// literal `%` in one of them is doubled and stays literal.
+pub fn st_sh_with_env( env: Str, command: Str) -> Str {
+    let capture = st_shell_capture()
+    let script = st_shell_script()
+    // Empty the capture before the command runs, so that a failure to write it
+    // reads as "no output" instead of as the previous command's answer.
+    //
+    // This is defence, not decoration. A long-lived child that inherits the
+    // capture as its stdout keeps the file open, and a redirect that cannot be
+    // written leaves the old contents in place - which is how `mkdir` once
+    // reported the companion's startup banner as its own error message. The
+    // launch no longer shares this file (`st_ai_launch`), and this line is what
+    // stops the next such mistake from being silent.
+    unsafe(justification: "the explorer clears its own capture file before the shell writes it") {
+        file_write(capture, "")
+    }
+    unsafe(justification: "the explorer writes the shell command it is about to run") {
+        if st_is_windows() {
+            // A batch file expands `%`, so a folder genuinely named `100% done`
+            // would lose its tail on the way through - and the path comes from
+            // the user, not from here. Doubling the sign is how batch spells a
+            // literal percent. This is the price of the script-file route and it
+            // is paid in one place.
+            //
+            // The exit code is recorded on its own line rather than inside the
+            // parenthesised group. Batch expands `%VAR%` when it *reads* a line,
+            // and a line inside `( ... )` is read as part of the whole group -
+            // so `%ERRORLEVEL%` written inside the parens would be the value
+            // from before the command ran. On its own line it is read after, and
+            // it is the code the command actually returned. `st_last_code` reads
+            // it; `st_sh` itself ignores it.
+            file_write(script, "@echo off\r\n" + env + "\r\n("
+                             + str_replace(command, "%", "%%") + ") > \""
+                             + st_back_path(capture) + "\" 2>&1\r\n"
+                             + "echo %ERRORLEVEL% > \""
+                             + st_back_path(st_code_capture()) + "\"\r\n")
+        } else {
+            file_write(script, "#!/bin/sh\n" + env + "\n(" + command + ") > \""
+                             + capture + "\" 2>&1\n"
+                             + "echo $? > \"" + st_code_capture() + "\"\n")
+        }
+    }
+    if st_is_windows() {
+        // **The shell is named by absolute path, and that is a fix, not a
+        // precaution.**
+        //
+        // The studio edits its own PATH: `tc_prepend_msvc` stages
+        // `env_set("PATH", bin + ";" + env_get("PATH"))`. forgen 1.4.2 corrupts
+        // a run-time-built value on its way into `env_set` - measured: a
+        // 1500-character string built in a loop arrived at the child as a single
+        // garbage byte - so the child's PATH comes out unusable and `cmd.exe`
+        // cannot be resolved by name. Measured directly: with that prepend
+        // staged, a child answers
+        //
+        //     "cmd.exe" is not recognized as an internal or external command
+        //
+        // and every `system("cmd.exe /d /c ...")` in this file silently does
+        // nothing at all - the script is written, the folder is never created,
+        // the capture stays empty. That single fact is why the tree could not be
+        // dragged into, why the worktree chip was missing and why the companion
+        // switch looked dead, all at once and only after `/api/health` had been
+        // called once.
+        //
+        // The bridge must not be breakable by the environment this program
+        // itself writes, so the shell is named absolutely. Each invocation
+        // below is still a compile-time literal, so SEAM-1 holds; only the
+        // choice between them is made at run time.
+        let has_temp = byte_len(str_trim(env_get("TEMP"))) > 0
+        let abs_cmd = st_file_exists("C:/Windows/System32/cmd.exe")
+        unsafe(justification: "the explorer runs its own shell script") {
+            if abs_cmd {
+                if has_temp {
+                    system("C:\\Windows\\System32\\cmd.exe /d /c \"%TEMP%\\datara-studio-shell.bat\"")
+                } else {
+                    system("C:\\Windows\\System32\\cmd.exe /d /c \"C:\\Temp\\datara-studio-shell.bat\"")
+                }
+            } else {
+                if has_temp {
+                    system("cmd.exe /d /c \"%TEMP%\\datara-studio-shell.bat\"")
+                } else {
+                    system("cmd.exe /d /c \"C:\\Temp\\datara-studio-shell.bat\"")
+                }
+            }
+        }
+    } else {
+        unsafe(justification: "the explorer runs its own shell script") {
+            system("sh /tmp/datara-studio-shell.sh")
+        }
+    }
     mut res = ""
-    unsafe(justification: "the shell is needed for mkdir, move, delete and content search, which have no builtin") {
-        res = exec(cmd)
+    unsafe(justification: "the explorer reads the shell result from its temporary capture") {
+        if file_exists(capture) {
+            res = file_read(capture)
+        }
     }
     return res
+}
+
+/// The script the companion launch is written into.
+///
+/// A separate file from `st_shell_script`, and that separation is the whole
+/// point - see `st_ai_launch`.
+fn st_ai_script() -> Str {
+    if st_is_windows() {
+        return st_join(st_shell_temp(), "datara-studio-ai.bat")
+    }
+    return st_join(st_shell_temp(), "datara-studio-ai.sh")
+}
+
+/// Start a detached process with **nothing redirected**.
+///
+/// ## Why this is not `st_sh`
+///
+/// It was, for exactly one build, and the regression is worth recording because
+/// it is the kind that looks like five unrelated bugs.
+///
+/// `st_sh` wraps its command as `( ... ) > capture 2>&1`, and `start "" /b`
+/// gives the child the *current* standard handles. So the daemon inherited the
+/// capture file as its stdout and went on holding it for the rest of its life -
+/// which, for a detached daemon, is until the machine restarts. From that moment
+/// every shell feature in the IDE was broken, and each one failed differently:
+/// `st_port_busy` read the daemon's startup banner instead of netstat's output
+/// and therefore reported "nothing is listening on 7890" while the companion was
+/// plainly listening on 7890; `mkdir` answered "could not create the folder"
+/// with the daemon's banner as its detail; `git` answered "not a git
+/// repository". One long-lived child had taken the single file the entire shell
+/// bridge reads through.
+///
+/// So the launch gets its own script and **no redirection at all**. The child
+/// inherits the server's own console, which costs nothing, and the shared
+/// capture stays the property of commands that finish.
+///
+/// The invocation is still a compile-time literal, so SEAM-1 still applies: the
+/// command is written to a file rather than passed as an argument.
+pub fn st_ai_launch( command: Str) -> Int {
+    let script = st_ai_script()
+    unsafe(justification: "the IDE writes the script that starts its own optional companion") {
+        if st_is_windows() {
+            file_write(script, "@echo off\r\n" + str_replace(command, "%", "%%") + "\r\n")
+        } else {
+            file_write(script, "#!/bin/sh\n" + command + "\n")
+        }
+    }
+    mut code = -1
+    if st_is_windows() {
+        // Named absolutely for the same measured reason `st_sh` is - see the
+        // long note there. This one matters twice over, because the companion
+        // launch is the first thing the interface does on load, so it is also
+        // the first thing that would fail.
+        let has_temp = byte_len(str_trim(env_get("TEMP"))) > 0
+        let abs_cmd = st_file_exists("C:/Windows/System32/cmd.exe")
+        unsafe(justification: "the IDE starts its own optional companion process") {
+            if abs_cmd {
+                if has_temp {
+                    code = system("C:\\Windows\\System32\\cmd.exe /d /c \"%TEMP%\\datara-studio-ai.bat\"")
+                } else {
+                    code = system("C:\\Windows\\System32\\cmd.exe /d /c \"C:\\Temp\\datara-studio-ai.bat\"")
+                }
+            } else {
+                if has_temp {
+                    code = system("cmd.exe /d /c \"%TEMP%\\datara-studio-ai.bat\"")
+                } else {
+                    code = system("cmd.exe /d /c \"C:\\Temp\\datara-studio-ai.bat\"")
+                }
+            }
+        }
+    } else {
+        unsafe(justification: "the IDE starts its own optional companion process") {
+            code = system("sh /tmp/datara-studio-ai.sh")
+        }
+    }
+    return code
 }
 
 /// Is something already *listening* on a loopback port?
@@ -198,6 +492,87 @@ pub fn st_port_busy( port: Int) -> Bool {
         }
     }
     return false
+}
+
+/// The last whitespace-separated field of a line.
+///
+/// `str_split` on a single space produces an empty string for every run of
+/// spaces, and `netstat` pads its columns, so the fields have to be filtered
+/// rather than indexed. Taking the last non-empty one is what makes this
+/// independent of the column widths.
+fn st_last_field( line: Str) -> Str {
+    let parts = str_split(str_trim(line), " ")
+    let n = parts.len()
+    mut last = ""
+    mut i = 0
+    while i < n {
+        let p = str_trim(parts[i])
+        if byte_len(p) > 0 {
+            last = p
+        }
+        i = i + 1
+    }
+    return last
+}
+
+/// The process id of whatever is LISTENING on a loopback port, or `""`.
+///
+/// Needed because the companion is started detached - by `wscript` on Windows and
+/// by a backgrounded subshell elsewhere - so there is no child handle to wait on
+/// and no pid file to read. The port is the only thing this program knows about
+/// it, and `netstat -ano` is the only place the owner is written down. It is the
+/// same command `st_port_busy` already runs, for the same reason.
+///
+/// The pid is the last field of the row, not a fixed column: the local and remote
+/// address fields are padded to widths that depend on the address family, so
+/// counting characters lands in the wrong place as soon as an IPv6 row appears.
+///
+/// The `LISTENING` test is the same one `st_port_busy` makes and for the same
+/// reason - a `TIME_WAIT` row for the port outlives its owner by two minutes, and
+/// killing the pid on one of those would kill an unrelated process that has since
+/// been handed the number.
+pub fn st_pid_on_port( port: Int) -> Str {
+    let p = int_to_str(port)
+    if !st_is_windows() {
+        // `-t` is "terse": one pid per line, nothing else. That is the whole
+        // point of asking lsof rather than parsing its table.
+        let out = st_sh("lsof -nP -iTCP:" + p + " -sTCP:LISTEN -t 2>/dev/null")
+        let lines = str_split(out, "\n")
+        let n = lines.len()
+        mut i = 0
+        while i < n {
+            let t = str_trim(lines[i])
+            i = i + 1
+            if byte_len(t) > 0 {
+                return t
+            }
+        }
+        return ""
+    }
+    let out = st_sh("netstat -ano")
+    let needle = ":" + p + " "
+    mut rest = out
+    mut nl = 0
+    while byte_len(rest) > 0 {
+        nl = str_index_of(rest, "\n")
+        mut line = ""
+        if nl < 0 {
+            line = rest
+        } else {
+            line = str_substring(rest, 0, nl)
+        }
+        if str_index_of(line, needle) >= 0 {
+            if str_index_of(line, "LISTENING") >= 0 {
+                return st_last_field(line)
+            }
+        }
+        if nl < 0 {
+            rest = ""
+        } else {
+            rest = str_substring(rest, nl + 1, byte_len(rest) - nl - 1)
+        }
+    }
+    return ""
 }
 
 // --------------------------------------------------------------- cp1251 -> UTF-8
@@ -1070,7 +1445,9 @@ fn st_mkdir_do( target: Str, shown: Str) -> Str {
 
     mut res = ""
     if st_is_windows() {
-        res = st_sh("(mkdir \"" + st_back_path(target) + "\") 2>&1")
+        // `mkdir` is a cmd builtin on Windows, not a process that `exec` can
+        // start by name. Call cmd.exe explicitly, just like move and delete.
+        res = st_sh("mkdir \"" + st_back_path(target) + "\" 2>&1")
     } else {
         res = st_sh("(mkdir -p \"" + target + "\") 2>&1")
     }
@@ -1130,7 +1507,10 @@ pub fn st_move( src_path: Str, dst_path: Str) -> Str {
     }
 
     // `move` is one of the three commands that reject forward slashes
-    let res = st_sh("(move \"" + st_back_path(a) + "\" \"" + st_back_path(b) + "\") 2>&1")
+    // `move` is a cmd builtin, not an executable. `exec` starts a process
+    // directly on Windows, so the bare command silently leaves the source in
+    // place. Invoke cmd.exe explicitly and keep both paths quoted.
+    let res = st_sh("move \"" + st_back_path(a) + "\" \"" + st_back_path(b) + "\" 2>&1")
 
     // confirmed by looking, not by reading the shell's message
     if st_file_exists(b) || st_dir_exists(b) {
@@ -1234,9 +1614,12 @@ pub fn st_find( root: Str, query: Str, whole: Bool) -> Str {
 
     mut listing = ""
     if st_is_windows() {
-        listing = st_sh("(cd /d \"" + st_back_path(base_dir) + "\" && echo " + st_ok_mark()
+        // `cd` and the `&&` chain are cmd syntax. `exec` does not invoke a
+        // command shell implicitly, so use cmd.exe explicitly just as the
+        // filesystem move/mkdir paths do.
+        listing = st_sh("cd /d \"" + st_back_path(base_dir) + "\" && echo " + st_ok_mark()
                         + " && cd && findstr /s /n /i /c:\"" + q + "\" " + st_search_masks()
-                        + ") 2>&1")
+                        + " 2>&1")
     } else {
         listing = st_sh("(cd \"" + base_dir + "\" && echo " + st_ok_mark()
                         + " && pwd && grep -rn -i --include=\"*.dtr\" --include=\"*.md\""

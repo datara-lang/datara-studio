@@ -1,59 +1,21 @@
-// A taskbar-context preview: the icon at the sizes Windows actually uses, at
-// 1x and at a magnified scale, on both surfaces, with the old drawing beside it
-// for comparison.
+// A taskbar-context preview: the mark at the sizes Windows actually uses, on a
+// strip the height of a taskbar, light and dark, plus the two smallest entries
+// magnified so they can be judged rather than squinted at.
 //
-// The user's complaint was "the logo is very blurry and bad, you can't see it"
-// about the taskbar. Reviewing a 256px PNG would never have caught that, and
-// neither would the contact sheet on its own - so this draws the thing in the
-// context it failed in: a strip the height of a taskbar, light and dark.
+// Why this exists. The complaint that produced it was "the logo is very blurry
+// and bad, you can't see it" about the taskbar. Reviewing a 256px PNG would
+// never have caught that, and neither would the contact sheet on its own - so
+// this draws the thing in the context it failed in.
+//
+// It used to also render the *old* drawing beside the new one, to make the fix
+// legible. That comparison is history now, and keeping it meant keeping a second
+// copy of the geometry here - which is the exact defect `scripts/mark.mjs` was
+// created to remove. There is one renderer and this file calls it.
+//
+// Run:  node scripts/taskbar-sheet.mjs [out.png]
 import { writeFileSync } from "node:fs";
-import { encodePng, renderMark, layoutFor, SMALL, MARK } from "./mark.mjs";
+import { encodePng, renderMark } from "./mark.mjs";
 
-// The old layout, for the comparison. Reproduces the pre-fix renderer.
-function oldRenderMark(size) {
-  const SS = 4, s = MARK.box, lay = layoutFor(size), mid = s / 2;
-  const fit = (v) => mid + (v - mid) * lay.scale;
-  const scale = size / s;
-  const px = Buffer.alloc(size * size * 4, 0);
-  const segDist = (px_, py, ax, ay, bx, by) => {
-    const vx = bx - ax, vy = by - ay, wx = px_ - ax, wy = py - ay;
-    const l2 = vx * vx + vy * vy;
-    let t = l2 > 0 ? (wx * vx + wy * vy) / l2 : 0;
-    t = t < 0 ? 0 : t > 1 ? 1 : t;
-    const dx = px_ - (ax + t * vx), dy = py - (ay + t * vy);
-    return Math.sqrt(dx * dx + dy * dy);
-  };
-  const rr = (px_, py, cx, cy, hw, hh, r) => {
-    const qx = Math.abs(px_ - cx) - (hw - r), qy = Math.abs(py - cy) - (hh - r);
-    const ax = qx > 0 ? qx : 0, ay = qy > 0 ? qy : 0;
-    const inner = Math.min(Math.max(qx, qy), 0);
-    return Math.sqrt(ax * ax + ay * ay) + inner - r;
-  };
-  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
-    let r = 0, g = 0, b = 0, a = 0;
-    for (let sy = 0; sy < SS; sy++) for (let sx = 0; sx < SS; sx++) {
-      const ux = (x + (sx + 0.5) / SS) / scale, uy = (y + (sy + 0.5) / SS) / scale;
-      let cr = 0, cg = 0, cb = 0, ca = 0;
-      const half = mid * lay.scale;
-      const rad = Math.min(s * lay.radius * lay.scale, half);
-      if (rr(ux, uy, mid, mid, half, half, rad) <= 0) { [cr, cg, cb, ca] = MARK.plate.fill; }
-      const w = MARK.stroke.w * (lay.scale < 1 ? 0.94 : 1);
-      let on = false;
-      for (const poly of MARK.brackets) for (let i = 0; i + 1 < poly.length; i++) {
-        if (segDist(ux, uy, fit(poly[i][0]), fit(poly[i][1]), fit(poly[i + 1][0]), fit(poly[i + 1][1])) <= w / 2) on = true;
-      }
-      if (on) { [cr, cg, cb, ca] = MARK.stroke.color; }
-      if (Math.hypot(ux - mid, uy - mid) <= MARK.node.r * (lay.scale < 1 ? 0.92 : 1)) { [cr, cg, cb, ca] = MARK.node.color; }
-      r += cr * (ca / 255); g += cg * (ca / 255); b += cb * (ca / 255); a += ca;
-    }
-    const n = SS * SS, o = (y * size + x) * 4, A = a / n;
-    if (A > 0) { px[o] = Math.round(r / n * 255 / A); px[o + 1] = Math.round(g / n * 255 / A); px[o + 2] = Math.round(b / n * 255 / A); }
-    px[o + 3] = Math.round(A);
-  }
-  return px;
-}
-
-// Compose a canvas.
 function canvas(w, h, bg) {
   const px = Buffer.alloc(w * h * 4);
   for (let i = 0; i < w * h; i++) {
@@ -61,47 +23,62 @@ function canvas(w, h, bg) {
   }
   return px;
 }
-function blit(dst, dw, src, sw, sh, dx, dy, alphaScale = 1) {
-  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
-    const so = (y * sw + x) * 4;
-    const A = (src[so + 3] / 255) * alphaScale;
-    if (A <= 0) continue;
-    const dX = dx + x, dY = dy + y;
-    if (dX < 0 || dY < 0 || dX >= dw) continue;
-    const do_ = (dY * dw + dX) * 4;
-    dst[do_] = Math.round(src[so] * A + dst[do_] * (1 - A));
-    dst[do_ + 1] = Math.round(src[so + 1] * A + dst[do_ + 1] * (1 - A));
-    dst[do_ + 2] = Math.round(src[so + 2] * A + dst[do_ + 2] * (1 - A));
+
+/** Blit `src` (sw x sh) into `dst` at (dx,dy), nearest-neighbour scaled by `k`. */
+function blit(dst, dw, dh, src, sw, sh, dx, dy, k = 1) {
+  const ow = Math.round(sw * k), oh = Math.round(sh * k);
+  for (let y = 0; y < oh; y++) {
+    for (let x = 0; x < ow; x++) {
+      const so = (Math.floor(y / k) * sw + Math.floor(x / k)) * 4;
+      const A = src[so + 3] / 255;
+      if (A <= 0) continue;
+      const dX = dx + x, dY = dy + y;
+      if (dX < 0 || dY < 0 || dX >= dw || dY >= dh) continue;
+      const d = (dY * dw + dX) * 4;
+      dst[d] = Math.round(src[so] * A + dst[d] * (1 - A));
+      dst[d + 1] = Math.round(src[so + 1] * A + dst[d + 1] * (1 - A));
+      dst[d + 2] = Math.round(src[so + 2] * A + dst[d + 2] * (1 - A));
+    }
   }
 }
 
-const SIZES = [16, 20, 24, 32, 48];
-const TOP = 8, GAP = 14, CELL = 60;
-const W = GAP + SIZES.length * (CELL + GAP);
-const ROW = 74;
-const H = TOP + ROW * 4 + TOP;
+const STRIP_H = 44;                 // a taskbar
+const BAR = [16, 20, 24, 32, 48];   // the sizes Windows draws in it
+const MAG = [16, 24];               // judged magnified, because 16px is the point
+const K = 6;
+const PAD = 16, GAP = 16;
+
+const barW = BAR.reduce((a, s) => a + s + GAP, 0);
+const magW = MAG.reduce((a, s) => a + s * K + GAP, 0);
+const W = PAD * 2 + Math.max(barW, magW);
+const barRow = STRIP_H + PAD;
+const magRow = 24 * K + PAD;
+const H = PAD + barRow * 2 + magRow * 2;
 
 const lightBg = [242, 242, 245], darkBg = [28, 28, 32];
 const px = canvas(W, H, [200, 200, 205]);
 
-// rows: old light, new light, old dark, new dark
-const rows = [
-  { bg: lightBg, old: true, label: "old / light" },
-  { bg: lightBg, old: false, label: "new / light" },
-  { bg: darkBg, old: true, label: "old / dark" },
-  { bg: darkBg, old: false, label: "new / dark" },
-];
-rows.forEach((row, ri) => {
-  const y0 = TOP + ri * ROW;
-  // the "taskbar" strip
-  const strip = canvas(W - GAP * 2, 44, row.bg);
-  blit(px, W, strip, strip.length / 4 / 44, 44, GAP, y0 + 8, 1);
-  SIZES.forEach((s, i) => {
-    const img = row.old ? oldRenderMark(s) : renderMark(s);
-    blit(px, W, img, s, s, GAP + i * (CELL + GAP), y0 + 8 + Math.round((44 - s) / 2), 1);
-  });
-});
-// a separator
-writeFileSync(process.argv[2] || "shots/icons/taskbar.png", encodePng(px, W, H));
-console.log(`wrote ${process.argv[2] || "shots/icons/taskbar.png"}  ${W}x${H}`);
-console.log("rows: old/light, new/light, old/dark, new/dark at 16,20,24,32,48");
+function drawRow(bg, y0, magnified) {
+  blit(px, W, H, canvas(W - PAD * 2, magnified ? 24 * K + 8 : STRIP_H, bg),
+       W - PAD * 2, magnified ? 24 * K + 8 : STRIP_H, PAD, y0);
+  const sizes = magnified ? MAG : BAR;
+  let x = PAD + GAP / 2;
+  for (const s of sizes) {
+    const img = renderMark(s);
+    const k = magnified ? K : 1;
+    const top = magnified ? y0 + 4 : y0 + Math.round((STRIP_H - s) / 2);
+    blit(px, W, H, img, s, s, x, top, k);
+    x += s * k + GAP;
+  }
+}
+
+drawRow(lightBg, PAD, false);
+drawRow(darkBg, PAD + barRow, false);
+drawRow(lightBg, PAD + barRow * 2, true);
+drawRow(darkBg, PAD + barRow * 2 + magRow, true);
+
+const out = process.argv[2] || "shots/icons/taskbar.png";
+writeFileSync(out, encodePng(px, W, H));
+console.log(`wrote ${out}  ${W}x${H}`);
+console.log("rows: light 1x, dark 1x, light " + K + "x, dark " + K + "x");
+console.log("1x sizes: " + BAR.join(", ") + "   magnified: " + MAG.join(", "));
