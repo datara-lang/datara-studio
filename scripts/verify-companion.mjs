@@ -33,6 +33,20 @@ const REAL = join(HERE, "find-companion.mjs");
 // comparison says they are not. Measured on the macOS runner: this test was the
 // only failure in the whole interface job, and it was the test that was wrong -
 // the search had found exactly the right directory.
+//
+// "Both sides" is not decoration, and this file got it wrong once. An answer
+// derived from `import.meta.url` arrives already canonicalised, so comparing it
+// against `real(x)` happens to work. An answer taken from `FORGEN_AI_DIR` does
+// not: it is the environment string verbatim, so `j.dir === real(mine)` compared
+// a raw path against a canonical one and failed on macOS alone - 11/12, on a
+// search that had returned the right directory. Canonicalise the left side too.
+//
+// Reproduce that on any platform, without a Mac: point TMP at a symlink whose
+// target differs from its own path, then run this file.
+//
+//     mkdir real-tmp && node -e "require('fs').symlinkSync('<abs>/real-tmp','<abs>/link-tmp','junction')"
+//     TMP=<abs>/link-tmp node scripts/verify-companion.mjs
+//
 // `realpathSync` throws on a path that does not exist, and the value being
 // canonicalised may be an empty string when the script under test failed - which
 // is exactly the case this test is supposed to report as a failure, not crash on.
@@ -98,7 +112,7 @@ process.stdout.write("companion search\n");
   plantCompanion(join(base, "a", "ryan", "python"));
   const r = run(script, { env: fakeHome(base), args: ["--json"] });
   const j = JSON.parse(r.out || "{}");
-  check("finds a sibling project's companion when nothing else matches", r.code === 0 && j.dir === real(join(base, "a", "ryan", "python")), `${r.code} ${j.dir}`);
+  check("finds a sibling project's companion when nothing else matches", r.code === 0 && real(j.dir) === real(join(base, "a", "ryan", "python")), `${r.code} ${j.dir}`);
   check("and says it found it by the sweep", j.foundVia === "$ROOT/../../*/python", j.foundVia);
   rmSync(base, { recursive: true, force: true });
 }
@@ -133,7 +147,7 @@ process.stdout.write("companion search\n");
   plantCompanion(mine);
   const r = run(script, { env: { ...fakeHome(base), FORGEN_AI_DIR: mine }, args: ["--json"] });
   const j = JSON.parse(r.out || "{}");
-  check("FORGEN_AI_DIR wins over every guess", j.foundVia === "FORGEN_AI_DIR" && j.dir === real(mine), j.dir);
+  check("FORGEN_AI_DIR wins over every guess", j.foundVia === "FORGEN_AI_DIR" && real(j.dir) === real(mine), j.dir);
   rmSync(base, { recursive: true, force: true });
 }
 
