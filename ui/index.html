@@ -500,6 +500,10 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .sugline{box-shadow:inset 2px 0 0 var(--ink3)}
 .k{color:#8FB3E8}.t{color:#7FC4A8}.s{color:#C9A86A}.c{color:#5A5A64;font-style:italic}
 .n{color:#C98FD4}.f{color:#DCDCE2}.p{color:#9AA0AD}
+/* A `{...}` hole in an `fmt"..."` literal. It has to read as code sitting
+   inside a string, so it takes a colour no other token uses rather than the
+   amber of the literal around it. */
+.v{color:#7FD4E8}
 
 .panel{background:var(--s1);display:flex;
   flex-direction:column;min-height:0}

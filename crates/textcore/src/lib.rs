@@ -40,6 +40,10 @@ const T_COMMENT: u32 = 4;
 const T_NUMBER: u32 = 5;
 const T_FUNCTION: u32 = 6;
 const T_PUNCT: u32 = 7;
+// A `{...}` hole inside an `fmt"..."` literal. It is the one place a variable
+// name appears inside a string, so it gets its own kind rather than being
+// painted as string text.
+const T_INTERP: u32 = 8;
 
 const KEYWORDS: &[&str] = &[
     "fn", "let", "mut", "const", "class", "struct", "behavior", "trait", "impl", "if", "else",
@@ -510,6 +514,99 @@ fn push_plain_span(buf: &mut Vec<u32>, from: &mut usize, to: usize) {
     }
 }
 
+/// Is the string literal starting at `quote` written as `fmt"..."`?
+///
+/// The language interpolates `{...}` in an `fmt` literal and nowhere else. That
+/// was measured, not assumed - `"{name}"` prints `{name}` and `fmt"{name}"`
+/// prints the value - so painting the braces in a plain string would tell the
+/// reader something untrue. Which literal it is therefore belongs in the lexer
+/// rather than in a guess at render time.
+fn is_fmt_string(text: &[u8], quote: usize) -> bool {
+    if quote < 3 || &text[quote - 3..quote] != b"fmt" {
+        return false;
+    }
+    // `myfmt"..."` is an ordinary identifier followed by an ordinary string, so
+    // the character before the word must not be part of a longer one.
+    quote == 3 || !is_ident_body(text[quote - 4])
+}
+
+/// The `}` closing a hole that opened at `from`, or `None` if it never closes.
+///
+/// A nested `{` raises the depth, so `{a{b}}` is one hole rather than a hole
+/// that ends early at the inner brace.
+fn find_hole_end(text: &[u8], from: usize, body_end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < body_end {
+        match text[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Push an `fmt` literal, splitting its `{...}` holes out of the string text.
+///
+/// A hole is a `{` followed by an identifier start or a digit, closed by the
+/// matching `}` before the end of the literal. Every branch of that rule is
+/// measured against the compiler rather than reasoned about:
+///
+///     fmt"{name}"      -> the value
+///     fmt"{p.p_name}"  -> the value
+///     fmt"{1 + 2}"     -> 3
+///     fmt"{}"          -> {}          nothing follows the brace, so no hole
+///     fmt"{{name}}"    -> {{name}}    a brace does not open an expression
+///     fmt"\{name}"     -> \{name}     escaped, so it cannot open one
+///
+/// The doubled-brace case is why the brace itself has to be excluded and not
+/// merely the character after it. `{{name}}` reads as literal text, so painting
+/// the inner `{name}` would promise an interpolation the compiler never
+/// performs - the same lie as highlighting a plain string, one level down.
+fn push_fmt_string(buf: &mut Vec<u32>, text: &[u8], start: usize, end: usize) {
+    // The body sits between the quotes. An unterminated literal has no closing
+    // quote - the scan stops at the newline - so then the body runs to `end`.
+    let body_end = if end > start + 1 && text[end - 1] == b'"' {
+        end - 1
+    } else {
+        end
+    };
+
+    let mut lit = start;
+    let mut i = start + 1;
+    while i < body_end {
+        if text[i] == b'\\' {
+            i += 2; // an escaped character cannot open a hole
+            continue;
+        }
+        // A brace directly after another brace is text, not the start of a
+        // hole - see the table above.
+        if text[i] == b'{' && i + 1 < body_end && text[i - 1] != b'{' {
+            let first = text[i + 1];
+            if is_ident_start(first) || first.is_ascii_digit() {
+                if let Some(close) = find_hole_end(text, i + 1, body_end) {
+                    push_token(buf, lit, i - lit, T_STRING);
+                    push_token(buf, i, close + 1 - i, T_INTERP);
+                    i = close + 1;
+                    lit = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Whatever is left, including the closing quote.
+    push_token(buf, lit, end - lit, T_STRING);
+}
+
 /// Tokenise the whole document. Returns the token count; the packed triples
 /// `[start, len, kind]` live at `lex_ptr()`.
 ///
@@ -567,7 +664,12 @@ pub extern "C" fn lex(h: u32) -> u32 {
                 }
                 i += 1;
             }
-            push_token(buf, start, i.min(n) - start, T_STRING);
+            let end = i.min(n);
+            if is_fmt_string(bytes, start) {
+                push_fmt_string(buf, bytes, start, end);
+            } else {
+                push_token(buf, start, end - start, T_STRING);
+            }
             plain_from = i;
             continue;
         }

@@ -39,7 +39,19 @@ const TC = instance.exports;
 const docHandle = TC.doc_new();
 
 const enc = new TextEncoder();
-const TOKEN_CLASS = ["", "k", "t", "s", "c", "n", "f", "p"];
+
+// The class table is read out of the interface rather than restated here.
+//
+// It used to be a copy of the array in ui/app.js, and that is the arrangement in
+// which a new token kind passes every assertion in this file while the editor
+// paints it as nothing at all - the test would be checking its own copy. The
+// wasm module is read from the built artefact above for the same reason.
+const TOKEN_CLASS = (() => {
+  const src = readFileSync(join(studio, "ui", "app.js"), "utf8");
+  const m = /const TOKEN_CLASS = \[([^\]]*)\]/.exec(src);
+  if (!m) throw new Error("ui/app.js has no TOKEN_CLASS array - did it move?");
+  return m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, ""));
+})();
 
 // mirrors coreHighlight() in ui/app.js
 function highlight(text) {
@@ -104,6 +116,16 @@ const CASES = {
   "cyrillic and emoji": "// Список задач\nlet имя = \"значение\"\n// \u{1F600} done\n",
   "punct dense": "fn f(a: Int, b: Str) -> Bool { return a > 1 && b != \"\" }\n",
   "no trailing newline": "fn f() {\n    return 1\n}",
+  "fmt with a hole": 'let s = fmt"{name}, hello"\n',
+  "fmt with two holes": 'let s = fmt"{a} and {b}"\n',
+  "fmt hole on a field path": 'let s = fmt"{p.p_name}"\n',
+  "fmt hole holding an expression": 'let s = fmt"{1 + 2}"\n',
+  "fmt with no hole": 'let s = fmt"plain text"\n',
+  "fmt with doubled braces": 'let s = fmt"{{name}}"\n',
+  "fmt with an escaped brace": 'let s = fmt"\\{name}"\n',
+  "fmt with empty braces": 'let s = fmt"{}"\n',
+  "fmt unterminated": 'let s = fmt"{name}\nlet t = 1\n',
+  "plain string with braces": 'let s = "{name}, hello"\n',
 };
 
 console.log("highlighting pipeline");
@@ -124,6 +146,48 @@ console.log("\ntoken classes reach the markup");
   check("comment class present", /class="c"[^>]*>\/\/ note</.test(joined), true);
   check("number class present", /class="n"[^>]*>42</.test(joined), true);
   check("function class present", /class="f"[^>]*>main</.test(joined), true);
+}
+
+console.log("\na hole in an fmt string is a variable, and only in an fmt string");
+{
+  // The rule this section pins down was measured against the compiler, because
+  // getting it wrong in either direction is a lie told to the reader:
+  //
+  //   fmt"{name}"      -> the value
+  //   fmt"{p.p_name}"  -> the value
+  //   fmt"{1 + 2}"     -> 3
+  //   fmt"{}"          -> {}          nothing follows the brace
+  //   fmt"{{name}}"    -> {{name}}    a brace does not open an expression
+  //   fmt"\{name}"     -> \{name}     escaped, so it cannot open one
+  //   "{name}"         -> {name}      a PLAIN string does not interpolate
+  //
+  // The last one is the one worth having: painting a plain string's braces would
+  // promise an interpolation the compiler never performs.
+  const HOLES = (src) =>
+    rawTokens(src)
+      .filter((t) => t.kind === 8)
+      .map((t) => src.slice(t.start, t.start + t.len));
+
+  check("a hole is a token of its own", HOLES('fmt"{name}, hello"'), ["{name}"]);
+  check("the hole excludes the literal around it", HOLES('fmt"a{name}b"'), ["{name}"]);
+  check("a field path is one hole", HOLES('fmt"{p.p_name}"'), ["{p.p_name}"]);
+  check("an expression is one hole", HOLES('fmt"{1 + 2}"'), ["{1 + 2}"]);
+  check("two holes are two tokens", HOLES('fmt"{a} and {b}"'), ["{a}", "{b}"]);
+  check("nested braces stay one hole", HOLES('fmt"{a{b}}"'), ["{a{b}}"]);
+  check("an empty hole is not a hole", HOLES('fmt"{}"'), []);
+  check("doubled braces are not a hole", HOLES('fmt"{{name}}"'), []);
+  check("an escaped brace is not a hole", HOLES('fmt"\\{name}"'), []);
+  check("a plain string has no hole", HOLES('"{name}, hello"'), []);
+  check("an fmt string with no hole has none", HOLES('fmt"plain text"'), []);
+  check("a longer identifier is not fmt", HOLES('let myfmt = "x{name}"'), []);
+
+  const markup = highlight('let s = fmt"{name}, hello"\n').lines.join("\n");
+  check("the hole is painted as a variable", /class="v"[^>]*>\{name\}</.test(markup), true);
+  check("the literal around it is still a string", /class="s"[^>]*>"/.test(markup), true);
+
+  // Splitting one string token into several must not move a single character.
+  const src = 'let s = fmt"{a}, {b} and {c}"\nlet t = "plain {d}"\n';
+  check("a split literal is still lossless", highlight(src).lines.map(unesc), src.split("\n"));
 }
 
 console.log("\ncomment tokens are comments, in non-ASCII documents too");

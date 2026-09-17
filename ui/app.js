@@ -53,7 +53,9 @@ let docHandle = 0;
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-const TOKEN_CLASS = ["", "k", "t", "s", "c", "n", "f", "p"];
+// Indexed by the token kinds in crates/textcore/src/lib.rs, in that order.
+// The last entry is a `{...}` hole in an `fmt"..."` literal.
+const TOKEN_CLASS = ["", "k", "t", "s", "c", "n", "f", "p", "v"];
 
 // The module is embedded as base64 by scripts/build-wasm.mjs rather than
 // fetched, so that the whole interface is ONE file with no subresources.
