@@ -440,7 +440,16 @@ console.log("\ncompletion is local-first, so it never waits on the network");
 {
   const outline = [{ kind: "fn", name: "rope_len", line: 1 }, { kind: "struct", name: "rope_box", line: 2 }];
   const items = Studio.completerFor("rope", outline, []);
-  check("this file's symbols come first", items.slice(0, 2).map((i) => i.label), ["rope_len", "rope_box"]);
+  // Provenance first: both are symbols in this file, so both beat every table
+  // below them. The order between two names of the same rank and the same
+  // length is alphabetical, which is why this asserts the set - pinning the
+  // sequence here would be asserting the tie-break, not the ranking.
+  check("this file's symbols come first", items.slice(0, 2).map((i) => i.label).sort(), ["rope_box", "rope_len"]);
+  // The invariant that actually matters, stated so it can fail: a name declared
+  // in the file outranks a builtin sharing its prefix. `str_` is in the builtin
+  // table, so this used to come back with `str_len` first because it is shorter.
+  const mixed = Studio.completerFor("str_", [{ kind: "fn", name: "str_length_report", line: 1 }], []);
+  check("a file symbol outranks a same-prefix builtin", mixed[0].label, "str_length_report");
   check("keywords are offered", Studio.completerFor("whi", outline, []).some((i) => i.label === "while"), true);
   check("types are offered", Studio.completerFor("Ou", outline, []).some((i) => i.label === "Outcome"), true);
   check("builtins are offered", Studio.completerFor("str_", outline, []).length > 5, true);

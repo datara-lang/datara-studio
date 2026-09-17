@@ -1157,7 +1157,21 @@ fn st_search_masks() -> Str {
 /// run on every Enter in the search box. The query is rejected if it contains a
 /// quote, because that would end the `/c:` argument and turn a search into
 /// whatever the rest of the string happened to be.
-pub fn st_find( root: Str, query: Str) -> Str {
+///
+/// `whole` restricts the hits to lines where the query appears as a complete
+/// name. It is filtered here rather than in the shell because `findstr` needs
+/// `/r` to express a word boundary and `/r` also turns the query into a regular
+/// expression - so a search for `a.b` would become a pattern and a search for
+/// `count` would need escaping. Doing it on the returned line text is one
+/// implementation, identical on both platforms, and testable.
+///
+/// The filter is **case-sensitive** even though the search itself is not. That
+/// looks inconsistent and is deliberate: `whole` exists for symbols, and in
+/// Datara `Count` and `count` are two different names, so a case-insensitive
+/// whole-word match would answer "everywhere this variable is used" with places
+/// it is not used. Free-text search leaves `whole` off and keeps the case
+/// insensitivity that makes it useful for prose.
+pub fn st_find( root: Str, query: Str, whole: Bool) -> Str {
     let q = str_trim(query)
     if byte_len(q) == 0 {
         return "{\"ok\":false,\"error\":\"empty query\"}"
@@ -1217,18 +1231,90 @@ pub fn st_find( root: Str, query: Str) -> Str {
         }
         let text = st_after_n_colons(raw, 2)
         let full = st_abs(st_slash(file), resolved)
+        let clean = st_from_oem(st_strip_ansi(str_trim(text)))
+        // The whole-word test runs on the decoded text, not on the raw shell
+        // bytes: the search is case-insensitive and `findstr` will happily match
+        // inside a name, which is what this is here to undo.
+        if whole && !st_has_word(clean, q) {
+            continue
+        }
         if kept > 0 {
             arr = arr + ","
         }
         arr = arr + "{\"file\":\"" + st_json_escape(st_from_oem(full)) + "\""
                  + ",\"line\":" + num
-                 + ",\"text\":\"" + st_json_escape(st_from_oem(st_strip_ansi(str_trim(text)))) + "\"}"
+                 + ",\"text\":\"" + st_json_escape(clean) + "\"}"
         kept = kept + 1
     }
     arr = arr + "]"
     return "{\"ok\":true,\"root\":\"" + st_json_escape(st_from_oem(resolved)) + "\""
          + ",\"query\":\"" + st_json_escape(q) + "\""
+         + ",\"whole\":" + st_bool_json(whole)
          + ",\"count\":" + int_to_str(kept) + ",\"hits\":" + arr + "}"
+}
+
+/// `true` / `false` as JSON, since there is no boolean formatter.
+pub fn st_bool_json( b: Bool) -> Str {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+/// True when `c` can appear inside a name: `[A-Za-z0-9_]`.
+///
+/// ASCII on purpose. Datara identifiers are ASCII, so this is the compiler's own
+/// definition of a name boundary - and it has to be a byte test, because the
+/// line may contain UTF-8 comments and treating every continuation byte as a
+/// name byte would make a search inside a Cyrillic comment behave differently
+/// from the same search inside an ASCII one.
+fn st_is_name_byte( c: Int) -> Bool {
+    if c >= 48 && c <= 57 {
+        return true
+    }
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    return c == 95
+}
+
+/// True when `line` contains `q` as a complete name rather than inside a longer
+/// one.
+///
+/// This is the difference between "find this variable everywhere" and "find
+/// everything that starts with this variable". Searching `stock` and being shown
+/// `release_stock`, or searching `count` and being shown `counter` and
+/// `discount`, is how a reference list turns into something nobody reads.
+///
+/// Case-sensitive - see the note on `st_find`.
+pub fn st_has_word( line: Str, q: Str) -> Bool {
+    let ln = byte_len(line)
+    let qn = byte_len(q)
+    if qn == 0 || qn > ln {
+        return false
+    }
+    mut i = 0
+    mut found = false
+    while i + qn <= ln && !found {
+        if str_substring(line, i, qn) == q {
+            mut before_ok = i == 0
+            if i > 0 {
+                before_ok = !st_is_name_byte(str_byte_at(line, i - 1))
+            }
+            mut after_ok = i + qn >= ln
+            if i + qn < ln {
+                after_ok = !st_is_name_byte(str_byte_at(line, i + qn))
+            }
+            if before_ok && after_ok {
+                found = true
+            }
+        }
+        i = i + 1
+    }
+    return found
 }
 
 /// True when every byte of `s` is a digit and it is not empty.

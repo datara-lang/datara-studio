@@ -119,7 +119,17 @@ function coreHighlight(text) {
 
 const Editor = {
   el: null, ta: null, hl: null, gut: null, ghost: null, squig: null, tip: null,
-  lines: [], marks: {}, ranges: [], symbols: [], ghostText: "", pendingText: null,
+  // `lines` is what gets rendered - the highlighter returns HTML, with each
+  // token wrapped in a span. `srcLines` is the same document as plain text, and
+  // it exists because the two were the same field until now: `wordAt` read
+  // `this.lines[line - 1]` to find the identifier under the caret, so after the
+  // lexer loaded it was reading markup. Measured on `    let store = 7`, with the
+  // caret inside `store`: `wordAt(2, 10)` returned **`span`**, taken out of
+  // `<span class="k">let</span>`. F12, hover help and Alt+F7 all resolve through
+  // it, so all three were answering about HTML tags. Before the wasm core
+  // arrived, `paintPlain` set plain text and everything worked - which is why it
+  // looked like a feature that sometimes misbehaves rather than a broken one.
+  lines: [], srcLines: [], marks: {}, ranges: [], symbols: [], ghostText: "", pendingText: null,
   sel: { line: 1, col: 1 },
   comp: null, completer: null, highlighter: coreHighlight, lh: 21, cw: 9.1, fontSize: 13.5,
   onCursor: null, onInput: null, onLex: null, onZoom: null, onHoverAsk: null,
@@ -303,11 +313,26 @@ const Editor = {
    * never waits on the network. Companion suggestions fold in when they arrive. */
   updateComplete() {
     if (!this.completer) return;
+    const src = this.ta.value;
     const pos = this.ta.selectionStart;
-    const m = this.ta.value.slice(0, pos).match(/[A-Za-z_][A-Za-z0-9_]*$/);
+    const before = src.slice(0, pos);
+    // `obj.` and `obj.pa` are the same question, and its answer is the
+    // receiver's members - not the file's whole vocabulary. The receiver is
+    // what the completer has to be asked about, so it is captured here instead
+    // of being thrown away with the dot.
+    const member = before.match(/([A-Za-z_]\w*)\.([A-Za-z_]\w*)?$/);
+    const receiver = member ? member[1] : null;
+    // A capitalised prefix has to open the list too. `Task` and `Task {` are how
+    // a type is written, and the old pattern needed a lowercase word boundary,
+    // so the first letter of every type name produced no list at all.
+    const m = before.match(/[A-Za-z_]\w*$/);
     const word = m ? m[0] : "";
-    if (word.length < 2) { this.setComplete(null); return; }
-    const items = this.completer(word);
+    // Two letters is the threshold for a name. After a dot there is nothing to
+    // type before the list is useful, so the threshold does not apply there.
+    if (!receiver && word.length < 2) { this.setComplete(null); return; }
+    const items = this.completer(word, { src, pos, receiver });
+    // The cap is applied after ranking. Cutting to nine first would keep
+    // whichever nine happened to be built first, which is not the same nine.
     this.setComplete(items.length ? { items: items.slice(0, 9), sel: 0, word } : null);
   },
 
@@ -435,6 +460,10 @@ const Editor = {
     const t0 = performance.now();
     const { lines, tokens } = (this.highlighter || coreHighlight)(text);
     this.lines = lines;
+    // The plain document, kept alongside the rendered one. See the note on the
+    // field: anything that wants to *read* the code rather than draw it must use
+    // this, not `lines`.
+    this.srcLines = text.split("\n");
     this.onLex && this.onLex(performance.now() - t0, tokens, text.length);
 
     const marks = this.marks;
@@ -458,6 +487,7 @@ const Editor = {
     const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const lines = text.split("\n");
     this.lines = lines;
+    this.srcLines = lines;
     this.hl.innerHTML = lines.map((l) => esc(l) || " ").join("\n");
     this.paintGutter(lines.length);
     this.ta.style.height = lines.length * this.lh + 28 + "px";
@@ -544,7 +574,9 @@ const Editor = {
   },
 
   wordAt(line, col) {
-    const text = this.lines[line - 1];
+    // `srcLines`, not `lines`: the rendered lines are HTML. See the note on the
+    // field - this single word was the whole of the defect.
+    const text = this.srcLines[line - 1];
     if (text === undefined) return "";
     let a = col - 1;
     if (a > text.length) a = text.length;
@@ -608,6 +640,30 @@ const Editor = {
     this.repaint();
     this.onInput && this.onInput(ta.value);
     ta.focus();
+  },
+
+  /** Add text at the END of the document, not at the caret.
+   *
+   *  The difference is the whole point of the Generate panel. A freshly opened
+   *  file has its caret at 0 - `setText` puts it there on purpose, so that
+   *  double-clicking a file does not leave the cursor on the last line - which
+   *  means "insert at the caret" wrote generated code *above* `fn main`. A
+   *  request to finish the program arrived as a prologue to it.
+   *
+   *  Focus is deliberately not taken. The generated code goes in, and the caret
+   *  stays in the request field, so a second request can be typed straight away;
+   *  that chaining is the feature. The view scrolls to the new code instead, so
+   *  the arrival is visible without moving the keyboard. */
+  append(text) {
+    if (!text) return;
+    if (!this.live()) { this.pendingText = (this.pendingText || "") + text; return; }
+    const ta = this.ta;
+    const sep = ta.value && !ta.value.endsWith("\n") ? "\n" : "";
+    ta.value = ta.value + sep + text;
+    ta.selectionStart = ta.selectionEnd = ta.value.length;
+    ta.scrollTop = ta.scrollHeight;
+    this.repaint();
+    this.onInput && this.onInput(ta.value);
   },
 
   // ---- editing aids
@@ -849,13 +905,49 @@ async function post(path, body) {
  * Sources: `src/lexer/mod.rs` for the reserved words, `src/types/prelude.rs`
  * for the builtins.
  */
+/** The words the language reserves.
+ *
+ *  Two sources, and neither is complete on its own, so the rule is: the
+ *  official grammar's keyword list, corrected by the compiler.
+ *
+ *  The grammar is the TextMate file the compiler ships for VS Code
+ *  (`editors/vscode/syntaxes/datara.tmLanguage.json`). It is the editor-side
+ *  authority and it is broad. The compiler is the final one, so anything it
+ *  rejects in its own form is out, and anything it accepts that the grammar
+ *  forgot is in.
+ *
+ *  Corrections, each from a probe project run through `forgen check`:
+ *    removed  defer, static      - in neither the grammar nor the compiler
+ *    removed  self               - the receiver is `this`; `self.v` is rejected
+ *    removed  try, catch         - rejected in the only form they have
+ *    added    at, justification, module
+ *                                - these compile and the grammar omits them
+ *
+ *  The list this replaces was wrong in both directions and that is the whole of
+ *  the "the suggestions are useless" complaint. It offered `view`, `own` and
+ *  `shared` as declarations (they are parameter modifiers - `fn f(view r: R)`,
+ *  which does compile), it offered `impl` nowhere while `impl T for C` is real,
+ *  and it withheld `out` and `then`, which are in nearly every shipped example.
+ */
 const KEYWORDS = [
-  "fn", "let", "mut", "if", "else", "while", "for", "in", "return", "struct",
-  "behavior", "trait", "impl", "type", "pub", "use", "match", "view", "unsafe",
-  "justification", "comptime", "true", "false", "enum", "const", "static",
-  "defer", "as", "own", "shared", "val", "bits", "where", "require", "ensure",
-  "component", "register", "process", "extern",
+  // declarations
+  "fn", "struct", "class", "entity", "record", "behavior", "role", "component",
+  "process", "packet", "trait", "impl", "enum", "type", "extern", "register",
+  "module", "pub", "use", "const",
+  // modifiers and clauses
+  "with", "at", "bits", "then", "require", "ensure", "view", "own", "shared",
+  "where", "as",
+  // statements and control flow
+  "let", "mut", "val", "if", "else", "while", "for", "in", "return", "match",
+  "out", "loop", "break", "continue", "unsafe", "justification", "comptime",
+  "async", "await",
+  // literals
+  "true", "false", "this",
 ];
+
+/** Membership test for the table above. A declaration scan has to tell a
+ *  method from a call, and `if (cond) {` has the same shape as `bump() {`. */
+const KEYWORD_SET = new Set(KEYWORDS);
 
 /** What a keyword expands into when you accept it.
  *
@@ -921,7 +1013,7 @@ const SNIPPETS = {
   // be written - which is the friction "пиши код комфортно" was about.
   fn:        { body: "fn name() {\n    \n}", caret: 3, select: 4, stop: 16 },
   struct:    { body: "struct Name {\n    name_field: Int\n}", caret: 7, select: 4 },
-  class:     { body: "class Name {\n    name_field: Int\n}", caret: 6, select: 4 },
+  class:     { body: "class Name {\n    name_field: Int\n}", caret: 6, select: 4, note: "snippet - deprecated, use struct + behavior" },
   entity:    { body: "entity Name {\n    name_field: Int\n}", caret: 7, select: 4 },
   record:    { body: "record Name {\n    name_field: Int\n}", caret: 7, select: 4 },
   component: { body: "component Name {\n    name_field: Int\n}", caret: 10, select: 4 },
@@ -942,6 +1034,25 @@ const SNIPPETS = {
   comptime:  { body: "comptime expr", caret: 9, select: 4 },
   defer:     { body: "defer action()", caret: 6, select: 8 },
   use:       { body: "use module_name", caret: 4, select: 11 },
+  // The forms the examples actually use and the list never offered. `out` and
+  // `then` are the two that show up in almost every shipped program, so their
+  // absence was the most visible half of the complaint.
+  //
+  // There is no `with` snippet, and that is deliberate rather than an omission.
+  // `with` is a clause on a declaration header - `entity U with C` - so there is
+  // no line you can type it on by itself. A snippet would have inserted a
+  // fragment that is a syntax error standing alone, which is exactly what the
+  // build's snippet check is there to catch. The keyword is still offered; it
+  // just inserts its own four letters.
+  out:       { body: "out expr", caret: 4, select: 4 },
+  then:      { body: "then step()", caret: 5, select: 4 },
+  module:    { body: "module name.sub", caret: 7, select: 8 },
+  role:      { body: "role Name {\n    name_method() -> Int\n}", caret: 5, select: 4 },
+  process:   { body: "process name(x: Int) -> Int {\n    x\n}", caret: 8, select: 4 },
+  // A packet field is a NAME AND A BIT COUNT, not a name and a type:
+  // `name_field: Int` is E-SYNTAX-001, "Expected bit count for packet field".
+  // The snippet carried the type form until the build's snippet check failed it.
+  packet:    { body: "packet Name {\n    name_field: 8\n}", caret: 7, select: 4 },
 };
 
 const TYPES = [
@@ -981,15 +1092,33 @@ const DATARA_DOCS = {
   struct: ["keyword", "struct", "Declares a value type.\n\n  pub struct Rope {\n      rope_len: Int\n  }\n\nField names must be globally unique across every struct in the program - see PORTING.md."],
   behavior: ["keyword", "behavior", "Declares a set of methods. `class` is deprecated in favour of `struct` + `behavior`."],
   trait: ["keyword", "trait", "Declares an interface."],
-  impl: ["keyword", "impl", "Implements a trait or adds methods to a type."],
   view: ["keyword", "view", "A borrowed parameter. It goes BEFORE the name.\n\n  fn rope_len(view r: Rope) -> Int\n\n`r: view Rope` is rejected."],
   pub: ["keyword", "pub", "Exports a declaration from its module.\n\nA plain `fn` is private to its file; reaching for it elsewhere is E0042.\nNot allowed on struct fields or on a top-level `let`."],
   unsafe: ["keyword", "unsafe", "Opens a capability scope.\n\n  unsafe(justification: \"why this is needed\") { ... }\n\nRequired around exec, file_*, socket_* and env_get, or the type check fails with E0940."],
   comptime: ["keyword", "comptime", "Evaluated during compilation rather than at run time."],
   match: ["keyword", "match", "Pattern matching. Note there are no if-expressions in this language."],
-  while: ["keyword", "while", "A loop. There is no `break` and no `continue` - put the exit condition in the `while` itself, or carry a flag."],
+  // This entry used to say there is no `break` and no `continue`. Both compile.
+  // The note was wrong, and wrong in the direction that costs the most: it sent
+  // people to a flag variable to do what a keyword already does. Every line in
+  // this table is the editor making a claim on the compiler's behalf, so it has
+  // to be a claim the compiler backs.
+  while: ["keyword", "while", "A loop.\n\n  mut i = 0\n  while i < 10 {\n      i = i + 1\n  }\n\n`break` and `continue` both work inside it."],
+  loop: ["keyword", "loop", "A loop with no condition. Leave it with `break`."],
+  break: ["keyword", "break", "Leaves the enclosing `while`, `for` or `loop`."],
+  continue: ["keyword", "continue", "Skips to the next turn of the enclosing loop."],
   return: ["keyword", "return", "Returns from a function."],
   use: ["keyword", "use", "Imports a module. Everything lands in one flat namespace, so public names carry their module prefix."],
+  // The words the examples are written in and the table never explained.
+  out: ["keyword", "out", "Writes a line to standard output. A statement, not a function: no parentheses, and it cannot be used as a value.\n\n  out \"paid {amount}\"\n\n`println(\"...\")` is the call form and does the same thing."],
+  then: ["keyword", "then", "Chains the stages of a `process`, reading top to bottom.\n\n  store\n  then find_product()\n  then report()\n\nIt lowers to the same IR as `|>`."],
+  module: ["keyword", "module", "Names the module a file belongs to, on the first line.\n\n  module embedded.mmio\n\nRequired before `register`."],
+  impl: ["keyword", "impl", "Implements a trait for a type.\n\n  impl Payable for User {\n      pay(amount: Int) -> Int => this.balance - amount\n  }\n\nA type with no trait to satisfy uses `behavior` instead."],
+  class: ["keyword", "class", "Declares a type together with its methods.\n\n`class` still compiles, but forgen emits W0100 for every one: the language has moved to `struct` plus a separate `behavior` block."],
+  entity: ["keyword", "entity", "A data-bearing type, and an alias of `class`. Compose in shared state with `with`."],
+  role: ["keyword", "role", "A method contract the compiler verifies. A type satisfies it by declaring the same method in a `behavior`."],
+  process: ["keyword", "process", "A named workflow, chained with `then`."],
+  require: ["keyword", "require", "A precondition, written between the signature and the body.\n\n  fn t(x: Int) -> Int\n      require x > 0\n  {\n      return x\n  }"],
+  ensure: ["keyword", "ensure", "A postcondition. Pairs with `require` and may name `result`.\n\n  fn t(x: Int) -> Int\n      require x > 0\n      ensure result >= x\n  {\n      return x\n  }"],
   Int: ["type", "Int", "The default integer, 64-bit."],
   Str: ["type", "Str", "A UTF-8 string.\n\n`str_len` counts BYTES, not characters: str_len(\"Шахматная школа\") is 24.\nUse `char_len` for characters."],
   Bool: ["type", "Bool", "true or false. Note that str_contains / str_starts_with / str_ends_with return `Int`, not `Bool` - compare `== 1`."],
@@ -1009,42 +1138,243 @@ const DATARA_DOCS = {
   str_to_int: ["builtin", "str_to_int(s) -> Int", "Parses decimal text. Returns 0 on anything it cannot read, so validate the range yourself."],
 };
 
-/** Top-level declarations in a source file, for the outline panel.
+/** Where a completion came from, which is the only ranking signal available
+ *  without a type checker.
  *
- * A regex scan, not a parse. It is honest about that: it finds declarations at
- * the start of a line and will miss anything nested or unusual. The real fix is
- * the Datara provider reusing forgen's own parser; until then this is a useful
- * approximation and nothing depends on it being complete.
+ * This used to be `a.label.length - b.label.length` - not a ranking at all. It
+ * put `str_len` above `str_split` because it is shorter, and it let a stdlib
+ * builtin outrank a function declared in the file the reader is looking at.
+ * Order is now by provenance, then by length so the closest completion of what
+ * was typed wins, then alphabetically so the list does not reshuffle.
  */
-function completerFor(word, outline, suggestions) {
+const COMPLETE_RANK = { symbol: 0, field: 0, method: 1, snippet: 2, type: 3, keyword: 4, builtin: 5, ai: 6 };
+
+function byRank(a, b) {
+  const d = (a.rank || 0) - (b.rank || 0);
+  if (d) return d;
+  if (a.label.length !== b.label.length) return a.label.length - b.label.length;
+  return a.label < b.label ? -1 : a.label > b.label ? 1 : 0;
+}
+
+/** The declaration keywords that open a braced body, and the one place their
+ *  pattern is written down.
+ *
+ *  `class` was missing from this list while being the keyword the shipped
+ *  stdlib declares 102 times, so `user.` on a class instance had nothing to
+ *  answer with. `entity`, `record`, `role` and `packet` were missing too. Two
+ *  functions used to carry their own copy of the pattern and this is why they
+ *  disagreed; now there is one, and both read it.
+ *
+ *  `process` is deliberately absent. `process purchase(user: User, ...)` has a
+ *  parameter list where a body would be, and a scan that treated it as a
+ *  declaration would file `user: User, store: Store, amount: Int` as one field.
+ */
+const DECL_RE = /^\s*(?:pub\s+)?(struct|class|entity|record|behavior|role|component|packet|trait|register)\s+([A-Za-z_]\w*)\s*(?:with\s+([A-Za-z_][\w,\s]*?))?\s*(?:at\s+\S+)?\s*\{/;
+
+/** The struct and behavior declarations in a file, with their insides.
+ *
+ * `symbols()` finds top-level names, which is all the outline panel needs.
+ * Completion needs more: a `behavior` is the only place its methods exist, and
+ * a class's fields are the only thing a literal can be given. This is a brace
+ * scan, not a parser, and it will miss anything unusual - the real answer is
+ * the Datara provider reusing forgen's own parser, and this is what is honest
+ * until then.
+ */
+function declaredTypes(src) {
+  const out = {};
+  const lines = String(src || "").split("\n");
+  let current = null, depth = 0;
+  for (const line of lines) {
+    if (!current) {
+      const m = line.match(DECL_RE);
+      if (!m) continue;
+      // A type and its behavior are written as two blocks with the same name -
+      // that is the idiom forgen's own W0100 tells people to move to, and it is
+      // what `03_split_behavior.dtr` does. Overwriting on the second block is
+      // what made `user.` list nothing: `behavior User` replaced `class User`
+      // and took its fields with it.
+      current = out[m[2]] || (out[m[2]] = { kind: m[1], name: m[2], fields: [], methods: [], with: [] });
+      if (m[3]) {
+        for (const w of m[3].split(",")) {
+          const t = w.trim();
+          if (t && current.with.indexOf(t) < 0) current.with.push(t);
+        }
+      }
+      depth = (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
+      if (depth <= 0) current = null;
+      continue;
+    }
+    const open = (line.match(/\{/g) || []).length;
+    const close = (line.match(/\}/g) || []).length;
+    // Depth 1 is the body of the declaration itself. Anything deeper belongs to
+    // a method, and a `name: Type` down there is a local, not a field.
+    if (depth === 1) {
+      const field = line.match(/^\s*([A-Za-z_]\w*)\s*:\s*([A-Za-z_][\w<>,\s[\]]*?)\s*(?:in\s+bits\s+[\d.=.]+|at\s+0x[\dA-Fa-f_]+)?\s*$/);
+      if (field) {
+        current.fields.push({ name: field[1], type: field[2].trim() });
+      } else {
+        // Three shapes reach here and the old pattern matched one of them:
+        // `fn bump() -> Void {`, `greet() -> Str => "..."` and `pay(n: Int) -> Int`.
+        // Both the `fn` prefix and the `=>` body are in the shipped examples, and
+        // a scanner that misses them reports a class with no methods - which is
+        // what `user.` showed.
+        const method = line.match(/^\s*(?:pub\s+)?(?:fn\s+)?([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:->\s*([A-Za-z_][\w<>,\s[\]]*?))?\s*(?:\{|=>|$)/);
+        // A call has the same shape as a method, so the name is checked against
+        // the keyword table. `if (cond) {` is not a method.
+        if (method && !KEYWORD_SET.has(method[1])) {
+          current.methods.push({
+            name: method[1],
+            signature: (method[3] || "Unit").trim() + "(" + method[2].trim() + ")",
+          });
+        }
+      }
+    }
+    depth += open - close;
+    if (depth <= 0) current = null;
+  }
+  return out;
+}
+
+/** Which declaration the caret is inside, so `this.` can answer.
+ *
+ * `this.field` is real Datara, not a convention borrowed from elsewhere - it is
+ * in `03_post_oop_class.dtr` and throughout the stdlib. The receiver is whatever
+ * block encloses the caret, including a `behavior User` written separately from
+ * its `class User`, which is the shape the compiler steers people towards.
+ */
+function enclosingType(src, pos) {
+  const before = String(src || "").slice(0, pos);
+  let depth = 0, current = null;
+  for (const line of before.split("\n")) {
+    const m = line.match(DECL_RE);
+    if (m && depth === 0) current = m[2];
+    const open = (line.match(/\{/g) || []).length;
+    const close = (line.match(/\}/g) || []).length;
+    depth += open - close;
+    if (current && depth <= 0) current = null;
+  }
+  return current;
+}
+
+/** The declared type of a local or a parameter, when the file writes one down.
+ *
+ * Handles the shapes Datara uses in practice: `let t = Task { ... }` and
+ * `let t: Task = ...` for locals, and `fn f(store: Store)` for parameters. The
+ * parameter case is not an afterthought - `store.stock` and `user.pay(amount)`
+ * in `07_entity_process_model.dtr` are exactly it, and a scanner that only knew
+ * about `let` answered those with nothing.
+ *
+ * Parameters are looked for anywhere earlier in the file rather than only in the
+ * enclosing signature. This is a scan, not a scope analysis, and a parameter
+ * name that repeats across two functions is the exception.
+ *
+ * A receiver this cannot resolve returns null, and the caller then offers
+ * nothing rather than guessing at the whole vocabulary.
+ */
+function localType(src, pos, name) {
+  const before = String(src || "").slice(0, pos);
+  const re = new RegExp(
+    "\\b(?:let|mut|val|const)\\s+" + name + "\\s*(?::\\s*([^\\s=;]+))?\\s*=\\s*([^\\s{=(;]+)"
+    + "|[(,]\\s*" + name + "\\s*:\\s*([A-Za-z_][\\w<>\\[\\]]*)",
+    "g");
+  let match, letNamed = null, letInferred = null, param = null;
+  while ((match = re.exec(before))) {
+    if (match[3]) { param = match[3]; continue; }
+    letNamed = match[1] || null;
+    letInferred = match[2] || null;
+  }
+  // A binding beats a parameter: if both are in scope under one name, the inner
+  // `let` is the one the caret is looking at.
+  const t = letNamed || letInferred || param;
+  return String(t || "").replace(/[^A-Za-z0-9_]/g, "") || null;
+}
+
+/** What is reachable through `receiver` - and nothing else.
+ *
+ * Member access is a different question from "what names exist", and it has a
+ * different answer. Answering `obj.` with the keyword list would be worse than
+ * answering it with nothing, which is what happened before: the word before the
+ * caret was empty, so the list did not open at all.
+ *
+ * Fields composed in through `with` are members too - `entity User with
+ * Timestamped` really does have `created_at` - so they are merged in, ahead of
+ * the type's own, and de-duplicated because an entity may redeclare one.
+ */
+function memberCompletions(src, pos, receiver) {
+  const types = declaredTypes(src);
+  const typeName = receiver === "this" ? enclosingType(src, pos) : localType(src, pos, receiver);
+  if (!typeName) return [];
+  const decl = types[typeName];
+  if (!decl) return [];
+  const out = [], seen = new Set();
+  const fields = (list) => {
+    for (const f of list) {
+      if (seen.has(f.name)) continue;
+      seen.add(f.name);
+      out.push({ name: f.name, hint: f.type, rank: COMPLETE_RANK.field });
+    }
+  };
+  for (const comp of decl.with || []) if (types[comp]) fields(types[comp].fields);
+  fields(decl.fields);
+  for (const m of decl.methods) {
+    if (seen.has(m.name)) continue;
+    seen.add(m.name);
+    out.push({ name: m.name, hint: m.signature, rank: COMPLETE_RANK.method });
+  }
+  return out;
+}
+
+function completerFor(word, outline, suggestions, ctx) {
   const out = [], seen = new Set();
   // `stop` is carried through explicitly. It was silently dropped when it was
   // added, because this helper builds the item from a fixed list of fields and
   // an unknown one simply does not survive the trip - the snippet table had the
   // offset, the completion list did not, and the second Tab did nothing. A field
   // that reaches `acceptComplete` has to be named here or it does not exist.
-  const add = (label, insert, hint, caret, select, stop) => {
+  const add = (label, insert, hint, caret, select, stop, rank) => {
     if (seen.has(label)) return;
     seen.add(label);
-    out.push({ label, insert, hint, caret, select, stop });
+    out.push({ label, insert, hint, caret, select, stop, rank });
   };
-  for (const s of outline) if (s.name.startsWith(word)) add(s.name, s.name, s.kind);
-  for (const k of KEYWORDS) {
+
+  // After a dot the only correct answers are the receiver's own members.
+  if (ctx && ctx.receiver) {
+    for (const m of memberCompletions(ctx.src, ctx.pos, ctx.receiver)) {
+      if (m.name.startsWith(word)) add(m.name, m.name, m.hint, undefined, undefined, undefined, m.rank);
+    }
+    return out.sort(byRank);
+  }
+
+  for (const s of outline) {
+    if (s.name.startsWith(word)) add(s.name, s.name, s.kind, undefined, undefined, undefined, COMPLETE_RANK.symbol);
+  }
+  // Every snippet is reachable. The loop used to run over KEYWORDS alone, so a
+  // snippet whose word was not also in that table could never be offered -
+  // `class`, `entity` and `record` sat in the snippet table and were dead code.
+  const words = KEYWORDS.slice();
+  for (const k of Object.keys(SNIPPETS)) if (!KEYWORD_SET.has(k)) words.push(k);
+  for (const k of words) {
     if (!k.startsWith(word)) continue;
     const snip = SNIPPETS[k];
     // A keyword that opens a shape inserts the shape. The hint says "snippet"
     // rather than "keyword", because Tab doing something other than inserting
     // the two letters already on screen has to be visible before it is pressed.
-    if (snip) add(k, snip.body, "snippet", snip.caret, snip.select, snip.stop);
-    else add(k, k, "keyword");
+    // A snippet may sharpen that hint further - `class` says it is deprecated -
+    // and that note has to reach the list or the advice arrives after the fact.
+    if (snip) add(k, snip.body, snip.note || "snippet", snip.caret, snip.select, snip.stop, COMPLETE_RANK.snippet);
+    else add(k, k, "keyword", undefined, undefined, undefined, COMPLETE_RANK.keyword);
   }
-  for (const t of TYPES) if (t.startsWith(word)) add(t, t, "type");
-  for (const b of BUILTINS) if (b.startsWith(word)) add(b, b, "builtin");
+  for (const t of TYPES) {
+    if (t.startsWith(word)) add(t, t, "type", undefined, undefined, undefined, COMPLETE_RANK.type);
+  }
+  for (const b of BUILTINS) {
+    if (b.startsWith(word)) add(b, b, "builtin", undefined, undefined, undefined, COMPLETE_RANK.builtin);
+  }
   for (const c of suggestions) {
     const it = (c.insert_text || "").split("\n")[0];
-    if (it.startsWith(word)) add(it, it, "ai");
+    if (it.startsWith(word)) add(it, it, "ai", undefined, undefined, undefined, COMPLETE_RANK.ai);
   }
-  return out.sort((a, b) => a.label.length - b.label.length);
+  return out.sort(byRank);
 }
 
 /** What to show when the pointer rests on a word.
@@ -1351,10 +1681,23 @@ function providerFor(path) {
   return PROVIDERS.find((p) => p.extensions.includes(ext)) || PLAIN_LANG;
 }
 
+/** Top-level declarations in a source file, for the outline panel.
+ *
+ * A regex scan, not a parse. It is honest about that: it finds declarations at
+ * the start of a line and will miss anything nested or unusual. The real fix is
+ * the Datara provider reusing forgen's own parser; until then this is a useful
+ * approximation and nothing depends on it being complete.
+ *
+ * The kind list is the compiler's own, taken from the E-SYNTAX-001 message it
+ * prints when it meets something it cannot place. `impl` was in this pattern and
+ * does not exist in the language - the outline offered a shape the compiler
+ * rejects - while `entity`, `record`, `component`, `process` and `role` were
+ * missing, so a file written in the domain model showed an empty outline.
+ */
 function symbols(src) {
   const out = [];
   src.split("\n").forEach((l, i) => {
-    const m = l.match(/^\s*(?:pub\s+)?(fn|class|struct|behavior|trait|impl|type)\s+([A-Za-z_]\w*)/);
+    const m = l.match(/^\s*(?:pub\s+)?(fn|struct|class|entity|record|behavior|role|component|process|packet|trait|enum|type|const|extern|register|module)\s+([A-Za-z_]\w*)/);
     if (m) out.push({ kind: m[1], name: m[2], line: i + 1 });
   });
   return out;
@@ -1397,6 +1740,17 @@ const Ico = ({ k, size }) => {
     edit: html`<g ...${st}><path d="M2.4 11.6L9.6 4.4M2.4 11.6l1-3.2 6.2-6.2 2.2 2.2-6.2 6.2-3.2 1z"></path><path d="M2.4 11.6h9.2"></path></g>`,
     trash: html`<g ...${st}><path d="M2.6 3.6h8.8M5 3.6V2.6h4v1M4 3.6v7.2c0 .9.7 1.6 1.6 1.6h2.8c.9 0 1.6-.7 1.6-1.6V3.6"></path></g>`,
     panel: html`<g ...${st}><rect x="1.8" y="2.6" width="10.4" height="8.8" rx="1.4"></rect><path d="M9 2.6v8.8"></path></g>`,
+    // The same frame with the divider near the left edge, so the narrow strip
+    // reads as the panel on the left.
+    //
+    // This exists because the left toggle used to borrow `panel`, and `panel`
+    // puts the strip on the right - which is correct for the button that hides
+    // the right panel and backwards for the one that hides the explorer. Two
+    // buttons, two panels, two opposite sides: one glyph cannot be right for
+    // both, and the eye reads the strip as "the panel is that side" long before
+    // it reads the tooltip. The divider sits 2 units from the centre in both, so
+    // the two icons are exact mirrors rather than two drawings that nearly agree.
+    panelL: html`<g ...${st}><rect x="1.8" y="2.6" width="10.4" height="8.8" rx="1.4"></rect><path d="M5 2.6v8.8"></path></g>`,
     // Datara: the app mark, reduced to two brackets and the node between them
     "file-dtr": html`<g ...${st}><path d="M4.9 3.1L2.3 7l2.6 3.9"></path><path d="M9.1 3.1L11.7 7l-2.6 3.9"></path><circle cx="7" cy="7" r="1.5" fill="currentColor" stroke="none"></circle></g>`,
     // Python: the two interlocking plates of the logo silhouette
@@ -1584,8 +1938,8 @@ const ZenBar = memo(function ZenBar({ values, onExit, onOpenProblems,
 
 const IntentBar = memo(function IntentBar({ root, wsName, coreVersion, aiOnline, aiLabel, running,
                                             onAction, onPalette, onOpenFolder, onSave, onSettings,
-                                            onToggleMode, readMode, onSearch, search,
-                                            setSearch, treeFold, panelFold,
+                                            onToggleMode, readMode,
+                                            treeFold, panelFold,
                                             onFoldTree, onFoldPanel, gitBranch, gitDirty,
                                             onZen }) {
   const [menu, setMenu] = useState(false);
@@ -1600,7 +1954,7 @@ const IntentBar = memo(function IntentBar({ root, wsName, coreVersion, aiOnline,
     <div class="left">
       <button class="iconbtn" title="Settings   Ctrl+," onClick=${onSettings}><${Ico} k="gear" /></button>
       <button class=${"iconbtn" + (treeFold ? " off" : "")} title="Show or hide the explorer"
-        onClick=${onFoldTree}><${Ico} k="panel" /></button>
+        onClick=${onFoldTree}><${Ico} k="panelL" /></button>
       <span class="vrule"></span>
       <button class="iconbtn" title="Open file   Ctrl+P" onClick=${() => onPalette()}><${Ico} k="file" /></button>
       <button class="iconbtn" title="Open folder" onClick=${onOpenFolder}><${Ico} k="folder" /></button>
@@ -2074,17 +2428,47 @@ function fmtBytes(n) {
   return (n / (1024 * 1024)).toFixed(1) + " MB";
 }
 
+/** How much of the open file is sent to the companion as context.
+ *
+ *  Module scope, not panel scope, because two different components need the same
+ *  number: `runGenerate` slices the file with it, and the Generate panel reports
+ *  it back to the reader. Declared inside the panel it was simply not defined
+ *  where it was used, which threw inside the request handler and left the
+ *  button saying "generating ..." forever - the fetch never happened, and the
+ *  only clue was a page error nobody was reading.
+ *
+ *  Measured against the daemon: it echoes the context back at the head of its
+ *  answer and the panel subtracts that echo, so this number is also how much of
+ *  the file the companion can be said to have read. */
+const GEN_CONTEXT_CHARS = 4000;
+
 const Panel = memo(function Panel({ tab, setTab, order, hidden, onReorder,
                                      suggestions, diagnostics, aiOnline, aiLabel,
                                      layout, layoutBusy, onScan, onInsert, onGoto, outline,
                                      genReq, genRes, genErr, genBusy, genModel, onGenReq, onGenerate,
-                                     genWhere,
+                                     genWhere, genCtx,
                                      chatMsgs, chatReq, chatBusy, chatErr, chatCtx, chatClearing,
                                      onChatReq, onChatSend, onChatClear, onChatUndo, onChatProject,
                                      fmtBytes,
-                                     onStartAI, aiStarting, project, git, refs, refWord, refBusy, onFindRefs,
+                                     onStartAI, aiStarting, project, git, refs, refWord, refBusy,
+                                     searchQ, onSearchQ, searchFocus, refWhole, onRefWhole, onRunSearch,
                                      current, onOpen, projDiag, projBusy, projWhere, onCheckProject, onGotoProblem }) {
   const sev = (s) => (s === "warning" ? "w" : "e");
+
+  // Take focus in the project search box when asked.
+  //
+  // Keyed on the counter rather than on a boolean, so pressing Ctrl+Shift+F
+  // twice focuses twice. `select()` rather than a bare `focus()` because the box
+  // is usually pre-filled with the word at the caret, and the next thing anyone
+  // does is type a different one - without the select, they type into the middle
+  // of the old query and search for something that exists only by accident.
+  useEffect(() => {
+    if (!searchFocus) return;
+    const el = document.getElementById("psearch");
+    if (!el) return;
+    el.focus();
+    el.select();
+  }, [searchFocus]);
 
   const problems = () => {
     const fromCompiler = diagnostics.filter((d) => d.source === "compiler");
@@ -2200,11 +2584,28 @@ const Panel = memo(function Panel({ tab, setTab, order, hidden, onReorder,
       </div>
       <div class="card">
         <div class="ch"><b>References</b>
-          ${refWord ? html`<span class="tag">${refWord}</span>` : null}</div>
+          ${refWord ? html`<span class="tag">${refWord}</span>` : null}
+          ${refWord ? html`<span class="tag ${refWhole ? "" : "w"}">${refWhole ? "whole name" : "any text"}</span>` : null}</div>
+        <div class="findrow">
+          <input class="field" id="psearch" value=${searchQ} spellCheck=${false}
+            placeholder="a name, or any text"
+            onInput=${(e) => onSearchQ(e.target.value)}
+            onKeyDown=${(e) => {
+              if (e.key === "Enter") { e.preventDefault(); onRunSearch(searchQ, refWhole); }
+              if (e.key === "Escape") { e.preventDefault(); e.target.blur(); }
+            }} />
+          <button class="mini" title="Search the workspace   Ctrl+Shift+F"
+            onClick=${() => onRunSearch(searchQ, refWhole)}>${refBusy ? "..." : "search"}</button>
+        </div>
+        <label class="ck">
+          <input type="checkbox" checked=${refWhole}
+            onChange=${(e) => onRefWhole(e.target.checked)} />
+          <span>whole name only</span>
+          <span class="ckhint">off, it also matches inside longer names</span>
+        </label>
         <pre>${refWord
           ? (refBusy ? "searching ..." : refs.length + " place(s) in the workspace")
-          : "Put the caret on a name and press Alt+F7, or use the button."}</pre>
-        <button class="mini" onClick=${() => onFindRefs()}>find references</button>
+          : "Ctrl+Shift+F searches from anywhere, with the name at the caret already in the box. Alt+F7 searches it without the box."}</pre>
       </div>
       ${refs.length ? refs.slice(0, 40).map((r, i) => html`<div class="card" key=${i}
           style=${{ cursor: "pointer" }} onClick=${() => onOpen(r.file)}>
@@ -2306,11 +2707,19 @@ struct below says which of the two applies.</pre>
         ${genModel ? html`<span class="tag">${describeModel(genModel)}</span>` : null}</div>
       <pre>The in-context generator: a trained n-gram model over this project plus
 exemplar retrieval, structural shapes and verification through forgen. Pure
-Python, so it needs no ML runtime. The open file is sent as context.</pre>
+Python, so it needs no ML runtime. The open file is sent as context, and what
+comes back is added to it - so a second request continues the program rather
+than starting again.</pre>
+      ${genCtx ? html`<div class="genctx">
+        <span>context sent</span>
+        <span class="mono">${genCtx.chars} char${genCtx.chars === 1 ? "" : "s"} of the open file</span>
+        ${genCtx.used === null ? null
+          : html`<span class=${genCtx.used ? "ok" : "warn"}>${genCtx.used ? "the companion read it" : "the companion did not use it"}</span>`}
+      </div>` : null}
       ${!aiOnline ? html`<div style=${{ marginTop: "10px" }}>
         <button class="mini" onClick=${onStartAI}>${aiStarting ? "starting ..." : "start the companion"}</button>
       </div>` : null}
-      <input class="field" value=${genReq} placeholder="what should it do?"
+      <input class="field" value=${genReq} placeholder=${genCtx && genCtx.chars ? "what should it do next?" : "what should it do?"}
         onInput=${(e) => onGenReq(e.target.value)}
         onKeyDown=${(e) => { if (e.key === "Enter") onGenerate(); }} />
       <button class="mini" onClick=${onGenerate}>${genBusy ? "generating ..." : "generate"}</button>
@@ -2324,9 +2733,9 @@ Python, so it needs no ML runtime. The open file is sent as context.</pre>
         <span class=${"tag " + (genRes.verified ? "a" : "w")}>${genRes.verified ? "verified" : "unverified"}</span></div>
       <pre class="muted">${(genRes.fragments || []).join(" + ")}${(genRes.exemplars || []).length ? "  ·  exemplars: " + genRes.exemplars.join(", ") : ""}</pre>
       ${genWhere ? html`<div class="genwhere">
-        <span class="ok">written into the file</span>
+        <span class="ok">appended to the file</span>
         <span class="mono">${genWhere}</span>
-        <span class="hint">at the caret - Ctrl+S to save it</span>
+        <span class="hint">at the end, after what was already there - Ctrl+S to save it</span>
       </div>` : null}
       ${weakGen ? html`<div class="genweak">
         <b>This is a skeleton, not an answer.</b>
@@ -2335,7 +2744,7 @@ is the floor it assigns when nothing in its shape table fits. The code compiles
 - it is verified - but none of it came from your question.</span>
       </div>` : null}
       <div class="ins">${genRes.code}</div>
-      ${genWhere ? null : html`<button class="mini" style=${{ marginTop: "9px" }}
+      ${genWhere || !genRes.code ? null : html`<button class="mini" style=${{ marginTop: "9px" }}
         onClick=${() => (weakGen ? insertWeak() : onInsert(genRes.code))}>insert at caret</button>`}
     </div>` : null}
   </div>`;
@@ -3127,7 +3536,19 @@ function App() {
   const [refs, setRefs] = useState([]);
   const [refWord, setRefWord] = useState("");
   const [refBusy, setRefBusy] = useState(false);
-  const [search, setSearch] = useState("");
+  // The project search box. `searchQ` is the editable text in the box, which is
+  // not the same thing as `refWord` (what the last run actually searched for):
+  // the box keeps whatever was typed while the list below still describes the
+  // previous query, and a result list labelled with text that was never run is
+  // how you end up reading the wrong hits.
+  const [searchQ, setSearchQ] = useState("");
+  // Bumped to ask the box to take focus and select itself. A counter rather than
+  // a boolean because the gesture can repeat - Ctrl+Shift+F twice in a row has
+  // to focus twice - and because an effect keyed on a boolean would not re-fire.
+  const [searchFocus, setSearchFocus] = useState(0);
+  // Whole-name matching. On for "find this variable everywhere" (the Alt+F7
+  // case, where a substring answer is noise); off for "find this text".
+  const [refWhole, setRefWhole] = useState(true);
   // layout of the three columns: widths in px, and whether each side is folded
   const [treeW, setTreeW] = useState(() => Number(localStorage.getItem("datara.studio.treeW")) || 232);
   const [panelW, setPanelW] = useState(() => Number(localStorage.getItem("datara.studio.panelW")) || 264);
@@ -3147,6 +3568,11 @@ function App() {
   // placed yet, which is a different thing from "generation failed".
   const [genWhere, setGenWhere] = useState("");
   const [genModel, setGenModel] = useState(null);
+  // What the companion was given to read, and whether it says it read it.
+  // Reported rather than assumed: "it should understand what was written before"
+  // is a claim about the request, and a claim about a request that is never
+  // shown is a claim nobody can check.
+  const [genCtx, setGenCtx] = useState(null);
   // ---- chat
   //
   // The transcript lives here and is mirrored into localStorage, because the
@@ -3428,6 +3854,37 @@ function App() {
     };
   }, [toggleZen, leaveZen]);
 
+  // ---- find in the project, at window level
+  //
+  // Same reasoning as Zen's keys above, and the same trap. The editor's own
+  // handler only hears a key while the code surface has focus, and the gesture
+  // this shortcut serves is usually made *after* touching the chrome: fold the
+  // panel, click a tab, then reach for Ctrl+Shift+F. Registered on the editor
+  // alone, it did nothing in exactly those moments - which is when the results
+  // are wanted, because the panel is where they appear.
+  //
+  // `defaultPrevented` keeps this from double-firing when the editor does have
+  // focus: the editor's handler runs first, calls preventDefault, and this one
+  // then stands down. One gesture, one search.
+  //
+  // The function is reached through a ref rather than closed over, because the
+  // listener is created once. Closing over it directly would pin the first
+  // render's version for the life of the window - harmless today, since every
+  // capture inside it is a stable setter, and a silent bug the first time
+  // somebody reads a piece of state in there.
+  const openSearchRef = useRef(null);
+  useEffect(() => {
+    const find = (e) => {
+      if (e.defaultPrevented) return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key.toLowerCase() !== "f") return;
+      e.preventDefault();
+      if (openSearchRef.current) openSearchRef.current();
+    };
+    window.addEventListener("keydown", find);
+    return () => window.removeEventListener("keydown", find);
+  }, []);
+
   // ---- editor mount
   //
   // Re-runs whenever the surface comes or goes. It used to run once with `[]`
@@ -3443,8 +3900,10 @@ function App() {
       onCursor: (line, col) => setCursor({ line, col }),
       onInput: () => { setDirty(true); scheduleAI(); scheduleCheck(); },
       onLex: (lexMs, tokens, chars) => {
-        // completion and hover both ask the language, not this module
-        Editor.completer = (w) => langRef.current.complete(w, outlineRef.current, suggestionsRef.current);
+        // completion and hover both ask the language, not this module.
+        // `ctx` carries the receiver and the caret, because member access is a
+        // different question from "what names exist" and needs different data.
+        Editor.completer = (w, ctx) => langRef.current.complete(w, outlineRef.current, suggestionsRef.current, ctx);
         const lines = Editor.lines.length;
         setStats({ lines, chars, lexMs, tokens });
       },
@@ -3455,7 +3914,10 @@ function App() {
         try { localStorage.setItem("datara.studio.settings", JSON.stringify(n)); } catch (e) {}
         return n;
       }),
-      onHoverAsk: (word) => hoverInfo(word, outlineRef.current, Editor.lines, langRef.current.docs),
+      // `srcLines`: `hoverInfo` scans these for declarations, and the rendered
+      // lines are HTML - a declaration search over markup finds spans, not
+      // functions. See the note on the field.
+      onHoverAsk: (word) => hoverInfo(word, outlineRef.current, Editor.srcLines, langRef.current.docs),
       onGotoDef: (word) => gotoDefinition(word),
     });
     // A fresh surface starts at the built-in type scale. If the reader has
@@ -3521,6 +3983,17 @@ function App() {
 
       if (e.key === "F12") { e.preventDefault(); gotoDefinition(); return; }
       if (e.altKey && e.key === "F7") { e.preventDefault(); findRefs(); return; }
+      // Find in the project. Ctrl+Shift+F is the gesture every editor uses for
+      // "search the files, not this file"; Ctrl+F is bound to the same thing on
+      // purpose. This editor has no in-file find, and an unbound Ctrl+F in a
+      // browser opens the *browser's* find bar, which searches the interface's
+      // own DOM and can never find the word in the code. Doing something useful
+      // beats leaving the most obvious search key to do something misleading.
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        openProjectSearch();
+        return;
+      }
       // Escape leaves Zen; see the window-level handler above for why it is not
       // only here. The completion list has first claim when it is open.
       if (e.key === "Escape" && zenRef.current && !Editor.comp) { e.preventDefault(); leaveZen(); return; }
@@ -3739,7 +4212,9 @@ function App() {
     setStatus("looking for the declaration of " + word + " ...");
     let hits = [];
     try {
-      const r = await post("/api/find", root + "\n" + word);
+      // Whole word: a declaration search for `store` must not be answered with
+      // `storehouse`. See the note on `st_find`.
+      const r = await post("/api/find", root + "\n" + word + "\n1");
       hits = r && r.ok ? r.hits : [];
     } catch (e) {
       setStatus("search failed: " + e.message);
@@ -3750,7 +4225,7 @@ function App() {
       "^\\s*(?:pub\\s+)?(?:fn|struct|trait|behavior|impl|type|enum|mod|const)\\s+" + safe + "\\b");
     const def = hits.find((h) => decl.test(h.text));
     if (!def) {
-      const info = hoverInfo(word, outlineRef.current, Editor.lines);
+      const info = hoverInfo(word, outlineRef.current, Editor.srcLines);
       setStatus(info
         ? word + " is a " + info.kind + " - not declared anywhere in this workspace"
         : "no declaration of " + word + " in this workspace");
@@ -3817,41 +4292,82 @@ function App() {
     setTab("prob");
   }
 
-  /** Find every use of the word at the caret, across the workspace. */
-  async function findRefs() {
-    const word = Editor.wordAt(Editor.sel.line, Editor.sel.col);
-    if (!word) { setStatus("put the caret on a name first"); return; }
-    setRefWord(word);
-    setRefBusy(true);
-    setTab("proj");
-    try {
-      const r = await post("/api/find", root + "\n" + word);
-      setRefs(r && r.ok ? r.hits : []);
-      setStatus((r && r.ok ? r.hits.length : 0) + " reference(s) to " + word);
-    } catch (e) {
-      setRefs([]);
-      setStatus("reference search failed: " + e.message);
-    }
-    setRefBusy(false);
-  }
-
-  /** Search the workspace contents, from the intent bar. */
-  async function runSearch(q) {
+  /** Search the workspace, and put the result in the Project panel.   *
+   *  One entry point for every way in - the search box, Alt+F7, the intent bar -
+   *  because they all mean the same thing and used to be three copies of it.
+   *
+   *  `whole` asks the server to keep only lines where the query is a complete
+   *  name. That is the difference between "find this variable everywhere" and
+   *  "find everything that contains these letters": searching `stock` and being
+   *  shown `release_stock` is how a reference list stops being read. */
+  async function runProjectSearch(q, whole) {
     const query = String(q || "").trim();
-    if (!query) return;
+    if (!query) { setStatus("type something to search for"); return; }
+    const word = whole !== false;
     setTab("proj");
     setRefWord(query);
+    setRefWhole(word);
     setRefBusy(true);
     try {
-      const r = await post("/api/find", root + "\n" + query);
+      const r = await post("/api/find", root + "\n" + query + "\n" + (word ? "1" : "0"));
       setRefs(r && r.ok ? r.hits : []);
-      setStatus((r && r.ok ? r.hits.length : 0) + " hit(s) for " + query);
+      setStatus((r && r.ok ? r.hits.length : 0) + (word ? " name(s) matching " : " hit(s) for ") + query);
     } catch (e) {
       setRefs([]);
       setStatus("search failed: " + e.message);
     }
     setRefBusy(false);
   }
+
+  /** Find every use of the word at the caret, across the workspace. */
+  async function findRefs() {
+    const word = Editor.wordAt(Editor.sel.line, Editor.sel.col);
+    if (!word) { setStatus("put the caret on a name first"); return; }
+    setSearchQ(word);
+    await runProjectSearch(word, true);
+  }
+
+  /** Open the project search on the word at the caret, ready to be edited.
+   *
+   *  Deliberately does not search. The caret word is a starting point, not the
+   *  query - "find `stock` everywhere" usually becomes "find `stock`, no wait,
+   *  `stock_level`" the moment the results appear, and a box that has already
+   *  run and that you can type over is the gesture that survives that. Enter
+   *  runs it. Alt+F7 is still the one that searches immediately.
+   *
+   *  It does have to make the box *visible* first, though. Asking to search the
+   *  project and getting nothing at all - because the panel column is folded, or
+   *  because the Project tab was hidden in Settings - is indistinguishable from
+   *  a broken shortcut. Both are reversible one-click states, so undoing them is
+   *  the whole of "show me the results". */
+  function openProjectSearch() {
+    // Prefill from the caret word, but never over what is already typed in the
+    // box. The shortcut is registered at window level, so it also fires while
+    // the box itself has focus - and reaching for Ctrl+F again after typing half
+    // a name must not replace it with whatever word the caret is sitting on in
+    // the editor. In that case the gesture means "select the query", which is
+    // what the focus effect below does anyway.
+    const el = document.getElementById("psearch");
+    const inBox = !!el && document.activeElement === el;
+    const word = Editor.wordAt(Editor.sel.line, Editor.sel.col);
+    setPanelFold(false);
+    setSettings((s) => {
+      if (!(s.panelHidden || []).includes("proj")) return s;
+      const n = { ...s, panelHidden: s.panelHidden.filter((k) => k !== "proj") };
+      applySettings(n);
+      return n;
+    });
+    setTab("proj");
+    if (word && !inBox) setSearchQ(word);
+    setSearchFocus((n) => n + 1);
+    setStatus(word && !inBox
+      ? "searching the project - Enter to run, or edit the name first"
+      : "searching the project - type a name or any text");
+  }
+  // Hand the window-level listener the current version. Assigned during render
+  // on purpose, the same way `settingsRef` is kept up to date; the listener
+  // itself is created once and would otherwise hold the first render's closure.
+  openSearchRef.current = openProjectSearch;
 
   /** Start the companion, quietly, if it is not already up.
    *
@@ -4408,24 +4924,58 @@ function App() {
     return path;
   }
 
+  // How long a generate request is allowed to take before the panel gives up.
+  //
+  // There was no limit here, and that is worse than it sounds: the fetch had no
+  // timeout, so a companion that accepted the connection and then closed it
+  // without answering left the button reading "generating ..." indefinitely with
+  // no way back except a reload. A dropped connection is a thing that happens;
+  // an interface that cannot say so is the defect.
+  //
+  // Verification runs `forgen check` up to three times inside the daemon, so the
+  // honest ceiling is generous - this is here to bound the wait, not to hurry
+  // the compiler.
+  const GEN_TIMEOUT_MS = 90000;
+
   async function runGenerate() {
     const req = genReq.trim();
     if (!req || genBusy) return;
     setGenBusy(true); setGenErr(""); setGenRes(null); setGenWhere("");
+    // The context is captured once and kept, because it is needed twice: it goes
+    // to the companion, and it is then subtracted from the answer.
+    //
+    // The companion does not return "the new part". It returns the whole program
+    // with the new part in it - the context is echoed back at the head of `code`.
+    // This panel used to insert that entire string at the caret, so asking for a
+    // second function wrote a second copy of the file into the file. From the
+    // outside that reads as "it does not understand what was written before",
+    // and the outside was right: it understood, and then duplicated it.
+    const context = Editor.getText().slice(0, GEN_CONTEXT_CHARS);
+    setGenCtx({ chars: context.length, used: null });
+    let timedOut = false;
     try {
       const r = await fetch("http://127.0.0.1:7890/generate", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ request: req, context: Editor.getText().slice(0, 4000), verify: true }),
+        body: JSON.stringify({ request: req, context, verify: true }),
+        signal: AbortSignal.timeout(GEN_TIMEOUT_MS),
       });
       const j = await r.json();
       if (j.error) setGenErr(j.error + (j.detail ? ": " + j.detail : ""));
       else {
-        setGenRes(j);
+        // What the companion actually read, reported rather than assumed.
+        setGenCtx({ chars: context.length, used: j.context_used !== false });
+        // The addition is what belongs in the buffer. `startsWith` rather than a
+        // trim, because the echo is exact - and when it is not exact, the whole
+        // answer is inserted rather than a guess at where the seam is.
+        const addition = context && j.code && j.code.startsWith(context)
+          ? j.code.slice(context.length).replace(/^\n+/, "")
+          : (j.code || "");
+        setGenRes({ ...j, code: addition, echoed: context.length, returned: (j.code || "").length });
         // The point of generate is to write code, not to admire it in a panel.
-        // It goes into the open file at the caret, so it is real and saveable
-        // the moment it arrives - and both the panel and the status line name
-        // the file, because "it should understand which file" is the whole
-        // instruction.
+        // It goes into the open file, appended after what is already there, so
+        // it is real and saveable the moment it arrives - and both the panel and
+        // the status line name the file, because "it should understand which
+        // file" is the whole instruction.
         //
         // With nothing open there is nowhere for it to go, and dropping the
         // result on the floor without saying so is the worst option available:
@@ -4434,17 +4984,32 @@ function App() {
         if (j.code && !target) {
           target = await createAndOpen("generated.dtr");
         }
-        if (j.code && target) {
-          Editor.insert(j.code + "\n");
+        if (addition && target) {
+          Editor.append(addition + "\n");
           setDirty(true);
           setGenWhere(target);
-          setStatus("generated into " + target + " - Ctrl+S to keep it");
+          setStatus("appended " + addition.length + " characters to " + target + " - Ctrl+S to keep it");
+        } else if (target) {
+          setGenWhere("");
+          setStatus("nothing new to add - the companion returned what was already in the file");
         }
       }
     } catch (e) {
-      setGenErr("companion unreachable: " + e.message);
+      // A closed connection and a timeout are different failures and are named
+      // differently, because the first is the companion's bug and the second is
+      // a companion that is merely slow.
+      timedOut = e && (e.name === "TimeoutError" || e.name === "AbortError");
+      setGenErr(timedOut
+        ? "the companion did not answer within " + Math.round(GEN_TIMEOUT_MS / 1000)
+          + " seconds - it may still be verifying. Nothing was written to the file."
+        : "the companion closed the connection without answering (" + e.message + ")."
+          + " Nothing was written to the file. The companion may need restarting.");
+    } finally {
+      // In `finally` rather than after the try, because the one path that used to
+      // skip it - an exception thrown before the fetch - is exactly the path that
+      // left the button stuck on "generating ...".
+      setGenBusy(false);
     }
-    setGenBusy(false);
   }
 
   // ---- chat
@@ -4650,7 +5215,10 @@ function App() {
       { name: "Open file", hint: "anywhere on disk", run: () => { setBrowserMode("file"); setBrowserOpen(true); } },
       { name: "Open folder", hint: "workspace", run: () => { setBrowserMode("folder"); setBrowserOpen(true); } },
       { name: "Go to definition", hint: "F12", run: () => gotoDefinition() },
+      { name: "Find in project", hint: "Ctrl+Shift+F", run: () => openProjectSearch() },
       { name: "Find references", hint: "Alt+F7", run: () => findRefs() },
+      { name: "Search project contents", hint: "the whole text, not just names",
+        run: () => { openProjectSearch(); setRefWhole(false); } },
       { name: "Check", hint: "Ctrl+Shift+B", run: () => act("check") },
       { name: "Check the whole project", hint: "every module", run: () => checkProject() },
       { name: "Toggle comment", hint: "Ctrl+/", run: () => Editor.toggleComment(langRef.current.comment) },
@@ -4737,7 +5305,6 @@ function App() {
   return html`<div class="shell">
     <${IntentBar} root=${root} wsName=${wsNameOf(files, root)} coreVersion=${coreVersion}
       aiOnline=${aiOnline} aiLabel=${aiLabel} running=${running} readMode=${readMode}
-      search=${search} setSearch=${setSearch} onSearch=${runSearch}
       treeFold=${treeFold} panelFold=${panelFold}
       onFoldTree=${() => setTreeFold((v) => !v)} onFoldPanel=${() => setPanelFold((v) => !v)}
       onToggleAI=${() => setSettings((s) => { const n = { ...s, aiEnabled: !s.aiEnabled }; applySettings(n); return n; })}
@@ -4838,7 +5405,7 @@ function App() {
             layoutBusy=${layoutBusy} onScan=${scanLayout}
             genReq=${genReq} genRes=${genRes} genErr=${genErr} genBusy=${genBusy}
             genModel=${genModel} onGenReq=${setGenReq} onGenerate=${runGenerate}
-            genWhere=${genWhere}
+            genWhere=${genWhere} genCtx=${genCtx}
             chatMsgs=${chatMsgs} chatReq=${chatReq} chatBusy=${chatBusy} chatErr=${chatErr}
             chatCtx=${chatCtx} chatClearing=${chatClearing}
             onChatReq=${setChatReq} onChatSend=${runChat} onChatClear=${clearChat}
@@ -4847,7 +5414,9 @@ function App() {
             onInsert=${(t) => Editor.insert(t)} onGoto=${(n, c) => Editor.gotoLine(n, c)}
             outline=${outline} current=${current} onOpen=${openFile}
             project=${project} git=${git} refs=${refs} refWord=${refWord} refBusy=${refBusy}
-            onFindRefs=${findRefs} onStartAI=${() => startAI(false)} aiStarting=${aiStarting}
+            searchQ=${searchQ} onSearchQ=${setSearchQ} searchFocus=${searchFocus}
+            refWhole=${refWhole} onRefWhole=${setRefWhole} onRunSearch=${runProjectSearch}
+            onStartAI=${() => startAI(false)} aiStarting=${aiStarting}
             projDiag=${projDiag} projBusy=${projBusy} projWhere=${projWhere}
             onCheckProject=${checkProject} onGotoProblem=${gotoProblem} />
         </div>

@@ -56,7 +56,9 @@ const wsPosix = ws.replace(/\\/g, "/");
 const browser = await pw.chromium.launch();
 const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 await ctx.addInitScript((r) => {
-  localStorage.setItem("datara.studio.root", r);
+  // `lastRoot` is the key the boot reads; `datara.studio.root` is not read by
+  // anything. See the note in search.mjs.
+  localStorage.setItem("datara.studio.lastRoot", r);
   localStorage.setItem("datara.studio.recent", JSON.stringify([r]));
   localStorage.setItem("datara.studio.panelW", "264");
   localStorage.setItem("datara.studio.treeW", "232");

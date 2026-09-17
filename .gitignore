@@ -46,3 +46,7 @@ studio-run*.log
 
 # The build cache forgen writes beside the sources. Regenerated on every build.
 .forgen_cache/
+
+# written into the open workspace by the Generate panel when no file is open
+# (the panel creates and opens generated.dtr to append into)
+generated.dtr

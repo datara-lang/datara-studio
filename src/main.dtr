@@ -183,8 +183,13 @@ fn st_handle( fd: Int, tc: Str) {
         return
     }
     if path == "/api/find" {
+        // Three lines: root, query, and whether the query must match a whole
+        // name. The third is optional so that an older client - or a curl - that
+        // sends two lines still gets a substring search rather than an error.
         st_json(fd, st_find(str_trim(st_first_line(body)),
-                            str_trim(st_rest_after_first_line(body))))
+                            str_trim(st_first_line(st_rest_after_first_line(body))),
+                            str_trim(st_rest_after_first_line(
+                                st_rest_after_first_line(body))) == "1"))
         return
     }
     // branch, changed files and recent commits for the workspace - one git

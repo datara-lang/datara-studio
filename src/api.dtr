@@ -757,6 +757,31 @@ pub fn st_delete( kind: Str, path: Str) -> Str {
 ///
 /// Reports what it did rather than assuming success: the caller polls /health to
 /// find out whether it actually came up.
+///
+/// **Why `python -E -s` and not `python`.** The companion is a standalone
+/// program, so it must not be configured by whatever environment the IDE happens
+/// to be running in - and in one environment it was, fatally. Started plainly,
+/// the daemon inherits `PYTHONPATH` from this process. When that variable points
+/// at a `sitecustomize.py` - a debugger, a coverage tool, an instrumented
+/// interpreter, an agent harness - that module is imported into the daemon and
+/// every one of its monkeypatches applies to the companion too.
+///
+/// The concrete failure, traced end to end: the daemon inherited a shim whose
+/// `sitecustomize` replaces `os.remove` with a guarded delete that calls
+/// `raise SystemExit(1)` when its policy refuses. The companion's verification
+/// path removes its temporary file with `os.remove`, so the first verified
+/// `/generate` request killed the handler thread. `threading` swallows
+/// `SystemExit` silently, the socket closed with no response, and the browser
+/// reported `ERR_EMPTY_RESPONSE` - while `/health`, `/complete` and
+/// `/generate` with `verify: false` all kept working, because none of them
+/// deletes anything. A daemon started by hand from a shell answered the same
+/// request with `200` and `verified: true`, which is what made it look like the
+/// launcher rather than the companion.
+///
+/// `-E` ignores every `PYTHON*` variable and `-s` skips the user site directory,
+/// so the daemon runs as its own program with the standard library it was
+/// written against. Neither flag changes the companion; both are about not
+/// inheriting this process's Python configuration.
 pub fn st_ai_start( dir: Str) -> Str {
     let where_ = str_trim(dir)
     if byte_len(where_) == 0 {
@@ -779,13 +804,15 @@ pub fn st_ai_start( dir: Str) -> Str {
 
     mut res = ""
     if st_is_windows() {
+        // `-E -s`: see the note above - the companion must not inherit this
+        // process's Python configuration.
         let inner = "cmd /c cd /d \"" + st_back_path(where_)
-                  + "\" && python python\\forgen_ai\\ide_daemon.py --port 7890"
+                  + "\" && python -E -s python\\forgen_ai\\ide_daemon.py --port 7890"
         unsafe(justification: "the IDE starts its own optional companion process") {
             res = exec("wscript //nologo //B \"scripts\\hidden.vbs\" \"" + inner + "\"")
         }
     } else {
-        let inner = "cd \"" + where_ + "\" && (python3 python/forgen_ai/ide_daemon.py --port 7890 >/dev/null 2>&1 & )"
+        let inner = "cd \"" + where_ + "\" && (python3 -E -s python/forgen_ai/ide_daemon.py --port 7890 >/dev/null 2>&1 & )"
         unsafe(justification: "the IDE starts its own optional companion process") {
             res = exec(inner)
         }

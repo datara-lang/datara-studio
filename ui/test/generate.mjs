@@ -1,0 +1,206 @@
+// Does the Generate panel continue the open file, or does it paste the file
+// into itself?
+//
+// Run:  PLAYWRIGHT_ROOT=... node ui/test/generate.mjs <base-url>
+//
+// Why this exists. The panel sends the open file as context and the companion
+// returns the whole program with the new part in it - the context is echoed back
+// at the head of `code`. The panel used to insert that entire string, so asking
+// for a second function wrote a second copy of the file into the file. From the
+// outside that reads as "it does not understand what was written before", and
+// the outside was right: it understood, and then duplicated it.
+//
+// No screenshot can show this. The failure mode is a buffer that contains the
+// right code twice, which looks completely normal in a PNG. So the assertions
+// here are counts over the real textarea value, and the last one reads the bytes
+// off disk.
+//
+// The two requests are fixed rather than generated because the companion's
+// classifier is keyword-based: these two were probed against the running daemon
+// and both clear the 0.5 confidence floor, so the weak-result dialog never
+// enters the picture and the test measures the one thing it is about.
+
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
+
+async function loadPlaywright() {
+  try { return await import("playwright"); } catch (e) {}
+  const roots = [];
+  if (process.env.PLAYWRIGHT_ROOT) roots.push(process.env.PLAYWRIGHT_ROOT);
+  const home = process.env.USERPROFILE || process.env.HOME || "";
+  const appdata = process.env.APPDATA || (home ? join(home, "AppData", "Roaming") : "");
+  if (appdata) roots.push(join(appdata, "npm", "node_modules"));
+  for (const root of roots) {
+    for (const entry of ["index.mjs", "index.js"]) {
+      const file = join(root, "playwright", entry);
+      if (existsSync(file)) { try { return await import(pathToFileURL(file).href); } catch (e) {} }
+    }
+  }
+  return null;
+}
+
+const pw = await loadPlaywright();
+if (!pw) {
+  console.log("playwright is not importable - skipping the generate drive.");
+  process.exit(0);
+}
+
+const base = process.argv[2] || "http://127.0.0.1:7878";
+
+const results = [];
+const check = (name, ok, detail) => {
+  results.push(ok);
+  console.log((ok ? "  PASS  " : "  FAIL  ") + name + (detail ? "   [" + detail + "]" : ""));
+};
+
+// ---- the companion has to be up, or there is nothing to measure
+const alive = await fetch("http://127.0.0.1:7890/", { signal: AbortSignal.timeout(3000) })
+  .then((r) => r.ok).catch(() => false);
+if (!alive) {
+  console.log("the companion is not answering on :7890 - skipping the generate drive.");
+  process.exit(0);
+}
+
+// ---- a scratch workspace
+const ws = join(tmpdir(), "ds-generate");
+rmSync(ws, { recursive: true, force: true });
+mkdirSync(ws, { recursive: true });
+const HELLO = "fn main() -> Int {\n    return 0\n}\n";
+writeFileSync(join(ws, "main.dtr"), HELLO);
+const wsPosix = ws.replace(/\\/g, "/");
+const file = join(ws, "main.dtr");
+console.log("scratch workspace: " + wsPosix);
+
+const REQ1 = "reverse a list of integers";
+const REQ2 = "read a file and print it";
+
+/** Occurrences of a fixed string in a haystack. The whole point of the test. */
+const count = (hay, needle) => hay.split(needle).length - 1;
+
+const browser = await pw.chromium.launch();
+const ctx = await browser.newContext({ viewport: { width: 1500, height: 940 } });
+await ctx.addInitScript((r) => {
+  // `lastRoot` is the key the boot actually reads. This said `datara.studio.root`
+  // for as long as the test has existed, which nothing reads - so there was no
+  // workspace here, `lastFile` alone opened the file, and every assertion in
+  // this file happened to be about the Generate panel rather than about the
+  // tree. Found from the sibling search test, where the missing workspace was
+  // visible as a Project panel that never left "Reading the workspace ...".
+  localStorage.setItem("datara.studio.lastRoot", r);
+  localStorage.setItem("datara.studio.recent", JSON.stringify([r]));
+  localStorage.setItem("datara.studio.lastFile", r + "/main.dtr");
+  localStorage.removeItem("datara.studio.settings");
+}, wsPosix);
+const page = await ctx.newPage();
+const errs = [];
+const native = [];
+page.on("pageerror", (e) => errs.push(e.message));
+page.on("dialog", async (d) => { native.push(d.message()); await d.dismiss().catch(() => {}); });
+await page.goto(base, { waitUntil: "domcontentloaded" });
+await page.waitForTimeout(2800);
+
+const buf = () => page.locator(".code").inputValue();
+
+// ---- the file is open and the panel is reachable
+check("the file is open in the editor", (await buf()).includes("fn main"),
+  JSON.stringify((await buf()).slice(0, 30)));
+
+await page.locator(".ptabs button", { hasText: "Generate" }).first().click();
+await page.waitForTimeout(700);
+const field = page.locator(".card .field").first();
+check("the Generate panel has a request field", await field.count() === 1);
+
+// Before any request there is nothing to report about context, and the readout
+// must be absent rather than showing a zero it has not earned.
+check("no context readout before the first request",
+  await page.locator(".genctx").count() === 0);
+
+/** Send one request and wait for the file to grow. Returns the new buffer. */
+async function generate(req, before) {
+  await field.fill(req);
+  await page.locator("button.mini", { hasText: /^generate$/ }).first().click();
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    const now = await buf();
+    if (now.length > before.length && now !== before) return now;
+    await page.waitForTimeout(400);
+  }
+  return await buf();
+}
+
+// ---- 1. the first request appends, and appends once
+const after1 = await generate(REQ1, HELLO);
+check("the first request added something", after1.length > HELLO.length,
+  HELLO.length + " -> " + after1.length + " chars");
+check("the file was not duplicated by the first request",
+  count(after1, HELLO.trim()) === 1, count(after1, HELLO.trim()) + " copies of the original");
+check("the original code is still at the top",
+  after1.startsWith(HELLO.trim()), JSON.stringify(after1.slice(0, 24)));
+check("the generated code went after it, not before it",
+  after1.indexOf("fn reverse_str") > after1.indexOf("fn main"),
+  "fn reverse_str at " + after1.indexOf("fn reverse_str") + ", fn main at " + after1.indexOf("fn main"));
+
+// ---- 2. the readout says what was sent and whether it was used
+//
+// `innerText` comes back upper-cased for the status words because the stylesheet
+// applies `text-transform: uppercase` to them, so every match here is
+// case-insensitive on purpose. The first version of these assertions was not,
+// and failed against a panel that was working.
+const ctxCount = await page.locator(".genctx").count();
+const ctxText = ctxCount ? (await page.locator(".genctx").innerText()).replace(/\s+/g, " ").trim() : "";
+check("the panel reports the context it sent", ctxCount === 1, ctxText);
+check("the context it reports is the file it sent",
+  /of the open file/i.test(ctxText) && !/\b0 chars\b/i.test(ctxText), ctxText);
+check("it says whether the companion used the context",
+  /companion (read|did not use) it/i.test(ctxText), ctxText);
+check("the companion used it", /companion read it/i.test(ctxText), ctxText);
+
+// ---- 3. a second request continues the program instead of restarting it
+const after2 = await generate(REQ2, after1);
+check("the second request added something", after2.length > after1.length,
+  after1.length + " -> " + after2.length + " chars");
+check("the file was not duplicated by the second request",
+  count(after2, HELLO.trim()) === 1, count(after2, HELLO.trim()) + " copies of the original");
+check("the first request's code survived the second",
+  count(after2, "fn reverse_str") === 1, count(after2, "fn reverse_str") + " copies");
+check("the second request's code is there too",
+  after2.includes("fn count_lines"), "fn count_lines present: " + after2.includes("fn count_lines"));
+// The strongest form of "it did not restart": the buffer the panel produced
+// after the first request is still in the buffer, once, as its opening. A
+// duplicate would show up here as two occurrences even though the length check
+// above would pass - a second request that re-emitted the whole first answer is
+// exactly the failure this panel was reported for.
+check("the first answer is still a single unbroken prefix",
+  count(after2, after1.trim()) === 1, count(after2, after1.trim()) + " copies of the first answer");
+check("the buffer is not the first answer twice",
+  after2.length !== after1.length * 2 || count(after2, after1.trim()) === 1,
+  after2.length + " chars, first answer was " + after1.length);
+
+// ---- 4. what the panel says it did is what it did
+const whereText = (await page.locator(".genwhere").innerText()).replace(/\s+/g, " ").trim();
+check("the panel names the file it wrote into", /main\.dtr/.test(whereText), whereText);
+check("the panel says the code was appended, not inserted at the caret",
+  /appended/i.test(whereText), whereText);
+
+// ---- 5. and it is really in the file, not only in the panel
+await page.keyboard.press("Control+s");
+await page.waitForTimeout(1400);
+const onDisk = readFileSync(file, "utf8");
+check("Ctrl+S wrote it to disk", onDisk.length > HELLO.length, onDisk.length + " bytes on disk");
+check("the file on disk has one copy of the original",
+  count(onDisk, HELLO.trim()) === 1, count(onDisk, HELLO.trim()) + " copies");
+check("the file on disk has both additions",
+  onDisk.includes("fn reverse_str") && onDisk.includes("fn count_lines"),
+  "reverse_str " + onDisk.includes("fn reverse_str") + ", count_lines " + onDisk.includes("fn count_lines"));
+
+check("no native dialog was raised", native.length === 0, native.join(" | "));
+check("no page errors", errs.length === 0, errs.join(" | "));
+
+await ctx.close();
+await browser.close();
+
+const failed = results.filter((r) => !r).length;
+console.log("\n" + (results.length - failed) + " passed, " + failed + " failed");
+process.exit(failed ? 1 : 0);

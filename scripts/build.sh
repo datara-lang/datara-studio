@@ -10,21 +10,22 @@
 #   4. the Datara server, because it is what serves all of the above
 #
 # Usage:  bash scripts/build.sh
-# Exit:   0 ok, 1 core test failure, 2 server failure
+# Exit:   0 ok, 1 a test failed, 2 a build step failed, 3 a snippet does not
+#         compile, 4 a snippet is unreachable in the completion list
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
-echo "== 1/9 Rust text core -> wasm ================================"
+echo "== 1/10 Rust text core -> wasm ==============================="
 if ! node scripts/build-wasm.mjs; then
   echo "wasm build failed"
   exit 2
 fi
 
 echo
-echo "== 2/9 single-file interface + icons ========================="
+echo "== 2/10 single-file interface + icons ========================"
 # The icon set first, from the geometry in `scripts/mark.mjs`: the window icon,
 # the taskbar icon, the tab and the mark beside a .dtr file all come from that
 # one shape, which is the same shape `ui/icon.svg` describes. Generating them
@@ -59,35 +60,49 @@ if ! node scripts/build-ui.mjs --core; then
 fi
 
 echo
-echo "== 3/9 text core tests ======================================="
+echo "== 3/10 text core tests ======================================"
 if ! node crates/textcore/test/test.mjs; then
   echo "text core tests failed"
   exit 1
 fi
 
 echo
-echo "== 4/9 highlighting pipeline ================================="
+echo "== 4/10 highlighting pipeline ================================"
 if ! node ui/test/highlight.test.mjs; then
   echo "highlighting tests failed"
   exit 1
 fi
 
 echo
-echo "== 5/9 interface renders ====================================="
+echo "== 5/10 interface renders ===================================="
 if ! node ui/test/render.test.mjs; then
   echo "render tests failed"
   exit 1
 fi
 
 echo
-echo "== 6/9 the editor, driven as the app drives it ==============="
+echo "== 6/10 the editor, driven as the app drives it =============="
 if ! node ui/test/editor.test.mjs; then
   echo "the editor does not render text"
   exit 1
 fi
 
 echo
-echo "== 7/9 boot the built artifact ==============================="
+echo "== 7/10 completion ==========================================="
+# Reads `ui/app.js` itself and exercises the scanners and the ranking against
+# the compiler's own examples. It is here, before the boot test, because it
+# needs no DOM and no browser: if the vocabulary the editor offers is wrong,
+# nothing downstream can be right. The suite carries its own mutation checks -
+# dropping `out` from the keyword table, restoring the behavior-overwrites-class
+# bug, or reverting the ranking to length-only each make it fail - so a green
+# run is evidence rather than a formality.
+if ! node ui/test/complete.mjs; then
+  echo "completion tests failed"
+  exit 1
+fi
+
+echo
+echo "== 8/10 boot the built artifact =============================="
 echo "  (loads ui/studio.html in a DOM and runs it; needs: npm install, once)"
 if ! node ui/test/boot.test.mjs; then
   echo "the built interface does not boot"
@@ -95,14 +110,14 @@ if ! node ui/test/boot.test.mjs; then
 fi
 
 echo
-echo "== 8/9 Datara server ========================================="
+echo "== 9/10 Datara server ========================================"
 if ! forgen check src/main.dtr; then
   echo "server check failed"
   exit 2
 fi
 
 echo
-echo "== 9/9 every snippet is Datara ==============================="
+echo "== 10/10 every snippet is Datara ============================="
 if ! node scripts/check-snippets.mjs; then
   echo "a snippet the editor offers does not compile"
   exit 3
@@ -120,3 +135,6 @@ echo "      cannot tell you whether Ctrl+S actually saved anything."
 echo "      node ui/test/tabs.mjs  http://127.0.0.1:7878   the tab strip, both variants"
 echo "      node ui/test/zen.mjs   http://127.0.0.1:7878 <dir>  zen's layout, measured"
 echo "      node ui/test/measure.mjs http://127.0.0.1:7878 computed styles and geometry"
+echo "      node ui/test/search.mjs  http://127.0.0.1:7878 project search, whole-name vs free"
+echo "      node ui/test/generate.mjs http://127.0.0.1:7878 Generate continues the file"
+echo "        (generate.mjs also needs the companion up on :7890; it skips itself if not)"

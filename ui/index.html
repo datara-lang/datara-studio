@@ -31,6 +31,17 @@
   --r:6px; --r2:10px;
   /* There is no `--focus` token. It held the mint focus ring that is now gone
      entirely; see the keyboard section below for why. */
+
+  /* Dark form controls, from the browser rather than from us.
+     A `textarea` does not inherit `color` - the user-agent stylesheet gives it
+     `color: fieldtext`, which resolves against the used colour scheme and comes
+     out BLACK when there is none declared. So the chat box was black text on
+     `--s0`, and nothing in this file said so: the rule that would have fixed it
+     was simply absent, and the box is the one element a person types into. This
+     one line fixes that control and every other the browser draws itself -
+     scrollbars, the caret, selection, autofill. The explicit `color` on `.field`
+     below is the belt to this pair of braces. */
+  color-scheme:dark;
 }
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;overflow:hidden;background:var(--s1);color:var(--ink1);
@@ -573,6 +584,18 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
   color:var(--ok)}
 .genwhere .mono{font-size:12px;color:var(--ink1);word-break:break-all}
 .genwhere .hint{font-size:11.5px;color:var(--ink3)}
+/* What was sent as context, and whether the companion used it. The panel claims
+   to continue the open file; this is the line that lets a reader check that
+   claim instead of trusting it. It sits above the request field, so the number
+   is read before the request is typed rather than after the answer arrives. */
+.genctx{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-top:10px;
+  padding:7px 10px;border-radius:var(--r);background:var(--s3)}
+.genctx span{font-size:11.5px;color:var(--ink3)}
+.genctx .mono{font-size:11.5px;color:var(--ink1)}
+.genctx .ok{font-size:10.5px;font-weight:500;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--ok)}
+.genctx .warn{font-size:10.5px;font-weight:500;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--warn)}
 .tag{font-size:10.5px;font-weight:500;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3)}
 .tag.e{color:var(--err)}.tag.w{color:var(--warn)}.tag.a{color:var(--live)}
 .mini{height:28px;padding:0 12px;border-radius:var(--r);background:var(--s3);
@@ -587,8 +610,36 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .note{color:var(--ink3);font-size:13px;line-height:1.65}
 .note code{font-family:var(--mono);font-size:12.5px;color:#93B4DD;background:var(--s2);
   padding:2px 5px;border-radius:4px}
+/* `color` is written out even though `color-scheme:dark` on the root would make
+   the browser pick a light default. A control that is correct only because of a
+   property set somewhere else is one refactor away from being black again, and
+   this is the element the user is looking at while they type. */
 .field{width:100%;margin:9px 0;height:28px;padding:0 9px;background:var(--s0);border:0;
-  border-radius:var(--r);font-family:var(--mono);font-size:12.5px;outline:none}
+  border-radius:var(--r);font-family:var(--mono);font-size:12.5px;outline:none;
+  color:var(--ink1)}
+.field::placeholder{color:var(--ink3)}
+/* The project search row: the box and its button on one line.
+   `.field` is full-width with its own vertical margin because it is normally the
+   only thing in its card; here it shares the line, so both are reset rather than
+   fought with - a flex row containing a 100%-wide child collapses the button. */
+.findrow{display:flex;align-items:center;gap:7px;margin:9px 0 0}
+/* `min-width:0` is load-bearing, not tidying. A flex item's automatic minimum
+   size is its content-based minimum, and for an `<input>` that is its intrinsic
+   width - roughly 20 characters - so `flex:1` alone leaves the box refusing to
+   shrink and pushes the button out of the panel. Measured before the fix: the
+   button's right edge at 1529 against a card edge of 1486, i.e. 43 px outside
+   the panel it belongs to. */
+.findrow .field{flex:1;min-width:0;width:auto;margin:0}
+.findrow .mini{flex:none;min-width:60px;font-family:var(--mono)}
+/* `accent-color` is what actually paints the tick. Written out rather than left
+   to the platform because the platform default for a dark-scheme checkbox on
+   Windows is the light-theme blue, which is the one colour not in this palette.
+   The tick glyph itself is drawn by the browser and cannot be styled, so this is
+   the whole of the control's appearance that is ours to choose. */
+.ck{display:flex;align-items:center;gap:7px;margin-top:9px;cursor:pointer;user-select:none}
+.ck input{flex:none;width:13px;height:13px;margin:0;accent-color:var(--live);cursor:pointer}
+.ck span{font-size:12px;color:var(--ink2)}
+.ck .ckhint{font-size:11.5px;color:var(--ink3)}
 .sym{height:28px;display:flex;align-items:center;gap:9px;padding:0 9px;border-radius:var(--r);
   font-family:var(--mono);font-size:13px;color:var(--ink2);cursor:pointer}
 .sym:hover{background:var(--s3);color:var(--ink1)}
