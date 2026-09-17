@@ -30,6 +30,21 @@ if not exist "%EXE%" (
 
 if not exist "ui\studio.html" (
   echo   ui\studio.html is missing - building it ...
+  REM All three, in this order, for the same reason build-desktop.cmd does it:
+  REM the interface inlines ui\vendor\textcore.js and ui\mark.ico, and neither
+  REM is in git.
+  node scripts\build-wasm.mjs
+  if errorlevel 1 (
+    echo   Could not build the text core. Run: node scripts\build-wasm.mjs
+    pause
+    exit /b 1
+  )
+  node scripts\build-icons.mjs
+  if errorlevel 1 (
+    echo   Could not build the icons. Run: node scripts\build-icons.mjs
+    pause
+    exit /b 1
+  )
   node scripts\build-ui.mjs
   if errorlevel 1 (
     echo   Could not build the interface. Run: node scripts\build-ui.mjs

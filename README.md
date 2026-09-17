@@ -132,10 +132,28 @@ start-tauri.cmd                     # builds the shell if it is missing, then ru
 or by hand, on any platform:
 
 ```bash
-node scripts/build-icons.mjs        # icons are build inputs, not checked in
+node scripts/build-wasm.mjs         # ui/vendor/textcore.js - gitignored, and inlined
+node scripts/build-icons.mjs        # src-tauri/icons/ - gitignored, and bundled
 node scripts/build-ui.mjs && node scripts/build-ui.mjs --core
-cargo tauri build --manifest-path src-tauri/Cargo.toml
+tauri build                         # or `cargo tauri build`, see below
 ```
+
+**Those first two lines are not optional and the order matters.** Both write
+files that are in `.gitignore` and that the steps after them read:
+`ui/vendor/textcore.js` is inlined into the interface by `build-ui.mjs`, which
+fails outright if it is missing, and `src-tauri/icons/` is a bundled resource.
+A fresh checkout has neither.
+
+**`tauri` or `cargo tauri`, pick one.** They are different executables and the
+project does not install either for you:
+
+| You have | Run | Notes |
+|---|---|---|
+| `cargo install tauri-cli --version "^2"` | `cargo tauri build` | compiles the CLI from source, minutes |
+| `npm install -g @tauri-apps/cli@^2` | `tauri build` | a prebuilt binary, seconds - but it provides `tauri` and **not** `cargo-tauri`, so `cargo tauri` still fails |
+
+The release workflow uses the npm one. On Windows, `start-tauri.cmd` checks for
+either.
 
 The output lands in `src-tauri/target/release/bundle/`. On Linux, install the
 Tauri system dependencies first - the bundler fails at the point it links the

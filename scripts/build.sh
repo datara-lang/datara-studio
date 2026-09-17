@@ -131,6 +131,15 @@ if ! node scripts/verify-companion.mjs; then
   echo "the companion search does not work"
   exit 1
 fi
+# `verify-build-order.mjs` checks that every path to "the interface exists" runs
+# the same three build steps in the same order. Four of the six did not, and the
+# release workflow was one of them - it would have failed on its first run on
+# every platform, because `build-ui.mjs` inlines a gitignored file that nothing
+# before it built.
+if ! node scripts/verify-build-order.mjs; then
+  echo "a build entry point is out of step"
+  exit 1
+fi
 
 echo
 echo "== 10/11 Datara server ======================================="

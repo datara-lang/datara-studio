@@ -48,10 +48,33 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM The build inputs, in the order that makes them inputs.
+REM
+REM Three of the four write gitignored files that a later step reads, so a fresh
+REM checkout has none of them and the order is not cosmetic:
+REM
+REM   build-wasm.mjs   -> ui\vendor\textcore.js, which build-ui.mjs INLINES.
+REM                       Without it the interface build dies on
+REM                       "cannot inline /vendor/textcore.js". Measured on a
+REM                       fresh checkout (git archive HEAD into an empty
+REM                       directory) - it was missing from this script.
+REM   build-icons.mjs  -> src-tauri\icons\ and ui\mark.ico. build-ui.mjs embeds
+REM                       ui\mark.ico, so this must come BEFORE it. This script
+REM                       had them the other way round, so the interface always
+REM                       embedded whatever ui\mark.ico already held - the
+REM                       checked-in copy on a fresh tree, the previous run's
+REM                       otherwise. Silent either way, and it shows up only when
+REM                       the geometry in scripts\mark.mjs changes: the window
+REM                       icon gets the new mark and the title bar keeps the old
+REM                       one, which is the exact drift scripts\mark.mjs exists to
+REM                       prevent.
+REM   build-ui.mjs     -> ui\studio.html, a bundled resource.
 echo   building the self-contained interface ...
-node scripts\build-ui.mjs
+node scripts\build-wasm.mjs
 if errorlevel 1 exit /b 1
 node scripts\build-icons.mjs
+if errorlevel 1 exit /b 1
+node scripts\build-ui.mjs
 if errorlevel 1 exit /b 1
 
 if not exist "src-tauri\dist\index.html" (

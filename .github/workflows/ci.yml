@@ -93,6 +93,14 @@ jobs:
       - name: The companion is found from a fixture tree
         run: node scripts/verify-companion.mjs
 
+      # This one is here rather than only locally because it is the check that
+      # would have caught this workflow's own sibling: `release.yml` built the
+      # icons and the interface and never the text core, so its first run would
+      # have failed on every platform. A workflow is the one entry point that
+      # cannot be tried by hand before it matters.
+      - name: Every build entry point runs the same steps in the same order
+        run: node scripts/verify-build-order.mjs
+
       - name: Record what was built
         shell: bash
         run: |
