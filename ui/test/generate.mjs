@@ -116,6 +116,10 @@ check("the Generate panel has a request field", await field.count() === 1);
 // must be absent rather than showing a zero it has not earned.
 check("no context readout before the first request",
   await page.locator(".genctx").count() === 0);
+// Same for the verify loop: no request has been made, so there is no loop to
+// report. An empty block here would claim a verification that never happened.
+check("no verify loop before the first request",
+  await page.locator(".genloop").count() === 0);
 
 /** Send one request and wait for the file to grow. Returns the new buffer. */
 async function generate(req, before) {
@@ -183,6 +187,33 @@ const whereText = (await page.locator(".genwhere").innerText()).replace(/\s+/g, 
 check("the panel names the file it wrote into", /main\.dtr/.test(whereText), whereText);
 check("the panel says the code was appended, not inserted at the caret",
   /appended/i.test(whereText), whereText);
+
+// ---- 4b. the verify loop is visible, not only its outcome
+//
+// The companion checks the code with forgen, repairs what the diagnostics
+// explain, and checks again - up to three times. Until this block existed the
+// panel showed only the outcome, so a run that needed three attempts looked
+// exactly like one that passed first time, and "it self-corrected" was a claim
+// with nothing behind it. These requests pass on the first check, so what is
+// asserted here is that the loop reports its attempt honestly rather than
+// inventing work it did not do.
+//
+// `innerText` uppercases the attempt tag because `.tag` carries
+// `text-transform: uppercase`, so every match below is case-insensitive.
+const loopCount = await page.locator(".genloop").count();
+const stepCount = await page.locator(".genloop .step").count();
+const loopText = loopCount
+  ? (await page.locator(".genloop").innerText()).replace(/\s+/g, " ").trim() : "";
+check("the panel shows the verify loop", loopCount === 1, loopText);
+check("the loop has at least one attempt", stepCount >= 1, stepCount + " step(s)");
+check("the first attempt is numbered", /attempt 1\b/i.test(loopText), loopText);
+check("every attempt says what forgen check did",
+  (loopText.match(/forgen check (passed|failed)/gi) || []).length === stepCount, loopText);
+// These two requests match a known shape, so the honest report is a single
+// passing attempt. A second step here would mean the loop is claiming work.
+check("a request that compiles first time reports exactly one attempt",
+  stepCount === 1 && /forgen check passed/i.test(loopText), stepCount + " steps: " + loopText);
+check("the loop block names itself", /verify loop/i.test(loopText), loopText);
 
 // ---- 5. and it is really in the file, not only in the panel
 await page.keyboard.press("Control+s");

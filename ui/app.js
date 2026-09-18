@@ -2814,6 +2814,22 @@ struct below says which of the two applies.</pre>
   // happened. Below the floor the insert asks first.
   const CONFIDENCE_FLOOR = 0.5;
   const weakGen = !!(genRes && genRes.confidence != null && genRes.confidence < CONFIDENCE_FLOOR);
+  // The verify loop's attempts, as the companion reported them. Read from the
+  // response rather than inferred from `verified`, because the interesting case
+  // is the one that took more than one attempt - and an old companion that does
+  // not send `steps` yields an empty list, so the block is simply absent rather
+  // than empty.
+  const genSteps = (genRes && genRes.steps) || [];
+  /** What one attempt of the verify loop found: "forgen check passed", or
+   *  "forgen check failed (2 errors)". Named rather than inlined because the
+   *  nested ternary it replaces was wrong in a way the parser only caught at
+   *  boot - the whole interface failed to mount. */
+  const stepLabel = (s) => {
+    if (s.ok) return "forgen check passed";
+    const n = (s.errors || []).length;
+    if (!n) return "forgen check failed";
+    return "forgen check failed (" + n + (n === 1 ? " error)" : " errors)");
+  };
   async function insertWeak() {
     const yes = await askUser({
       title: "Insert a skeleton?",
@@ -2857,6 +2873,16 @@ than starting again.</pre>
         ${genRes.confidence != null ? html`<span class="tag">${genRes.confidence}</span>` : null}
         <span class=${"tag " + (genRes.verified ? "a" : "w")}>${genRes.verified ? "verified" : "unverified"}</span></div>
       <pre class="muted">${(genRes.fragments || []).join(" + ")}${(genRes.exemplars || []).length ? "  ·  exemplars: " + genRes.exemplars.join(", ") : ""}</pre>
+      ${genSteps.length ? html`<div class="genloop">
+        <span class="head">verify loop</span>
+        ${genSteps.map((s) => html`<div class="step" key=${s.iteration}>
+          <span class=${"tag " + (s.ok ? "a" : "w")}>attempt ${s.iteration}</span>
+          <span class="mono">${stepLabel(s)}</span>
+          ${(s.fixes || []).length
+            ? html`<span class="hint">repaired: ${s.fixes.join("; ")}</span>`
+            : null}
+        </div>`)}
+      </div>` : null}
       ${genWhere ? html`<div class="genwhere">
         <span class="ok">appended to the file</span>
         <span class="mono">${genWhere}</span>
