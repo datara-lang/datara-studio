@@ -64,13 +64,26 @@ if (!alive) {
 }
 
 // ---- a scratch workspace
+//
+// A real project rather than a loose file. `datara.toml` is what the companion
+// uses to decide which tree to verify against, and `src/` is where forgen looks
+// for the modules a file imports. With neither, a context that imports its
+// siblings cannot resolve - and that is the defect this layout exists to catch:
+// the companion checked the merged text against its *own* repository, so every
+// `use` in the open file came back `E-RESOLVE-005` and `verified` was false for
+// code that compiles in the project it was written for.
 const ws = join(tmpdir(), "ds-generate");
 rmSync(ws, { recursive: true, force: true });
-mkdirSync(ws, { recursive: true });
-const HELLO = "fn main() -> Int {\n    return 0\n}\n";
-writeFileSync(join(ws, "main.dtr"), HELLO);
+mkdirSync(join(ws, "src"), { recursive: true });
+writeFileSync(join(ws, "datara.toml"),
+  '[package]\nname = "ds_generate"\nversion = "0.1.0"\nedition = "2026"\n'
+  + 'entry = "src/main.dtr"\n');
+writeFileSync(join(ws, "src", "helper.dtr"),
+  "fn st_double(x: Int) -> Int {\n    return x + x\n}\n");
+const HELLO = "use helper\n\nfn main() -> Int {\n    return st_double(2)\n}\n";
+writeFileSync(join(ws, "src", "main.dtr"), HELLO);
 const wsPosix = ws.replace(/\\/g, "/");
-const file = join(ws, "main.dtr");
+const file = join(ws, "src", "main.dtr");
 console.log("scratch workspace: " + wsPosix);
 
 const REQ1 = "reverse a list of integers";
@@ -90,16 +103,35 @@ await ctx.addInitScript((r) => {
   // visible as a Project panel that never left "Reading the workspace ...".
   localStorage.setItem("datara.studio.lastRoot", r);
   localStorage.setItem("datara.studio.recent", JSON.stringify([r]));
-  localStorage.setItem("datara.studio.lastFile", r + "/main.dtr");
+  localStorage.setItem("datara.studio.lastFile", r + "/src/main.dtr");
   localStorage.removeItem("datara.studio.settings");
 }, wsPosix);
 const page = await ctx.newPage();
 const errs = [];
 const native = [];
+// Which Generate endpoint the panel actually talked to. The stream is the one
+// that reports attempts as they happen; the bare POST is the fallback. A run
+// that quietly used the fallback would still pass every other assertion here.
+const genCalls = [];
+page.on("request", (r) => {
+  const u = r.url();
+  if (/\/generate(\/stream)?$/.test(u)) genCalls.push(u.replace(/^https?:\/\/[^/]+/, ""));
+});
 page.on("pageerror", (e) => errs.push(e.message));
 page.on("dialog", async (d) => { native.push(d.message()); await d.dismiss().catch(() => {}); });
 await page.goto(base, { waitUntil: "domcontentloaded" });
-await page.waitForTimeout(2800);
+// Wait for the file to be in the buffer rather than for a fixed number of
+// milliseconds. The workspace now has a manifest and a sibling module, so the
+// boot does more work before the editor is filled - and a fixed sleep made this
+// suite fail on a machine that was merely busy, which reads as "the file did
+// not open" when the truth was "the assertion ran too early".
+const openDeadline = Date.now() + 15000;
+while (Date.now() < openDeadline) {
+  if ((await page.locator(".code").count())
+      && (await page.locator(".code").inputValue()).includes("fn main")) break;
+  await page.waitForTimeout(200);
+}
+await page.waitForTimeout(600);
 
 const buf = () => page.locator(".code").inputValue();
 
@@ -202,8 +234,13 @@ check("the panel says the code was appended, not inserted at the caret",
 // `text-transform: uppercase`, so every match below is case-insensitive.
 const loopCount = await page.locator(".genloop").count();
 const stepCount = await page.locator(".genloop .step").count();
+// `.first()`, not the bare locator. Playwright's strict mode throws when a
+// locator matches more than one element, and a suite that throws on the first
+// symptom stops being diagnostic: the failure arrives as a timeout in an
+// unrelated assertion instead of as "there are two verify loops". The count is
+// asserted separately below, so reading one of them here loses nothing.
 const loopText = loopCount
-  ? (await page.locator(".genloop").innerText()).replace(/\s+/g, " ").trim() : "";
+  ? (await page.locator(".genloop").first().innerText()).replace(/\s+/g, " ").trim() : "";
 check("the panel shows the verify loop", loopCount === 1, loopText);
 check("the loop has at least one attempt", stepCount >= 1, stepCount + " step(s)");
 check("the first attempt is numbered", /attempt 1\b/i.test(loopText), loopText);
@@ -215,6 +252,31 @@ check("a request that compiles first time reports exactly one attempt",
   stepCount === 1 && /forgen check passed/i.test(loopText), stepCount + " steps: " + loopText);
 check("the loop block names itself", /verify loop/i.test(loopText), loopText);
 
+// ---- 4c. the check ran against the project the file belongs to
+//
+// The context imports `helper`, which lives beside it in `src/`. The companion
+// used to write its scratch file into its own repository, where no `helper`
+// module exists, so forgen answered `E-RESOLVE-005: Module 'helper' not found`
+// and the panel reported `unverified` - for code that compiles perfectly well
+// in the project it was written for. Measured before the fix on a faithful
+// scratch project: 0 of 8 requests verified, every failure being one of the
+// file's own `use` lines.
+//
+// `verified` is read off the result card rather than inferred, because the tag
+// is what the user sees and it is the claim being tested.
+const resText = (await page.locator(".card").last().innerText()).replace(/\s+/g, " ").trim();
+check("a context that imports its siblings still verifies",
+  /verified/i.test(resText) && !/unverified/i.test(resText),
+  resText.slice(0, 160));
+check("the failure is not a module that could not be resolved",
+  !/E-RESOLVE-005/.test(resText), resText.slice(0, 160));
+
+// ---- 4d. the panel watched the loop rather than being told about it
+check("the panel used the streaming endpoint",
+  genCalls.includes("/generate/stream"), genCalls.join(" "));
+check("the panel did not have to fall back to the plain endpoint",
+  !genCalls.includes("/generate"), genCalls.join(" "));
+
 // ---- 5. and it is really in the file, not only in the panel
 await page.keyboard.press("Control+s");
 await page.waitForTimeout(1400);
@@ -225,6 +287,86 @@ check("the file on disk has one copy of the original",
 check("the file on disk has both additions",
   onDisk.includes("fn reverse_str") && onDisk.includes("fn count_lines"),
   "reverse_str " + onDisk.includes("fn reverse_str") + ", count_lines " + onDisk.includes("fn count_lines"));
+
+// ---- 6. the panel folds a streamed run, attempt by attempt
+//
+// The two requests above pass on the first check, so they cannot show what the
+// loop looks like when it has to work. This one is answered with a crafted
+// stream: attempt 1 fails, a repair is applied, attempt 2 passes. It is the one
+// shape the companion's own output almost never produces - measured over 30
+// requests, 0 reached the repair branch - and it is exactly the shape the panel
+// would get wrong, because it has to attach the repair to the attempt above it
+// rather than open a third.
+//
+// What this does NOT assert is that the attempts appear *while* the request is
+// running. A fulfilled route delivers its body in one write, so the reader loop
+// sees every event in the same tick; the incremental delivery is measured in
+// the companion's own suite instead, where the events are timed over a real
+// socket. Everything between the socket and the pixels is covered here.
+const STREAM_FIX = "List<Int>() -> []";
+const STREAM_ADD = "\nfn st_stream_probe() -> Int {\n    return 7\n}\n";
+await page.route("**/generate/stream", async (route) => {
+  const sent = route.request().postDataJSON() || {};
+  const ctx = sent.context || "";
+  const step1 = { iteration: 1, ok: false, errors: ["error[E-TYPE-001]: mismatch"], fixes: [STREAM_FIX] };
+  const step2 = { iteration: 2, ok: true, errors: [], fixes: [] };
+  const events = [
+    { event: "start", seq: 0 },
+    { event: "plan", seq: 1, task: "list", title: "Streamed", confidence: 0.9 },
+    { event: "shape", seq: 2, fragments: ["stream"] },
+    { event: "assembled", seq: 3, chars: ctx.length + STREAM_ADD.length },
+    { event: "check", seq: 4, iteration: 1, ok: false, errors: step1.errors },
+    { event: "repair", seq: 5, iteration: 1, fixes: [STREAM_FIX] },
+    { event: "check", seq: 6, iteration: 2, ok: true, errors: [] },
+    { event: "done", seq: 7, success: true, verified: true, iterations: 2,
+      task: "list", title: "Streamed", confidence: 0.9, fragments: ["stream"],
+      steps: [step1, step2], code: ctx + STREAM_ADD },
+  ];
+  await route.fulfill({
+    status: 200,
+    contentType: "application/x-ndjson; charset=utf-8",
+    body: events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+  });
+});
+
+const beforeStream = await buf();
+await field.fill("a request that needs two attempts");
+await page.locator("button.mini", { hasText: /^generate$/ }).first().click();
+const streamDeadline = Date.now() + 20000;
+while (Date.now() < streamDeadline && (await buf()).length === beforeStream.length) {
+  await page.waitForTimeout(200);
+}
+// The append and the result land in the same tick; the render that follows them
+// is what is being read here.
+await page.waitForTimeout(400);
+const streamedText = (await page.locator(".genloop").first().innerText()).replace(/\s+/g, " ").trim();
+const streamedSteps = await page.locator(".genloop .step").count();
+check("a streamed run shows both attempts", streamedSteps === 2, streamedSteps + " step(s): " + streamedText);
+check("the streamed run shows the failed attempt",
+  /attempt 1\b/i.test(streamedText) && /forgen check failed \(1 error\)/i.test(streamedText), streamedText);
+check("the streamed run shows the attempt that passed",
+  /attempt 2\b/i.test(streamedText) && /forgen check passed/i.test(streamedText), streamedText);
+// The repair belongs to the attempt that provoked it. Rendering it as its own
+// attempt, or dropping it, is the failure this catches.
+//
+// Compared on a lowercased copy, because `.tag` carries `text-transform:
+// uppercase` and `innerText` reports what is painted - so the painted text says
+// "ATTEMPT 1" and a case-sensitive `indexOf("attempt 1")` finds nothing, which
+// makes the ordering assertion pass for the wrong reason or fail for none.
+const lowText = streamedText.toLowerCase();
+const repairAt = lowText.indexOf("repaired: " + STREAM_FIX.toLowerCase());
+check("the repair is attached to the attempt it repaired",
+  repairAt > lowText.indexOf("attempt 1") && repairAt < lowText.indexOf("attempt 2"),
+  "attempt 1 at " + lowText.indexOf("attempt 1") + ", repair at " + repairAt
+  + ", attempt 2 at " + lowText.indexOf("attempt 2"));
+// One loop, not two. The trace the panel folded while the request was running
+// is the trace it keeps - so a run cannot be described one way in flight and
+// another way once it lands. Two blocks here would mean the panel is rendering
+// the live trace and the response's copy side by side.
+check("the panel shows exactly one verify loop",
+  await page.locator(".genloop").count() === 1, (await page.locator(".genloop").count()) + " loop(s)");
+check("the streamed code reached the file",
+  (await buf()).includes("fn st_stream_probe"), "probe present: " + (await buf()).includes("fn st_stream_probe"));
 
 check("no native dialog was raised", native.length === 0, native.join(" | "));
 check("no page errors", errs.length === 0, errs.join(" | "));

@@ -2527,7 +2527,7 @@ const Panel = memo(function Panel({ tab, setTab, order, hidden, onReorder,
                                      suggestions, diagnostics, aiOnline, aiLabel,
                                      layout, layoutBusy, onScan, onInsert, onGoto, outline,
                                      genReq, genRes, genErr, genBusy, genModel, onGenReq, onGenerate,
-                                     genWhere, genCtx,
+                                     genWhere, genCtx, genLive,
                                      chatMsgs, chatReq, chatBusy, chatErr, chatCtx, chatClearing,
                                      onChatReq, onChatSend, onChatClear, onChatUndo, onChatProject,
                                      fmtBytes,
@@ -2814,12 +2814,20 @@ struct below says which of the two applies.</pre>
   // happened. Below the floor the insert asks first.
   const CONFIDENCE_FLOOR = 0.5;
   const weakGen = !!(genRes && genRes.confidence != null && genRes.confidence < CONFIDENCE_FLOOR);
-  // The verify loop's attempts, as the companion reported them. Read from the
-  // response rather than inferred from `verified`, because the interesting case
-  // is the one that took more than one attempt - and an old companion that does
-  // not send `steps` yields an empty list, so the block is simply absent rather
-  // than empty.
-  const genSteps = (genRes && genRes.steps) || [];
+  // The verify loop's attempts.
+  //
+  // One source, not two. The companion streams each attempt as it happens, and
+  // the panel folds those events into a trace; the response then carries the
+  // same trace as `steps`. Rendering the live one during the request and the
+  // response's one afterwards would let a single run be described two ways -
+  // and it did: a defect in the folding was invisible, because the finished
+  // result replaced it before anyone could see the difference.
+  //
+  // So the folded trace wins whenever there is one, and `steps` is the fallback
+  // for a run that was not streamed - an older companion, or the plain endpoint
+  // after the stream could not be opened. Both cases leave `genLive` empty,
+  // which is what makes the fallback exact rather than a guess.
+  const genSteps = genLive.length ? genLive : ((genRes && genRes.steps) || []);
   /** What one attempt of the verify loop found: "forgen check passed", or
    *  "forgen check failed (2 errors)". Named rather than inlined because the
    *  nested ternary it replaces was wrong in a way the parser only caught at
@@ -2830,6 +2838,31 @@ struct below says which of the two applies.</pre>
     if (!n) return "forgen check failed";
     return "forgen check failed (" + n + (n === 1 ? " error)" : " errors)");
   };
+  /** The verify loop, drawn from a trace.
+   *
+   *  One function for both traces, because there are two of them: the live one
+   *  while the request is running and the final one from the response. Two
+   *  copies of this markup would let the run in progress and the run that
+   *  finished describe the same attempt differently, which is precisely the
+   *  kind of drift the loop block exists to rule out.
+   *
+   *  `running` marks the attempt that has not yet reported, so the last line
+   *  does not claim a result it is still waiting for.
+   */
+  const genLoop = (steps, running) => !steps.length ? null : html`<div class="genloop">
+    <span class="head">verify loop</span>
+    ${steps.map((s) => html`<div class="step" key=${s.iteration}>
+      <span class=${"tag " + (s.ok ? "a" : "w")}>attempt ${s.iteration}</span>
+      <span class="mono">${stepLabel(s)}</span>
+      ${(s.fixes || []).length
+        ? html`<span class="hint">repaired: ${s.fixes.join("; ")}</span>`
+        : null}
+    </div>`)}
+    ${running ? html`<div class="step">
+      <span class="tag">running</span>
+      <span class="hint">${steps.length} attempt${steps.length === 1 ? "" : "s"} so far</span>
+    </div>` : null}
+  </div>`;
   async function insertWeak() {
     const yes = await askUser({
       title: "Insert a skeleton?",
@@ -2867,22 +2900,17 @@ than starting again.</pre>
     </div>
     ${genErr ? html`<div class="card"><div class="ch"><span class="tag e">error</span></div>
       <pre>${genErr}</pre></div>` : null}
+    ${!genRes && genLive.length ? html`<div class="card">
+      <div class="ch"><b>Working</b><span class="tag">${genBusy ? "running" : "stopped"}</span></div>
+      ${genLoop(genLive, genBusy)}
+    </div>` : null}
     ${genRes ? html`<div class="card">
       <div class="ch"><b>${genRes.title || genRes.task}</b>
         <span class="tag">${genRes.task}</span>
         ${genRes.confidence != null ? html`<span class="tag">${genRes.confidence}</span>` : null}
         <span class=${"tag " + (genRes.verified ? "a" : "w")}>${genRes.verified ? "verified" : "unverified"}</span></div>
       <pre class="muted">${(genRes.fragments || []).join(" + ")}${(genRes.exemplars || []).length ? "  ·  exemplars: " + genRes.exemplars.join(", ") : ""}</pre>
-      ${genSteps.length ? html`<div class="genloop">
-        <span class="head">verify loop</span>
-        ${genSteps.map((s) => html`<div class="step" key=${s.iteration}>
-          <span class=${"tag " + (s.ok ? "a" : "w")}>attempt ${s.iteration}</span>
-          <span class="mono">${stepLabel(s)}</span>
-          ${(s.fixes || []).length
-            ? html`<span class="hint">repaired: ${s.fixes.join("; ")}</span>`
-            : null}
-        </div>`)}
-      </div>` : null}
+      ${genLoop(genSteps, false)}
       ${genWhere ? html`<div class="genwhere">
         <span class="ok">appended to the file</span>
         <span class="mono">${genWhere}</span>
@@ -3726,6 +3754,14 @@ function App() {
   const [genRes, setGenRes] = useState(null);
   const [genErr, setGenErr] = useState("");
   const [genBusy, setGenBusy] = useState(false);
+  // The verify loop while it is still running. The companion streams each check
+  // as it happens, so this is the same trace the finished result carries - it
+  // exists so that a request taking several attempts shows the attempts going
+  // past instead of showing nothing until it is over. Measured on this project
+  // it is usually one attempt and about 200 ms, so most runs fill this once and
+  // are replaced by `genRes` almost immediately; that is the honest shape of the
+  // work, and rendering it costs nothing when it is that short.
+  const [genLive, setGenLive] = useState([]);
   // Which file the generated code was written into. Empty means it has not been
   // placed yet, which is a different thing from "generation failed".
   const [genWhere, setGenWhere] = useState("");
@@ -5199,10 +5235,77 @@ function App() {
   // the compiler.
   const GEN_TIMEOUT_MS = 90000;
 
+  /** One streamed event folded into the trace the panel renders.
+   *
+   *  A `check` opens an attempt; the `repair` that follows belongs to the
+   *  attempt above it, which is why this appends rather than replaces. The
+   *  companion sends `fixes` on the check's own step in the finished result, so
+   *  folding them here is what makes the live trace and the final one agree
+   *  instead of showing the same run two different ways.
+   */
+  const foldGenEvent = (steps, ev) => {
+    if (ev.event === "check") {
+      return steps.concat([{ iteration: ev.iteration, ok: ev.ok,
+                             errors: ev.errors || [], fixes: [],
+                             elapsed_ms: ev.elapsed_ms }]);
+    }
+    if (ev.event === "repair" && steps.length) {
+      const last = steps[steps.length - 1];
+      return steps.slice(0, -1).concat([{ ...last, fixes: ev.fixes || [] }]);
+    }
+    return steps;
+  };
+
+  /** Ask the companion to generate, and watch it work.
+   *
+   *  Returns the same payload `POST /generate` returns. The endpoint is the
+   *  streaming one because the verify loop runs `forgen check` as a subprocess
+   *  and the panel should not have to wait for all of it to say what the first
+   *  attempt found. Throws before anything has been read if the stream cannot be
+   *  opened, which is how an older companion is detected.
+   */
+  async function generateStreamed(payload, onEvent) {
+    const r = await fetch("http://127.0.0.1:7890/generate/stream", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(GEN_TIMEOUT_MS),
+    });
+    if (!r.ok || !r.body || !r.body.getReader) throw new Error("no stream");
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let result = null;
+    let sawEvent = false;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (value) buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        // One unreadable line is a line. Dropping it is better than treating a
+        // partial write as the end of the run.
+        try { ev = JSON.parse(line); } catch (e) { continue; }
+        sawEvent = true;
+        if (ev.event === "done") result = ev;
+        else if (ev.event === "error") throw new Error(ev.detail || ev.error || "generation failed");
+        else onEvent(ev);
+      }
+      if (done) break;
+    }
+    if (!result) {
+      throw new Error(sawEvent ? "the stream ended without a result" : "no stream");
+    }
+    return result;
+  }
+
   async function runGenerate() {
     const req = genReq.trim();
     if (!req || genBusy) return;
     setGenBusy(true); setGenErr(""); setGenRes(null); setGenWhere("");
+    setGenLive([]);
     // The context is captured once and kept, because it is needed twice: it goes
     // to the companion, and it is then subtracted from the answer.
     //
@@ -5216,12 +5319,38 @@ function App() {
     setGenCtx({ chars: context.length, used: null });
     let timedOut = false;
     try {
-      const r = await fetch("http://127.0.0.1:7890/generate", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ request: req, context, verify: true }),
-        signal: AbortSignal.timeout(GEN_TIMEOUT_MS),
-      });
-      const j = await r.json();
+      const payload = {
+        request: req, context, verify: true,
+        // Which project this is, so the companion checks the merge against the
+        // tree the file belongs to rather than against its own. Without it a
+        // context that imports its siblings - which is every real Datara file
+        // - came back `unverified`, because the scratch file was written into
+        // the companion's repository and `use http` resolved to nothing there.
+        file_path: currentRef.current || "",
+      };
+      // The trace is folded here rather than read off the answer, so the
+      // attempts appear as they happen. `genLive` is cleared once `genRes`
+      // carries the same trace, so the panel never shows the run twice.
+      let steps = [];
+      const onEvent = (ev) => {
+        steps = foldGenEvent(steps, ev);
+        setGenLive(steps);
+      };
+      let j;
+      try {
+        j = await generateStreamed(payload, onEvent);
+      } catch (e) {
+        // Only before anything was read is this a fallback. A stream that broke
+        // after the companion had started working has already produced a trace,
+        // and re-running the request would generate the code twice.
+        if (steps.length) throw e;
+        const r = await fetch("http://127.0.0.1:7890/generate", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(GEN_TIMEOUT_MS),
+        });
+        j = await r.json();
+      }
       if (j.error) setGenErr(j.error + (j.detail ? ": " + j.detail : ""));
       else {
         // What the companion actually read, reported rather than assumed.
@@ -5233,6 +5362,9 @@ function App() {
           ? j.code.slice(context.length).replace(/^\n+/, "")
           : (j.code || "");
         setGenRes({ ...j, code: addition, echoed: context.length, returned: (j.code || "").length });
+        // `genLive` is deliberately left alone. It is the trace the panel is
+        // rendering, and when it is empty - a run that was not streamed - the
+        // block above falls back to this result's own `steps`.
         // The point of generate is to write code, not to admire it in a panel.
         // It goes into the open file, appended after what is already there, so
         // it is real and saveable the moment it arrives - and both the panel and
@@ -5266,6 +5398,9 @@ function App() {
           + " seconds - it may still be verifying. Nothing was written to the file."
         : "the companion closed the connection without answering (" + e.message + ")."
           + " Nothing was written to the file. The companion may need restarting.");
+      // The failed run's attempts are left on screen: they are the evidence of
+      // how far it got, and clearing them would leave an error with nothing to
+      // explain it. The next run clears them.
     } finally {
       // In `finally` rather than after the try, because the one path that used to
       // skip it - an exception thrown before the fetch - is exactly the path that
@@ -5673,7 +5808,7 @@ function App() {
             layoutBusy=${layoutBusy} onScan=${scanLayout}
             genReq=${genReq} genRes=${genRes} genErr=${genErr} genBusy=${genBusy}
             genModel=${genModel} onGenReq=${setGenReq} onGenerate=${runGenerate}
-            genWhere=${genWhere} genCtx=${genCtx}
+            genWhere=${genWhere} genCtx=${genCtx} genLive=${genLive}
             chatMsgs=${chatMsgs} chatReq=${chatReq} chatBusy=${chatBusy} chatErr=${chatErr}
             chatCtx=${chatCtx} chatClearing=${chatClearing}
             onChatReq=${setChatReq} onChatSend=${runChat} onChatClear=${clearChat}
